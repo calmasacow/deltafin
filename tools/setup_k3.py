@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """One-time setup for a fresh Deltafin clone.
 
-Downloads from huggingface.co/moonshotai/Kimi-K3 (a few MB + the tokenizer):
-  k3-meta/      config.json, generation_config.json, tokenizer_config.json,
-                tokenization_kimi.py, encoding_k3.py, tiktoken.model,
-                modeling_kimi_linear.py, modeling_kimi_k3.py, configuration_kimi_k3.py
-  tools/k3pkg/  copies of the three modeling/configuration modules (import home)
+Always downloads the small stuff from huggingface.co/moonshotai/Kimi-K3:
+  k3-meta/      config, tokenizer, and Moonshot's modeling files (a few MB)
+  tools/k3pkg/  import home for those modeling modules
+plus k3-meta/tensor_inventory_offsets.json, built by reading only the 96 shard
+HEADERS via range requests. Idempotent; safe to re-run.
 
-Then builds k3-meta/tensor_inventory_offsets.json by reading only the 96 shard
-HEADERS via HTTP range requests (~no download cost) — the index every other tool
-uses to locate tensors. Idempotent; safe to re-run.
+Then it installs the weights, in one of two modes:
 
-The model weights themselves are NOT downloaded here: run tools/fetch_spine.py
-for the resident spine (~114 GB); routed experts stream on demand at inference.
+  --full    (default when the disk allows it, and STRONGLY recommended)
+            resident spine (~114 GB) + every routed expert (~1.45 TB).
+            Nothing is fetched over the network at inference time, so every
+            prompt runs at full speed.
+
+  --stream  resident spine only (~114 GB). Experts are fetched over HTTP as the
+            router asks for them. This works, but a token needs 25.8 GB of
+            expert data: ~4 s from local NVMe versus MINUTES over the network.
+            Only text whose experts happen to be cached runs at full speed, so
+            in practice most prompts are several times slower.
+
+With no flag, setup picks --full if there is room and falls back to --stream
+with a warning if there isn't.
 """
 import concurrent.futures
 import json
@@ -62,7 +71,79 @@ def shard_header(i):
     return shard, n, h
 
 
+SPINE_BYTES = 114e9
+EXPERTS_BYTES = 82432 * 17547264      # ~1.45 TB
+HEADROOM = 100e9
+
+
+def _remaining_bytes():
+    """What still has to be downloaded, so re-running as an upgrade doesn't
+    demand space for weights that are already on disk."""
+    ecache = os.path.join(ROOT, "k3-experts")
+    try:
+        have = sum(1 for f in os.listdir(ecache) if f.endswith((".bin", ".npz")))
+    except FileNotFoundError:
+        have = 0
+    experts_left = max(0, 82432 - have) * 17547264
+    spine = os.path.join(ROOT, "k3-resident", "tensors")
+    try:
+        spine_have = sum(os.path.getsize(os.path.join(spine, f))
+                         for f in os.listdir(spine))
+    except FileNotFoundError:
+        spine_have = 0
+    return max(0, SPINE_BYTES - spine_have), experts_left
+
+
+def install_weights(mode):
+    import shutil as _sh
+    import subprocess
+    free = _sh.disk_usage(ROOT).free
+    spine_left, experts_left = _remaining_bytes()
+    need_full = spine_left + experts_left + HEADROOM
+    if mode is None:
+        mode = "full" if free >= need_full else "stream"
+        if mode == "stream":
+            print("\n" + "!" * 72)
+            print(f"  Not enough disk for the full install: it needs "
+                  f"{need_full/1e12:.2f} TB more (weights + 100 GB headroom)")
+            print(f"  and this volume has {free/1e12:.2f} TB free — about "
+                  f"{(need_full-free)/1e12:.2f} TB short.")
+            print("  Falling back to STREAMING, which is SUBSTANTIALLY SLOWER:")
+            print("  every prompt whose experts aren't cached fetches them over")
+            print("  the network — minutes per token instead of about one.")
+            print(f"  Freeing ~{(need_full-free)/1e12:.2f} TB and re-running with")
+            print("  --full is the single biggest speedup available.")
+            print("!" * 72 + "\n")
+    if mode == "full" and free < need_full:
+        print(f"--full still needs {need_full/1e12:.2f} TB (of which "
+              f"{experts_left/1e12:.2f} TB is experts), but only {free/1e12:.2f} TB is free.")
+        print("Free up space, or use --stream for now and run")
+        print("tools/fetch_experts_all.py later.")
+        sys.exit(1)
+
+    py = sys.executable
+    print(f"\n== installing weights: {mode} ==", flush=True)
+    subprocess.check_call([py, os.path.join(ROOT, "tools", "fetch_spine.py")])
+    if mode == "full":
+        subprocess.check_call([py, os.path.join(ROOT, "tools", "fetch_experts_all.py")])
+        print("\nFull install complete — no network needed at inference time.")
+    else:
+        print("\nStreaming install complete (spine only).")
+        print("Reminder: experts are fetched over the network on demand, so most")
+        print("prompts will be several times slower than a full install. When you")
+        print("have ~1.45 TB free:  python tools/fetch_experts_all.py")
+    print("Optional next step (halves per-token I/O):")
+    print("  python tools/convert_spine_int8.py")
+
+
 def main():
+    ap_mode = None
+    if "--full" in sys.argv:
+        ap_mode = "full"
+    elif "--stream" in sys.argv:
+        ap_mode = "stream"
+    meta_only = "--meta-only" in sys.argv
+
     os.makedirs(META, exist_ok=True)
     print(f"Deltafin setup -> {META}")
     for name in FILES:
@@ -74,6 +155,9 @@ def main():
     inv_path = os.path.join(META, "tensor_inventory_offsets.json")
     if os.path.exists(inv_path):
         print("  tensor inventory: already present")
+        if meta_only:
+            return
+        install_weights(ap_mode)
         return
     print("  building tensor inventory from 96 shard headers (range requests)...")
     inv = {}
@@ -89,7 +173,10 @@ def main():
         json.dump(inv, f)
     os.replace(inv_path + ".part", inv_path)
     print(f"  tensor inventory: {len(inv)} tensors indexed")
-    print("Done. Next: tools/fetch_spine.py (~114 GB), then tools/kimi_run.py")
+    if meta_only:
+        print("Done (--meta-only). Weights not installed.")
+        return
+    install_weights(ap_mode)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ def _boot():
     print("[serve] loading tokenizer + layer skeletons...", flush=True)
     _tok = AutoTokenizer.from_pretrained(
         os.path.join(kr.ROOT, "k3-meta"), trust_remote_code=True)
+    kr.check_expert_pool()
     _layers = kr.build_layers()
     _embed = kr.LazyEmbed()
     print("[serve] ready", flush=True)

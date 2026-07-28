@@ -24,6 +24,149 @@ is exact, reproducible, and it works on a 64 GB laptop.
 
 ---
 
+## Install
+
+Three commands, then you're generating. The only real decision is step 3.
+
+```bash
+# 1. environment (Python 3.12+, and Xcode CLT for clang)
+python3 -m venv venv
+./venv/bin/pip install torch numpy safetensors tiktoken ml_dtypes blobfile \
+    "transformers==4.56.2" einops tokenizers
+
+# 2. build the fused MXFP4 kernel
+clang -O3 -mcpu=native -shared -DNO_MAIN -o tools/libmxfp4gemv.dylib tools/fused_gemv.c
+
+# 3. download the model  (see the two modes below)
+./venv/bin/python tools/setup_k3.py --full
+```
+
+### The two modes
+
+| | `--full` (recommended) | `--stream` |
+|---|---|---|
+| Disk needed | **~1.7 TB** | **~215 GB** |
+| Download time | 5–10 hours, resumable | ~30 minutes |
+| Speed afterwards | ~60–76 s/token, every prompt | ~3+ min/token for anything not already cached |
+| Network at inference | none | constant |
+
+Every token reads 16 experts × 92 layers = **25.8 GB of expert data**. From local
+disk that's about 4 seconds; over the network it's minutes. That single fact is
+the whole difference between the two columns.
+
+Run `setup_k3.py` with no flag and it picks `--full` when the disk allows,
+otherwise falls back to streaming and tells you exactly how much space you'd
+need to free.
+
+### Starting with streaming and upgrading later
+
+Streaming is a fine way to try Deltafin without committing 1.7 TB. Whenever you
+want the speed, one command finishes the job — no reinstall, no reconfiguration,
+and it picks up whatever is already cached:
+
+```bash
+./venv/bin/python tools/fetch_experts_all.py          # resumable, run anytime
+./venv/bin/python tools/fetch_experts_all.py --dry-run   # just show the numbers
+./venv/bin/python tools/fetch_experts_all.py --layers 1-40   # partial is fine too
+```
+
+Deltafin prints a reminder at startup — both for the CLI and the API server —
+whenever it's still in streaming mode, showing how much of the pool is local and
+what finishing would cost.
+
+### Optional: int8 spine
+
+Halves per-token I/O for the non-expert weights, with no meaningful quality
+change in our checks. Takes a few minutes:
+
+```bash
+./venv/bin/python tools/convert_spine_int8.py
+```
+
+## Usage
+
+```bash
+# generate
+K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/kimi_run.py \
+    --prompt "The capital of France is" --max-new 16
+
+# chat template instead of raw completion
+K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/kimi_run.py \
+    --chat --prompt "Explain MoE routing in two sentences" --max-new 64
+```
+
+Router selections are logged to `router_trace.jsonl` if you want to study K3's
+routing behaviour.
+
+## OpenAI-compatible server
+
+Deltafin can serve the standard OpenAI API, so chat interfaces, the `openai` SDK
+and coding agents can use it by changing a base URL:
+
+```bash
+K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/serve_openai.py --port 8000
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "deltafin-kimi-k3", "max_tokens": 32,
+       "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+r = client.chat.completions.create(
+    model="deltafin-kimi-k3", max_tokens=32,
+    messages=[{"role": "user", "content": "Hello!"}])
+
+print(r.choices[0].message.content)            # the answer
+print(r.choices[0].message.reasoning_content)  # K3's thinking, when present
+```
+
+`/v1/chat/completions`, `/v1/completions` and `/v1/models` are implemented, and
+streaming (`"stream": true`) works. Most tools that read `OPENAI_BASE_URL` and
+`OPENAI_API_KEY` will work by pointing those at the server.
+
+Please read these caveats before pointing anything automated at it:
+
+- **Speed.** Roughly a token per minute. `max_tokens` defaults to 32 and is
+  capped at 256. Set your client's timeouts to hours, not seconds.
+- **Streaming installs are much slower here.** A chat-template prompt is 60
+  tokens or more and prefill touches many experts per layer, so on a partly
+  filled cache a chat request can spend hours fetching. With a full install it's
+  just normal (slow) inference. The server prints a warning at startup when
+  you're in streaming mode.
+- **Greedy only.** `temperature` and `top_p` are accepted and ignored, and one
+  request runs at a time (a second concurrent request gets a 429).
+- **Agents are a curiosity, not a workflow.** Coding assistants work in
+  principle, but their long system prompts make prefill expensive.
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `K3_DEV` | `cpu` | `mps` recommended on Apple Silicon |
+| `K3_SPINE` | `bf16` | `int8` halves resident I/O |
+| `K3_SPEC` | `1` | n-gram speculation (lossless) |
+| `K3_TEMPLATES` | `1` | template-layer buffer reuse |
+| `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
+| `K3_APPROX` | `0` | fp16 numerics; not reproducible at near-ties |
+| `K3_RAM_GB` / `K3_PIN_LAYERS` | auto | override the RAM budget |
+| `K3_PROFILE` | `0` | per-phase timing for each pass |
+| `DELTAFIN_ROOT` | repo root | where caches and weights live |
+| `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
+
+## Requirements
+
+- An Apple Silicon Mac. Developed on an M1 Max with 64 GB; more RAM is used
+  automatically.
+- Xcode Command Line Tools, for `clang` (`xcode-select --install`).
+- Python 3.12 or newer.
+- Disk: ~1.7 TB for the full install, ~215 GB for streaming (see [Install](#install)).
+- Network access to Hugging Face.
+
 ## How it works
 
 K3's weights total about 1.56 TB, which is more than this machine's free disk, let
@@ -33,10 +176,10 @@ Mixture-of-Experts model only *touches* a small fraction of itself per token.
 - **The resident spine** (~114 GB: attention, shared experts, latent projections,
   embeddings) is downloaded once and read layer-by-layer from local NVMe each token,
   quantized to int8 and computed on the GPU.
-- **The 82,432 routed experts** (~1.45 TB) stay on Hugging Face's CDN. For each
-  token K3's router picks 16 experts per layer, and Deltafin fetches just those —
-  one HTTP range request per expert — into a disk cache. Over time the cache grows
-  toward the subset of the model that actually gets used.
+- **The 82,432 routed experts** (~1.45 TB). For each token K3's router picks 16
+  experts per layer, and only those are read. Install them all locally if you can
+  (recommended); otherwise Deltafin fetches them from Hugging Face on demand —
+  one HTTP range request per expert — into a growing disk cache.
 - **The forward pass** runs Moonshot's own modeling code, unmodified. A small
   pure-PyTorch shim stands in for the CUDA-only `fla` kernels it expects.
 
@@ -72,9 +215,13 @@ They will vary with network speed, disk, and whatever else the machine is doing.
 | Metric | First attempt | After optimization | Change |
 |---|---|---|---|
 | Prefill (5-token prompt) | 2,429 s | 144 s | ~17× |
-| Warm decode | ~20 min/token | 60–76 s/token | ~16× |
+| Decode, experts local | ~20 min/token | 60–76 s/token | ~16× |
 | With speculation accepts | — | ~43 s/token effective | lossless |
-| Fresh text (uncached experts) | ~20 min/token | ~3 min/token | network-bound |
+| Decode, experts streamed | ~20 min/token | ~3 min/token | network-bound |
+
+The gap between the two decode rows is the whole argument for the full install
+([see above](#the-two-modes)): with the experts local, every prompt runs at the
+top-row speed instead of only the ones whose experts happen to be cached.
 
 Output is greedy and reproducible: the same prompt yields the same tokens, run
 after run.
@@ -176,109 +323,6 @@ We kept the failures, since they may save someone else the time:
 | MTP self-speculation | K3 doesn't ship an MTP head |
 | Two-Mac tensor parallel | both expert halves would need to be resident; the arithmetic doesn't come close |
 | fp16 by default | ~0.1 of logit noise was enough to flip near-tie tokens and change the output sequence |
-
-## Requirements
-
-- An Apple Silicon Mac. Developed on an M1 Max with 64 GB; more RAM is used
-  automatically.
-- Xcode Command Line Tools, for `clang` (`xcode-select --install`).
-- Python 3.12 or newer.
-- Free disk: about 175 GB for the spine and its int8 copy, plus room for the
-  expert cache, which grows with use. Budget 350 GB or more to be comfortable.
-- Network access to Hugging Face.
-
-## Getting started
-
-Steps 1–3 take a few minutes. Step 4 downloads 114 GB — roughly half an hour at
-70 MB/s — and is resumable. Nothing here needs `sudo`.
-
-```bash
-# 1. environment
-python3 -m venv venv
-./venv/bin/pip install torch numpy safetensors tiktoken ml_dtypes blobfile \
-    "transformers==4.56.2" einops tokenizers
-
-# 2. build the fused MXFP4 kernel
-clang -O3 -mcpu=native -shared -DNO_MAIN -o tools/libmxfp4gemv.dylib tools/fused_gemv.c
-
-# 3. one-time setup: fetches K3's config, tokenizer and modeling files
-#    (Moonshot's code is downloaded here, not vendored) and builds the tensor index
-./venv/bin/python tools/setup_k3.py
-
-# 4. fetch the resident spine (~114 GB, resumable)
-./venv/bin/python tools/fetch_spine.py
-
-# 5. optional but recommended: int8 spine (halves per-token I/O)
-./venv/bin/python tools/convert_spine_int8.py
-
-# 6. generate
-K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/kimi_run.py \
-    --prompt "The capital of France is" --max-new 16
-```
-
-Experts are fetched on demand into `k3-experts/`, so the first pass over any
-prompt is network-bound and later passes reuse the cache. Add `--chat` to render
-K3's chat template instead of a raw completion — but read the cold-cache caveat
-below first. Router selections are logged to `router_trace.jsonl` if you want to
-study K3's routing behaviour.
-
-## OpenAI-compatible server
-
-Deltafin can serve the standard OpenAI API, so chat interfaces, the `openai` SDK
-and coding agents can use it by changing a base URL:
-
-```bash
-K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/serve_openai.py --port 8000
-```
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "deltafin-kimi-k3", "max_tokens": 32,
-       "messages": [{"role": "user", "content": "Hello!"}]}'
-```
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
-r = client.chat.completions.create(
-    model="deltafin-kimi-k3", max_tokens=32,
-    messages=[{"role": "user", "content": "Hello!"}])
-
-print(r.choices[0].message.content)            # the answer
-print(r.choices[0].message.reasoning_content)  # K3's thinking, when present
-```
-
-`/v1/chat/completions`, `/v1/completions` and `/v1/models` are implemented, and
-streaming (`"stream": true`) works. Most tools that read `OPENAI_BASE_URL` and
-`OPENAI_API_KEY` will work by pointing those at the server.
-
-Please read these caveats before pointing anything automated at it:
-
-- **Speed.** Roughly a token per minute. `max_tokens` defaults to 32 and is
-  capped at 256. Set your client's timeouts to hours, not seconds.
-- **Cold-cache chat is very slow.** A chat-template prompt is 60 tokens or more,
-  and prefill touches many experts per layer, so on a fresh cache the first chat
-  request can spend hours fetching. Warm the cache with short completions first;
-  it persists across restarts and keeps improving.
-- **Greedy only.** `temperature` and `top_p` are accepted and ignored, and one
-  request runs at a time (a second concurrent request gets a 429).
-- **Agents are a curiosity, not a workflow.** Coding assistants work in
-  principle, but their long system prompts make prefill expensive.
-
-## Configuration
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `K3_DEV` | `cpu` | `mps` recommended on Apple Silicon |
-| `K3_SPINE` | `bf16` | `int8` halves resident I/O |
-| `K3_SPEC` | `1` | n-gram speculation (lossless) |
-| `K3_TEMPLATES` | `1` | template-layer buffer reuse |
-| `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
-| `K3_APPROX` | `0` | fp16 numerics; not reproducible at near-ties |
-| `K3_RAM_GB` / `K3_PIN_LAYERS` | auto | override the RAM budget |
-| `K3_PROFILE` | `0` | per-phase timing for each pass |
-| `DELTAFIN_ROOT` | repo root | where caches and weights live |
 
 ## Where this could go
 

@@ -493,6 +493,49 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
     return generated
 
 
+TOTAL_EXPERTS = 82432
+EXPERT_SPAN = 17547264
+
+
+def check_expert_pool():
+    """Streaming is the fallback, not the goal. Warn clearly when the expert pool
+    isn't fully local, because every novel prompt pays for it over the network."""
+    import shutil
+    cache = os.path.join(ROOT, "k3-experts")
+    try:
+        n = sum(1 for f in os.listdir(cache) if f.endswith((".bin", ".npz")))
+    except FileNotFoundError:
+        n = 0
+    if n >= TOTAL_EXPERTS:
+        return
+    missing = TOTAL_EXPERTS - n
+    need = missing * EXPERT_SPAN
+    free = shutil.disk_usage(ROOT).free
+    print("=" * 72)
+    print(f"  STREAMING MODE — {n:,} of {TOTAL_EXPERTS:,} experts are local "
+          f"({n/TOTAL_EXPERTS*100:.1f}%)")
+    print()
+    print("  Experts that aren't on disk get fetched from Hugging Face while you")
+    print("  generate. Every token needs 25.8 GB of expert data:")
+    print("      from local disk   ~4 s      ->  roughly 60-76 s per token")
+    print("      over the network  minutes   ->  roughly 3+ min per token")
+    print()
+    if free - need > 100e9:
+        print(f"  Downloading the rest is a one-time cost ({need/1e12:.2f} TB, you have "
+              f"{free/1e12:.2f} TB free)")
+        print("  and makes every prompt run at full speed:")
+        print()
+        print("      python tools/fetch_experts_all.py        # resumable, run anytime")
+    else:
+        short = (need + 100e9 - free) / 1e12
+        print(f"  Finishing the download needs {need/1e12:.2f} TB + 100 GB headroom, but only")
+        print(f"  {free/1e12:.2f} TB is free — about {short:.2f} TB short. Freeing that space is")
+        print("  the single biggest speedup available here. Partial helps too:")
+        print()
+        print("      python tools/fetch_experts_all.py --layers 1-40")
+    print("=" * 72, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default="The capital of France is")
@@ -507,6 +550,7 @@ def main():
                                       tokenize=True, add_generation_prompt=True)
     else:
         ids = tok.encode(args.prompt)
+    check_expert_pool()
     print(f"prompt tokens ({len(ids)}): {ids}", flush=True)
 
     layers = build_layers()

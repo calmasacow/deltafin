@@ -32,8 +32,8 @@ import numpy as np
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INV_PATH = os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")
-BASE_HOST = "huggingface.co"
-BASE_PATH = "/moonshotai/Kimi-K3/resolve/main/"
+BASE_HOST = os.environ.get("K3_HF_HOST", "huggingface.co")
+BASE_PATH = os.environ.get("K3_HF_PATH", "/moonshotai/Kimi-K3/resolve/main/")
 ECACHE = os.path.join(ROOT, "k3-experts")
 os.makedirs(ECACHE, exist_ok=True)
 
