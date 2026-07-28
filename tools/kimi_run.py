@@ -563,7 +563,9 @@ def check_expert_pool():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default="The capital of France is")
-    ap.add_argument("--max-new", type=int, default=8)
+    ap.add_argument("--max-new", type=int, default=None,
+                    help="cap on generated tokens; default: run until the model "
+                         "finishes (chat mode) or until Ctrl-C — both stop cleanly")
     ap.add_argument("--chat", action="store_true", help="use the K3 chat template")
     args = ap.parse_args()
 
@@ -581,10 +583,16 @@ def main():
     cache = ml.KimiDynamicCache(config)
     embed = LazyEmbed()
     t_start = time.time()
+    max_new = args.max_new or 1_000_000   # effectively: until EOS or Ctrl-C
+    if args.max_new is None and not args.chat:
+        print("note: raw completions have no natural end — press Ctrl-C to stop "
+              "cleanly, or pass --max-new N", flush=True)
     print(f"=== prefill: {len(ids)} tokens through 93 layers ===", flush=True)
     state = {"first": True}
+    generated = []   # mirrored via on_token so Ctrl-C still has the text
 
     def on_token(t):
+        generated.append(t)
         if state["first"]:
             state["first"] = False
             print(f"[prefill done in {time.time()-t_start:.0f}s] "
@@ -594,8 +602,13 @@ def main():
         print(f"[token {s}: {time.time()-t0:.0f}s{tag}] {tok.decode(gen)!r}", flush=True)
         print("   ", k3loader.cache_report(), flush=True)
 
-    generated = generate(layers, cache, embed, ids, args.max_new,
-                         on_token=on_token, verbose_prefill=True, log=log)
+    try:
+        generate(layers, cache, embed, ids, max_new,
+                 on_token=on_token, verbose_prefill=True, log=log)
+    except KeyboardInterrupt:
+        print("\n[stopped by Ctrl-C]", flush=True)
+    if EOS_ID in generated:
+        generated = generated[:generated.index(EOS_ID)]
 
     print("\n=== RESULT ===")
     print("completion:", tok.decode(generated))

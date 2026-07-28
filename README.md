@@ -86,13 +86,18 @@ change in our checks. Takes a few minutes:
 ## Usage
 
 ```bash
-# generate
-./venv/bin/python tools/kimi_run.py --prompt "The capital of France is" --max-new 16
+# ask a question; generates until the model finishes its answer
+./venv/bin/python tools/kimi_run.py --chat --prompt "What are the three largest moons of Saturn?"
 
-# chat template instead of raw completion
-./venv/bin/python tools/kimi_run.py --chat \
-    --prompt "Explain MoE routing in two sentences" --max-new 64
+# raw completion (no chat template); runs until you press Ctrl-C, or cap it
+./venv/bin/python tools/kimi_run.py --prompt "The capital of France is" --max-new 16
 ```
+
+Tokens print as they are generated, so you always see the text as it comes.
+Ctrl-C stops cleanly at any point and prints the result so far; `--max-new N`
+caps the length. One honest warning: K3 thinks before it answers, and at about
+a token per minute a full chat answer can take a while — watching it stream is
+part of the experience.
 
 Router selections are logged to `router_trace.jsonl` if you want to study K3's
 routing behaviour.
