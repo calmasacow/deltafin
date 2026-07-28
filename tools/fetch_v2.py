@@ -18,8 +18,11 @@ Expert layout facts (verified against tensor_inventory_offsets.json for all
 w1_p, w1_s, w2_p, w2_s, w3_p, w3_s with fixed sizes; each MoE layer's 896
 experts occupy ONE shard, back-to-back with zero gaps, sorted by str(eid).
 """
+import collections
+import fcntl
 import http.client
 import json
+import mmap
 import os
 import re
 import ssl
@@ -58,10 +61,28 @@ MAX_CONNS = int(os.environ.get("K3_FETCH_CONNS", "4"))
 BACKEND = os.environ.get("K3_FETCH_BACKEND", "httpclient")  # or "httpx"
 MAX_COALESCE = int(os.environ.get("K3_FETCH_COALESCE", "4"))  # experts per merged range
 
+# ---- local read path (K3_EXPERT_READ) -------------------------------------
+# "mmap"  : np.memmap views over the .bin cache; the pages are demand-faulted
+#           later, inside the GEMV kernel. Measured 0.87-0.93 GB/s.
+# "pread" : the whole layer's selected experts are pread() in parallel by a
+#           persistent worker pool into reused page-aligned buffers, so the
+#           kernel only ever touches resident memory. Measured ~7.0 GB/s.
+EXPERT_READ = os.environ.get("K3_EXPERT_READ", "pread")
+PREAD_WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "6"))
+PREAD_NOCACHE = os.environ.get("K3_PREAD_NOCACHE", "1") == "1"
+# free-slot high-water mark; prefill unions (up to 5 x 16 experts/layer) grow the
+# pool transiently and are trimmed back to this after the layer is done.
+PREAD_MAX_FREE = int(os.environ.get("K3_PREAD_MAX_FREE", "40"))
+# how many read_layer() results stay valid at once (buffer recycling depth).
+PREAD_DEPTH = int(os.environ.get("K3_PREAD_DEPTH", "2"))
+F_NOCACHE = 48          # <sys/fcntl.h>, Darwin: bypass the unified buffer cache
+
 stats = {
     "expert_http": 0, "expert_disk": 0, "http_bytes": 0, "http_s": 0.0,
     "requests": 0, "new_conns": 0, "conn_s": 0.0, "resolves": 0,
     "resolve_s": 0.0, "retries": 0, "coalesced_spans": 0,
+    "pread_experts": 0, "pread_bytes": 0, "pread_s": 0.0, "pread_slots": 0,
+    "prefetch_hits": 0, "prefetch_wasted": 0, "npz_experts": 0,
 }
 _stats_lock = threading.Lock()
 
@@ -302,6 +323,214 @@ def _range_get(shard, start, size):
 
 
 # ---------------------------------------------------------------------------
+# threaded pread reader (K3_EXPERT_READ=pread)
+# ---------------------------------------------------------------------------
+# Why this exists: the mmap path hands the GEMV kernel views over file-backed
+# pages that are still on disk, so the kernel demand-faults them while it
+# computes — measured 0.87-0.93 GB/s against 7.0 GB/s for a threaded pread pool
+# on the same files.  Here the whole layer's 16 experts (281 MB) are read in
+# parallel before the kernel starts, into page-aligned buffers that are recycled
+# across layers.  F_NOCACHE keeps 25.8 GB/token of expert traffic from evicting
+# the page cache the resident spine relies on.
+#
+# EXPERT_SPAN and every intra-expert offset are exact multiples of 16 KB
+# (17547264 = 1071*16K, _P = 336*16K, _S = 21*16K), so an anonymous-mmap slot is
+# always correctly aligned for an unbuffered read and metal_moe's zero-copy
+# contiguity test (base + off) still holds on these buffers.
+#
+# CAVEAT for tools/metal_moe.py: it caches MTLBuffer wraps keyed by base pointer
+# and assumes one pointer == one expert forever. Slots here are recycled, so the
+# same pointer carries a different expert a couple of layers later. The wrap
+# aliases the same memory so the GPU does read the fresh bytes, but the pin LRU
+# in metal_moe becomes meaningless — use metal_moe.raw_from_cache() (persistent
+# per-expert mmaps) rather than these buffers if that path is ever wired up.
+
+
+class _Slot:
+    """One recyclable page-aligned EXPERT_SPAN buffer + its numpy views."""
+    __slots__ = ("mm", "mv", "arr", "raw")
+
+    def __init__(self):
+        self.mm = mmap.mmap(-1, EXPERT_SPAN)
+        self.mv = memoryview(self.mm)
+        self.arr = np.ndarray((EXPERT_SPAN,), dtype=np.uint8, buffer=self.mm)
+        d = {}
+        for name, off, nb, shape in LAYOUT:
+            w, kind = name.split("_")
+            d.setdefault(w, {})[kind] = self.arr[off:off + nb].reshape(shape)
+        # stable dict: the views never move, so this is built once per slot
+        self.raw = {w: (v["p"], v["s"]) for w, v in d.items()}
+        _bump(pread_slots=1)
+
+    def read(self, path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            if PREAD_NOCACHE:
+                fcntl.fcntl(fd, F_NOCACHE, 1)
+            off = 0
+            while off < EXPERT_SPAN:
+                n = os.preadv(fd, [self.mv[off:]], off)
+                if n <= 0:
+                    raise IOError(f"short read {off}/{EXPERT_SPAN} from {path}")
+                off += n
+        finally:
+            os.close(fd)
+
+
+class _PreadReader:
+    """Persistent worker pool + recycled slot pool. One instance per process."""
+
+    def __init__(self):
+        self._ex = concurrent.futures.ThreadPoolExecutor(
+            PREAD_WORKERS, thread_name_prefix="k3pread")
+        self._free = []                       # idle _Slot objects
+        self._gens = collections.deque()      # [[slot, ...]] youngest last
+        self._pending = {}                    # layer -> {eid: (slot, future)}
+        self._lock = threading.Lock()
+
+    # -- slot bookkeeping ---------------------------------------------------
+    def _take(self, n):
+        with self._lock:
+            out = [self._free.pop() for _ in range(min(n, len(self._free)))]
+        out += [_Slot() for _ in range(n - len(out))]
+        return out
+
+    def _give(self, slots):
+        with self._lock:
+            self._free.extend(slots)
+            drop = len(self._free) - PREAD_MAX_FREE
+            extra = [self._free.pop() for _ in range(drop)] if drop > 0 else []
+        del extra                             # unmaps the surplus prefill slots
+
+    def _retire(self, slots):
+        """Publish this call's slots; recycle the ones PREAD_DEPTH calls old."""
+        old = []
+        with self._lock:
+            self._gens.append(slots)
+            while len(self._gens) > max(1, PREAD_DEPTH):
+                old.extend(self._gens.popleft())
+        if old:
+            self._give(old)
+
+    # -- reads --------------------------------------------------------------
+    def _job(self, slot, path):
+        t0 = time.time()
+        slot.read(path)
+        _bump(pread_experts=1, pread_bytes=EXPERT_SPAN, pread_s=time.time() - t0)
+        return slot
+
+    def _submit(self, layer, eids):
+        slots = self._take(len(eids))
+        return {e: (s, self._ex.submit(self._job, s, _cache_path_bin(layer, e)))
+                for e, s in zip(eids, slots)}
+
+    def prefetch(self, layer, eids):
+        """Speculatively start layer `layer`'s reads. At most one layer is kept
+        outstanding; a superseded prefetch is drained and its slots recycled."""
+        eids = [e for e in eids if _has_bin(layer, e)]
+        if not eids:
+            return
+        with self._lock:
+            busy = layer in self._pending or len(self._pending) >= 1
+        if busy:
+            return
+        jobs = self._submit(layer, eids)
+        with self._lock:
+            self._pending[layer] = jobs
+
+    def _drain(self, jobs):
+        """Wait out unwanted in-flight reads and hand their slots back."""
+        spare = []
+        for slot, fut in jobs.values():
+            if not fut.cancel():
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+            spare.append(slot)
+        _bump(prefetch_wasted=len(spare))
+        self._give(spare)
+
+    def drop_prefetch(self):
+        with self._lock:
+            pend, self._pending = self._pending, {}
+        for jobs in pend.values():
+            self._drain(jobs)
+
+    def read_layer(self, layer, eids):
+        """{eid: {"w1": (packed, scale), ...}} for the whole selected set, plus
+        the list of eids with nothing on disk (those go back to the HTTP path).
+
+        .bin spans go through the pread pool; legacy .npz entries keep the old
+        np.load path but are submitted to the same pool first, so they overlap
+        with the raw reads instead of running serially after them."""
+        want, other = [], []
+        for e in eids:
+            (want if _has_bin(layer, e) else other).append(e)
+        npz = {e: self._ex.submit(_cache_load, layer, e) for e in other}
+        missing = []
+        with self._lock:
+            pend = self._pending.pop(layer, None)
+        jobs = {}
+        if pend:
+            hits = [e for e in want if e in pend]
+            _bump(prefetch_hits=len(hits))
+            for e in hits:
+                jobs[e] = pend.pop(e)
+            if pend:
+                self._drain(pend)             # speculation misses -> free slots
+            want = [e for e in want if e not in jobs]
+        if want:
+            jobs.update(self._submit(layer, want))
+        raw, slots = {}, []
+        err = None
+        for e, (slot, fut) in jobs.items():
+            try:
+                fut.result()
+                raw[e] = slot.raw
+            except Exception as ex:           # unreadable .bin -> other path
+                err = err or ex
+                missing.append(e)
+            slots.append(slot)
+        self._retire(slots)
+        _bump(expert_disk=len(raw))
+        if err is not None and not raw:
+            raise err
+        for e, fut in npz.items():
+            hit = fut.result()
+            if hit is None:
+                missing.append(e)
+            else:
+                raw[e] = hit
+                _bump(npz_experts=1)
+        return raw, missing
+
+
+_reader = None
+_reader_lock = threading.Lock()
+
+
+def reader():
+    global _reader
+    if _reader is None:
+        with _reader_lock:
+            if _reader is None:
+                _reader = _PreadReader()
+    return _reader
+
+
+def prefetch_layer(layer, eids):
+    """Start a layer's expert reads early (K3_EXPERT_READ=pread only)."""
+    if EXPERT_READ == "pread":
+        reader().prefetch(layer, list(eids))
+
+
+def drop_prefetch():
+    if EXPERT_READ == "pread" and _reader is not None:
+        _reader.drop_prefetch()
+
+
+# ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
 def _slice_expert(buf, base=0):
@@ -323,6 +552,13 @@ def _cache_path_bin(layer, eid):
     # raw format: the expert's 17,547,264-byte shard span verbatim (w1_p w1_s w2_p
     # w2_s w3_p w3_s) — zero-parse, mmap-able; npz kept as read fallback
     return os.path.join(ECACHE, f"L{layer}-E{eid}.bin")
+
+
+def _has_bin(layer, eid):
+    try:
+        return os.stat(_cache_path_bin(layer, eid)).st_size == EXPERT_SPAN
+    except OSError:
+        return False
 
 
 def _cache_store_raw(layer, eid, span):
@@ -377,17 +613,37 @@ def _fetch_group(shard, group):
     return out
 
 
+def _finish(raw, dequant):
+    if not dequant:
+        return {e: {w: (np.ascontiguousarray(p), np.ascontiguousarray(s))
+                    for w, (p, s) in ws.items()} for e, ws in raw.items()}
+    import torch
+    from mxfp4 import dequant_mxfp4
+    return {e: {w: torch.from_numpy(dequant_mxfp4(p, s))
+                for w, (p, s) in ws.items()} for e, ws in raw.items()}
+
+
 def fetch_experts(layer, eids, workers=None, dequant=True, coalesce=True):
     """Parallel fetch of a routed set; signature-compatible with k3loader.
-    Coalesces file-adjacent misses into single multi-expert Range requests."""
+    Coalesces file-adjacent misses into single multi-expert Range requests.
+
+    With K3_EXPERT_READ=pread the .bin-cached experts of the whole layer are
+    read up front by the worker pool; the returned arrays are views into
+    recycled buffers and stay valid for K3_PREAD_DEPTH (default 2) further
+    fetch_experts() calls — long enough for the caller's MoE kernel to run."""
     workers = workers or MAX_CONNS
     raw, misses = {}, []
-    for e in eids:
-        hit = _cache_load(layer, e)
-        if hit is not None:
-            raw[e] = hit
-        else:
-            misses.append(e)
+    if EXPERT_READ == "pread":
+        raw, misses = reader().read_layer(layer, list(eids))
+        if not misses:                       # the all-local steady state
+            return _finish(raw, dequant)
+    else:
+        for e in eids:
+            hit = _cache_load(layer, e)
+            if hit is not None:
+                raw[e] = hit
+            else:
+                misses.append(e)
     if misses:
         spans = sorted((expert_span(layer, e)[1], e) for e in misses)
         shard = expert_span(layer, misses[0])[0]
@@ -402,13 +658,7 @@ def fetch_experts(layer, eids, workers=None, dequant=True, coalesce=True):
         with concurrent.futures.ThreadPoolExecutor(min(workers, len(groups))) as ex:
             for fut in [ex.submit(_fetch_group, shard, g) for g in groups]:
                 raw.update(fut.result())
-    if not dequant:
-        return {e: {w: (np.ascontiguousarray(p), np.ascontiguousarray(s))
-                    for w, (p, s) in ws.items()} for e, ws in raw.items()}
-    import torch
-    from mxfp4 import dequant_mxfp4
-    return {e: {w: torch.from_numpy(dequant_mxfp4(p, s))
-                for w, (p, s) in ws.items()} for e, ws in raw.items()}
+    return _finish(raw, dequant)
 
 
 def close():

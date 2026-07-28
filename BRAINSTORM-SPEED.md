@@ -19,7 +19,7 @@ Timeline of the day: first run ~20 min/token → run 3 (mps+int8+v2) ~127 s → 
 | S5 | Raw-span expert cache (.bin = verbatim shard bytes, mmap on hit; replaced npz zip+CRC parsing ~1,472 loads/token) | in quartet; gate-clean |
 | S6 | Double-buffered layer loader (worker thread reads layer N+1 blobs during layer N compute) | in quartet; gate-clean |
 | S7 | Resident lm_head on GPU (was 2.35 GB re-read+dequant per token) | in quartet; gate-clean |
-| S8 | Previous-token whole-depth expert prefetch (fires the prior token's per-layer sets at step start) | in quartet; recall basis measured 39.1–39.7% |
+| S8 | Previous-token whole-depth expert prefetch (fires the prior token's per-layer sets at step start) | in quartet; honest recall **30.8%** on a deduplicated holdout (the 39.1–39.7% we first quoted was inflated by repeated prompts in the trace) |
 | — | Quartet net (S5–S8) | decode 127→76 s warm; prefill 219→154 s |
 
 ## ✅ Validated prototype, integration pending
@@ -86,3 +86,145 @@ SSD 6.6 GB/s (4–8-thread F_NOCACHE) / 7.0 GB/s (buffered+RDADVISE); GPU 283–
 v2 4-conn 57.7 MB/s; expert = 17,547,264 B (33.03 M params, MXFP4); per-token expert touch
 = 16×92 = 1,472 selections ≈ 25.8 GB uncached; resident spine 113.5 GB bf16 / 60 GB int8;
 consecutive-token expert overlap 39.1–39.7%; top-16/896 in-sample routing mass 40.8%.
+
+---
+
+## Post-download campaign (queued 2026-07-28, starts when the expert pool is 100% local)
+
+Once all 82,432 experts are on local disk, expert *fetching* stops being the
+bottleneck (25.8 GB/token from NVMe at 6.6 GB/s ≈ 4 s, versus minutes over the
+network). The problem reorders: **expert compute and resident I/O become the
+entire cost.** Measured shares from the last profiled token, and what each phase
+of the campaign targets:
+
+| phase | measured now | target | approach |
+|---|---|---|---|
+| expert fetch | 79 s | ~4 s | (free — the download itself) |
+| MoE kernel | 43 s | ~5 s | Metal expert kernel, validated at 150 GB/s = 9.5× the CPU path |
+| resident I/O | 49 s | ~25 s | int4 spine (opt-in, quality-gated), better overlap |
+| other compute | ~7 s | ~3 s | torch.compile on the two layer templates |
+
+**Order of work** (each step re-profiled before the next, since the bottleneck moves):
+
+1. **Re-baseline.** Fresh `K3_PROFILE=1` run on a quiet, fully-local machine. Every
+   number above was taken under contention and must be re-measured before decisions.
+2. **Metal expert kernel** (prototype validated, bridge written in advance). Biggest
+   single lossless win available. Must batch a whole layer per command buffer —
+   per-expert dispatch measured 29 GB/s versus 150 GB/s batched.
+3. **Batched CPU GEMV** — one dylib call per layer instead of 48, persistent
+   P-core-pinned pool. Useful on its own and as the fallback path.
+4. **torch.compile** on the KDA/MLA templates. Template-layer reuse made this viable
+   by giving the graph stable shapes *and* stable parameter identities.
+5. **RAM-pinned hot-expert tier** — with 1.45 TB on disk and ~40 GB of RAM spare, pin
+   the highest-frequency experts. Sizing decided by the holdout locality study.
+6. **int4 spine** — opt-in only, and only if the quality gate passes (int8 shifted the
+   top logit 0.07% and preserved top-5 order; int4-g64 is expected to be ~3× worse).
+7. **Quality harness** (avg NLL vs the official API) — the instrument that lets the
+   lossy dials (top-k truncation ×1.33–2.0, cache-aware routing +39% on colibri's
+   measurements) be *measured* rather than argued about.
+8. **ANE** — lm_head as a CoreML fp16 model first, then possibly the whole resident
+   spine. The third compute engine on the die is still completely idle.
+
+The destination remains the ds4-style C engine (PLAN.md §5), where the Python
+overhead disappears entirely. Everything above feeds it.
+
+### Prep round results (2026-07-28, written while the expert download ran)
+
+| item | status | evidence |
+|---|---|---|
+| **Metal MoE bridge** (`tools/metal_moe.{mm,py}`, `tools/metal/moe_mxfp4.metal`) | ready to benchmark | 2.5e-7 relative error vs the CPU path on a real 16-expert decode layer (target was 1e-4); bindless and per-expert dispatch modes bit-identical to each other; zero-copy confirmed (0 host copies on the mmap path); w1/w3 fused into one pass over x, so an expert costs 2 GEMV passes not 3 |
+| **Batched CPU GEMV** (`tools/fused_gemv_batch.c`, `tools/fast_moe_batch.py`) | ready to benchmark | **max relative error exactly 0.000e+00** vs the shipped path — it `#include`s the shipped kernel rather than reimplementing it; 48 ctypes calls per layer become 2, with zero thread creations after pool init (was 192 create/join per layer) |
+| **int4 spine** (`tools/convert_spine_int4.py`, `tools/int4_loader.py`) | **DROP for uniform int4** | built and bit-exact (25/25 checks, MPS == CPU), but the quality gate fails: int4-g64 weight error is **10.1× int8** (11.1% vs 1.1% relative Frobenius) — about 3× worse than predicted, and in the wrong direction. g=32 is 9.0×, g=128 is 11.1×. Not worth an end-to-end benchmark; kept in-tree for anyone who wants to try mixed precision |
+| **Expert locality study** (`tools/expert_locality.py`) | done, corrective | see below |
+
+Two latent bugs were found and fixed during bring-up, both of which would have been
+painful later: the Metal wrap cache could alias a *stale* expert after an LRU eviction
+unmapped its backing pages, and the batched pool could deadlock when a worker latched
+its generation counter before the dispatcher bumped it.
+
+**The locality study corrected our own published numbers.** The router trace is an
+append log across many re-runs of a handful of prompts — only 55% of token-passes have
+a distinct routing signature. Re-measured on unique contexts with a 60/40 chronological
+holdout: previous-token recall is **30.8%** (not 39.7%), and a 40 GB frequency-pinned
+RAM tier gets **41.1%** (not 51.9%). The gap between honest and in-sample numbers
+*widens* with cache size, because the tail of the pinned set is exactly the part that
+does not generalize. Also learned: global LRU is useless at any size below one token's
+1,472-expert working set, and cross-layer co-activation lift is only ~1.20× median —
+too weak to justify building a router surrogate on.
+
+
+### Fully-local baseline (2026-07-28) — the campaign's assumptions were wrong
+
+First profile with all 82,432 experts on local disk. **Decode token: 30 s** (was 60–76 s
+while streaming). Per-token split, measured not estimated:
+
+| phase | per token | share | what I predicted |
+|---|---|---|---|
+| expert reads | **12.9 s** | 43% | ~4 s |
+| resident spine apply | **13.6 s** | 45% | ~25 s |
+| MoE kernel | **1.9 s** | 6% | ~43 s |
+| other compute (attention, norms) | 2.0 s | 7% | ~7 s |
+
+Two corrections worth recording:
+
+1. **The MoE kernel was never the problem.** The 43 s figure came from a run whose
+   "compute" bucket also contained network waits and prefill. At 1.9 s it is 6% of a
+   token, so the Metal expert kernel — validated at 9.5× the CPU path — is worth about
+   1.7 s here, not tens of seconds. It stays on the list; it is no longer the headline.
+2. **We repeated ds4's mistake in our own code.** Expert reads run at 25.8 GB / 12.9 s =
+   **2.0 GB/s**, which is precisely the cold-mmap-demand-fault rate measured on day one
+   (0.66 GB/s single-threaded, 2.0 GB/s with parallel faulting) — because `fetch_v2`
+   returns `np.memmap` views and lets the GEMV kernel fault pages in as it computes. The
+   threaded `F_NOCACHE` pread pool we benchmarked at 6.6 GB/s was never wired into the
+   cache-hit path. We criticised ds4 for exactly this class of bug (`posix_madvise` being
+   a no-op on macOS) and then shipped our own version of it.
+
+Revised priority order: expert read path, then resident apply, then Metal MoE, then
+torch.compile. The lesson that keeps repeating: profile on the real configuration before
+choosing what to optimise.
+
+
+### I/O campaign results (2026-07-28) — decode 32 s -> 16 s, both now default-on
+
+Sequential A/B on a quiet machine, fully local, 2 decode tokens each. Every config
+produced the reference completion " Paris.".
+
+| config | decode token | wall (prefill + 2 tokens) | resident apply | expert fetch |
+|---|---|---|---|---|
+| baseline (mmap + torch dequant) | 32 s | 107 s | 28.2 s | 46.8 s |
+| pread expert reads only | 24 s | 71 s | 27.9 s | 26.4 s |
+| fast spine only | 23 s | 75 s | **3.6 s** | 50.7 s |
+| **both (now the default)** | **16 s** | **57 s** | 4.1 s | 32.4 s |
+| both + speculative L+1 prefetch | 16 s | 57 s | 4.1 s | 32.4 s |
+
+**Exactly 2× on decode, and the two fixes compose** (each ~25% alone, 50% together).
+
+**S9 — expert reads via threaded F_NOCACHE pread** (`K3_EXPERT_READ`, default `pread`).
+The old path returned `np.memmap` views and let the GEMV kernel fault pages in while it
+computed. Cold micro-benchmark: memmap+touch **0.87 GB/s**, threaded pread + `F_NOCACHE`
+**6.85 GB/s**. Isolated read path 40.2 s -> 4.3 s per token (9.3×). A whole layer's 16
+experts are now read in parallel from the router's ids instead of faulting in serially.
+Note the old accounting understated this: under mmap, `fetch_experts` did almost no I/O,
+so the cost was split between the `expert_fetch` and `moe_kernel` buckets.
+
+**S10 — fast resident spine** (`K3_FAST_SPINE`, default on). Measurement, not guesswork,
+found the cost was *not* file reads (already hidden in the preloader — proven with a
+`preload_wait` counter reading 0.4 s) but torch's row-broadcast multiply on MPS: **43.7
+GB/s versus 334 GB/s for a plain copy of the same traffic.** Nine PyTorch formulations
+topped out at 60 GB/s; a custom Metal dequant kernel via `torch.mps.compile_shader` hits
+**297 GB/s**. Two further finds: a 634 MB MPS alloc/free per layer cost more than the
+dequant (fixed with persistent staging buffers), and blocking H2D transfers wedged
+between kernel dispatches stalled the main thread on the GPU queue (fixed by hoisting
+them). Per-layer apply 117.8 ms -> 21.2 ms; bit-exact, `max|diff| = 0.000e+00` across
+nine real layers.
+
+**Speculative L+1 expert prefetch: no measurable gain** (`K3_EXPERT_PREFETCH`, stays
+off). Once reads run at disk speed there is nothing left to hide, and at ~31% recall it
+reads ~1.6× the bytes for it. Kept as a flag, documented as a dead end.
+
+Where a 16 s token now goes (approximate, from the D column): expert reads ~6 s,
+attention/norm compute ~5 s, MoE kernel ~2 s, resident apply ~2 s, other ~1 s. The
+remaining read cost is partly the 12,676 legacy `.npz` cache entries (~15% of selections)
+that still go through `np.load` at ~2.9 GB/s — converting them to raw `.bin` is the next
+cheap read-path win. After that the ranking is: Metal MoE kernel (~2 s), then
+`torch.compile` on the layer templates (~5 s of attention compute).

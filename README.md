@@ -10,13 +10,14 @@
 
 ### An experiment in running [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters) on one Apple Silicon Mac
 
-Deltafin is a small research project that streams a Mixture-of-Experts model much
-larger than the machine it runs on. It is not fast — about a token per minute on
-our M1 Max — but it is exact, reproducible, and it works on a 64 GB laptop.
+Deltafin is a small research project that runs a Mixture-of-Experts model far
+larger than the machine it sits on. It is not fast — about 16 seconds per token
+on our M1 Max — but it is exact, reproducible, and it works on a 64 GB laptop.
 Newer chips and more RAM make it faster automatically.
 
 ![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
-![hardware](https://img.shields.io/badge/tested_on-M1_Max_·_64GB-silver)
+![hardware](https://img.shields.io/badge/measured_on-M1_Max_·_64GB-silver)
+![speed](https://img.shields.io/badge/decode-16s%2Ftoken_(M1_Max)-orange)
 ![precision](https://img.shields.io/badge/experts-MXFP4_native-teal)
 ![mode](https://img.shields.io/badge/decoding-greedy_·_reproducible-green)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -172,9 +173,11 @@ startup. These variables exist for overriding that:
 
 ## Requirements
 
-- An Apple Silicon Mac. Developed on an M1 Max with 64 GB — the slowest thing
-  it has run on. More RAM is used automatically (a 128 GB machine pins several
-  times more of the model), and newer chips bring much higher memory bandwidth.
+- An Apple Silicon Mac. All published numbers are from an M1 Max with 64 GB —
+  the slowest machine it has run on. More RAM is used automatically (a 128 GB
+  machine pins several times more of the model), and newer chips bring higher
+  memory bandwidth, more GPU cores and faster storage. See
+  [Why newer Macs should be faster](#why-newer-macs-should-be-faster).
 - Xcode Command Line Tools, for `clang` (`xcode-select --install`).
 - Python 3.12 or newer.
 - Disk: ~1.7 TB for the full install, ~215 GB for streaming (see [Install](#install)).
@@ -222,19 +225,52 @@ flowchart LR
 
 ## What to expect
 
-These numbers come from one M1 Max (64 GB) on the day the weights were released
-— treat them as the floor, not the ceiling. An M3/M4/M5 machine with more RAM
-should do meaningfully better: memory bandwidth is higher across the board, and
-Deltafin automatically pins several times more of the model in RAM on a 128 GB
-machine. If you run it on newer hardware, we would genuinely love to see your
-numbers.
+All numbers below were measured on **one M1 Max (10-core CPU, 32-core GPU,
+64 GB, internal NVMe)** with the full model installed locally, greedy decoding,
+on a quiet machine. **This is the slowest machine Deltafin has run on — treat
+these as a floor.**
 
-| Metric | First attempt | After optimization | Change |
+| Metric | First working version | Now | Change |
 |---|---|---|---|
-| Prefill (5-token prompt) | 2,429 s | 144 s | ~17× |
-| Decode, experts local | ~20 min/token | 60–76 s/token | ~16× |
-| With speculation accepts | — | ~43 s/token effective | lossless |
+| Prefill (5-token prompt) | 2,429 s | **40 s** | ~60× |
+| Decode, experts local | ~20 min/token | **16 s/token** | ~75× |
 | Decode, experts streamed | ~20 min/token | ~3 min/token | network-bound |
+
+Roughly 3.75 tokens per minute. Where those 16 seconds go, per token:
+
+| | |
+|---|---|
+| reading the 16 selected experts per layer (25.8 GB) | ~6 s |
+| attention and norms (93 layers) | ~5 s |
+| MoE expert matmuls | ~2 s |
+| loading the resident spine | ~2 s |
+| everything else | ~1 s |
+
+### Why newer Macs should be faster
+
+Every one of those lines is bound by something the M1 Max is simply the weakest
+at. Nothing here is tuned for a specific chip, so a newer machine should pick up
+the difference without any configuration:
+
+- **Memory bandwidth.** The M1 Max has 400 GB/s. An M3/M4 Max is meaningfully
+  higher and an Ultra roughly doubles it — that lands directly on the spine load
+  and the expert matmuls.
+- **GPU.** More cores execute the same Metal kernels faster; the dequant shader
+  and the attention path both scale with it.
+- **SSD.** Expert reads are the single biggest slice, and they run at whatever
+  the internal drive delivers. Later Macs ship faster NVMe.
+- **RAM.** Deltafin sizes itself at startup: a 128 GB machine pins several times
+  more of the model and leaves a much larger page cache for expert reads. That
+  is automatic — no flags.
+
+We have only ever run this on the one machine. **If you try it on an M3, M4 or
+M5, or with 128 GB, we would genuinely like to see your numbers** — open an
+issue with the output of `K3_PROFILE=1` and your chip.
+
+When n-gram speculation accepts a draft, one forward pass emits two tokens, so
+repetitive text runs proportionally faster. Speculation is lossless: accepted
+drafts reproduce the reference sequence exactly, and a rejected draft restores
+the model state bit-for-bit.
 
 The gap between the two decode rows is the whole argument for the full install
 ([see above](#the-two-modes)): with the experts local, every prompt runs at the
@@ -246,9 +282,10 @@ after run.
 > `The capital of France is` → ` Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also in Paris. The Louvre has…`
 
 To be clear about the limitations: this is a research artifact, not a practical
-chat setup. On the test machine a token a minute is a long way from interactive,
-and long prompts are expensive because prefill touches many experts. We think it is interesting mainly as an existence proof, and
-as a testbed for streaming-inference techniques.
+chat setup. Sixteen seconds a token is a long way from interactive, and long
+prompts are expensive because prefill touches many experts. We think it is
+interesting mainly as an existence proof, and as a testbed for
+streaming-inference techniques.
 
 ## Techniques
 
@@ -266,12 +303,19 @@ from the projects credited below to K3's particular shape.
   6.4× faster than fetching tensors individually. We also tried HTTP/2; it was
   slower than HTTP/1.1 keep-alive in this setting.
 - **Raw-span disk cache.** Cache files are the shard bytes verbatim — no container
-  format, `mmap` on read.
+  format, no parsing.
+- **Parallel expert reads.** A layer's 16 selected experts are read together by a
+  thread pool using `pread` with `F_NOCACHE`, rather than being demand-faulted
+  page by page while the kernel computes. Measured cold: 0.87 GB/s faulting
+  versus 6.85 GB/s reading. This was worth 40 s → 4.3 s per token on the read
+  path alone, and `F_NOCACHE` keeps 25 GB/token of expert traffic from evicting
+  the page cache the spine needs.
 - **Double-buffered layer loading.** A worker thread reads the next layer's spine
   data while the current layer computes.
-- **Previous-token prefetch.** Consecutive tokens reuse roughly 40% of expert
-  selections (we measured 39.7%, close to the 41.3% colibri reported for GLM), so
-  each token's expert set is fetched in the background for the next one.
+- **Previous-token prefetch.** Consecutive tokens reuse about 31% of their expert
+  selections, so each token's set is fetched in the background for the next one.
+  (An earlier 39.7% figure counted repeated prompts in our own trace; on a
+  deduplicated holdout it is 30.8%, below the 41.3% colibri reported for GLM.)
 
 ### Compute
 
@@ -286,6 +330,12 @@ from the projects credited below to K3's particular shape.
   churn that profiling showed was a large share of per-token time.
 - **int8 resident spine.** Halves the per-token resident I/O. In our checks the
   top-5 next-token candidates kept their order and the top logit moved by 0.07%.
+- **Custom Metal dequant kernel.** Loading the spine spent most of its time in a
+  row-broadcast multiply that MPS runs at 43 GB/s, against 334 GB/s for a plain
+  copy of the same bytes. A small `compile_shader` kernel fusing int8→fp32, the
+  row scale, and the copy reaches 297 GB/s; with persistent staging buffers and
+  transfers hoisted out from between dispatches, per-layer load went 118 ms →
+  21 ms. Bit-exact: `max|diff| = 0` on every tensor.
 - **Pure-PyTorch KDA shim** ([`tools/fla/`](tools/fla)) — Kimi Delta Attention's
   recurrence, short convolution, and gated norm, ported from fla-core's semantics.
   Chunked and step-by-step execution agree to about 1e-9. At decode the recurrence

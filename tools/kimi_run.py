@@ -68,7 +68,8 @@ if SPINE == "bf16" and "K3_SPINE" not in os.environ:
 APPROX = os.environ.get("K3_APPROX", "0") == "1"
 DT = torch.float16 if (APPROX or os.environ.get("K3_DTYPE", "fp32") == "fp16") else torch.float32
 TRACE = open(os.path.join(ROOT, "k3-meta/router_trace.jsonl"), "a")
-TIMES = {"resident_io": 0.0, "expert_fetch": 0.0, "compute": 0.0, "moe_kernel": 0.0}
+TIMES = {"resident_io": 0.0, "expert_fetch": 0.0, "compute": 0.0, "moe_kernel": 0.0,
+         "preload_wait": 0.0}   # time the main thread blocks on the preloader
 PROFILE = os.environ.get("K3_PROFILE", "0") == "1"
 PROF = {"kda": 0.0, "mla": 0.0, "n_kda": 0, "n_mla": 0}
 
@@ -135,6 +136,15 @@ PRELOAD = os.environ.get("K3_PRELOAD", "1") == "1"
 # layers another. Two persistent materialized templates + copy_() per layer
 # kills the MPS alloc/free churn measured at 1317 -> 288 ms/layer.
 TEMPLATES = os.environ.get("K3_TEMPLATES", "1") == "1"
+
+# --- fast resident-spine path (K3_FAST_SPINE=1, default off) ------------------
+# Packed readinto + one H2D per layer + a bit-exact Metal dequant kernel.
+# See tools/spine_fast.py for the measurements that motivate each piece.
+import spine_fast  # noqa: E402
+
+if spine_fast.FAST or spine_fast.DEQ == "metal":
+    spine_fast.metal_available()          # compile once, on the main thread
+    print(f"[spine] fast path: {spine_fast.describe()}", flush=True)
 
 
 def _ram_budget_layers():
@@ -205,17 +215,31 @@ _orig_moe_infer = ml.KimiSparseMoeBlock.moe_infer
 FAST_MOE = os.environ.get("K3_FAST_MOE", "1") == "1"
 import fast_moe  # noqa: E402
 
+fetch_v2 = None
 if os.environ.get("K3_FETCH", "v2") == "v2":
     import fetch_v2
     k3loader.fetch_experts = fetch_v2.fetch_experts  # 6.4x: coalesced + keep-alive
 
+# K3_EXPERT_READ=pread (see tools/fetch_v2.py) reads the layer's whole selected
+# set through a threaded pread pool instead of demand-faulting mmap pages inside
+# the GEMV kernel. K3_EXPERT_PREFETCH=1 additionally starts layer L+1's reads
+# from the previous token's selections while layer L computes — separate flag,
+# because it is speculative (39.7% measured recall) and costs wasted bandwidth.
+PREAD = fetch_v2 is not None and fetch_v2.EXPERT_READ == "pread"
+EXPERT_PREFETCH = PREAD and os.environ.get("K3_EXPERT_PREFETCH", "0") == "1"
 
 _LAST_SEL = {}   # layer -> ids selected for the most recent token (prefetch oracle)
+_PREV_SEL = {}   # snapshot of _LAST_SEL taken when the current pass started
 
 
 def prefetch_prev_token():
     """Fire-and-forget: fetch the previous token's full per-layer expert sets
     (39.7% measured next-token recall); misses stream to disk while layers compute."""
+    if PREAD:
+        # Under the pread path this would issue 25.8 GB of real reads from a
+        # background thread, fighting the foreground layer for the same disk.
+        # The per-layer K3_EXPERT_PREFETCH hook replaces it.
+        return
     import threading
     snap = dict(_LAST_SEL)
 
@@ -235,6 +259,10 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
     t0 = time.time()
     raw = k3loader.fetch_experts(li, ids, dequant=not FAST_MOE)
     TIMES["expert_fetch"] += time.time() - t0
+    if EXPERT_PREFETCH:
+        nxt = _PREV_SEL.get(li + 1)
+        if nxt:
+            fetch_v2.prefetch_layer(li + 1, nxt)
     TRACE.write(json.dumps({"step": _step_ctx["step"], "layer": li,
                             "ids": topk_ids.view(-1).tolist(),
                             "w": [round(x, 5) for x in topk_weight.view(-1).tolist()]}) + "\n")
@@ -322,7 +350,18 @@ def copy_resident(module, prefix, blobs):
             shape = k3loader.INV[full]["shape"]
             q = torch.frombuffer(bytearray(rec[1]), dtype=torch.int8).reshape(shape)
             sc = torch.frombuffer(bytearray(rec[2]), dtype=torch.float16).reshape(shape[0], 1)
-            t = (q.to(DEV).to(torch.float32) * sc.to(DEV).to(torch.float32)).to(DT)
+            qd, scd = q.to(DEV), sc.to(DEV)
+            # K3_SPINE_DEQ=metal: fuse int8->fp32 + row-scale + the copy_ into one
+            # bit-exact kernel writing straight into the template buffer.
+            if (spine_fast.DEQ != "torch" and p.device.type == DEV.type
+                    and p.shape == torch.Size(shape) and p.dtype == torch.float32
+                    and DT == torch.float32):
+                if spine_fast.DEQ == "metal" and spine_fast.dequant_into(
+                        p.data, qd, scd.view(-1)):
+                    continue
+                torch.mul(qd, scd.to(torch.float32), out=p.data)
+                continue
+            t = (qd.to(torch.float32) * scd.to(torch.float32)).to(DT)
         else:
             meta = k3loader.INV[full]
             t = torch.frombuffer(bytearray(rec[1]),
@@ -332,6 +371,26 @@ def copy_resident(module, prefix, blobs):
         else:
             p.data.copy_(t)
     TIMES["resident_io"] += time.time() - t0
+
+
+# --- resident read/apply dispatch --------------------------------------------
+# K3_SPINE_PACK=1 routes a layer through spine_fast (one packed readinto, one
+# H2D, fused dequant). Default 0 = the existing per-tensor path, unchanged.
+def _spine_read(module, prefix):
+    if spine_fast.PACK:
+        return spine_fast.read_pack(module, prefix, INT8_DIR, k3loader.RES,
+                                    k3loader.INV, SPINE, k3loader.load_resident)
+    return _read_resident_bytes(module, prefix)
+
+
+def _spine_apply(module, prefix, pack):
+    if spine_fast.PACK:
+        t0 = time.time()
+        spine_fast.apply_pack(module, prefix, pack, DEV, DT, k3loader.INV,
+                              k3loader._DT, set_param, k3loader.load_resident)
+        TIMES["resident_io"] += time.time() - t0
+        return
+    (copy_resident if TEMPLATES else _apply_resident)(module, prefix, pack)
 
 
 def causal_mask(T, dtype=None):
@@ -345,6 +404,10 @@ def causal_mask(T, dtype=None):
 def forward_pass(layers, cache, hidden, step, verbose=True):
     """hidden: [1, T, H] fp32. Returns logits [1, T, vocab]."""
     T = hidden.shape[1]
+    if EXPERT_PREFETCH:
+        global _PREV_SEL
+        _PREV_SEL = dict(_LAST_SEL)     # last token's routing = this pass's oracle
+        fetch_v2.drop_prefetch()        # nothing from the previous pass is valid
     mask = causal_mask(T + (cache.get_seq_length() or 0))[:, :, -T:, :] if T > 1 else None
     block_residual = hidden.new_zeros(T, 0, H)
 
@@ -354,7 +417,7 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
         return j
 
     nxt = _next_unpinned(0)
-    fut = (_PRELOADER.submit(_read_resident_bytes, layers[nxt], f"{PFX}layers.{nxt}.")
+    fut = (_PRELOADER.submit(_spine_read, layers[nxt], f"{PFX}layers.{nxt}.")
            if PRELOAD and nxt < NL else None)
     for i, layer in enumerate(layers):
         _step_ctx["layer"] = i
@@ -364,15 +427,18 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
         pinned = i < PIN_N and getattr(layer, "_k3_res", False)
         if not pinned:
             if PRELOAD and fut is not None and i == nxt:
+                _tw = time.time()
                 blobs = fut.result()
+                TIMES["preload_wait"] += time.time() - _tw
                 j = _next_unpinned(i + 1)
-                fut = (_PRELOADER.submit(_read_resident_bytes, layers[j], f"{PFX}layers.{j}.")
+                fut = (_PRELOADER.submit(_spine_read, layers[j], f"{PFX}layers.{j}.")
                        if j < NL else None)
                 nxt = j
-                (copy_resident if TEMPLATES else _apply_resident)(layer, f"{PFX}layers.{i}.", blobs)
+                _spine_apply(layer, f"{PFX}layers.{i}.", blobs)
             else:
-                if TEMPLATES:
-                    copy_resident(layer, f"{PFX}layers.{i}.", _read_resident_bytes(layer, f"{PFX}layers.{i}."))
+                if TEMPLATES or spine_fast.PACK:
+                    pfx = f"{PFX}layers.{i}."
+                    _spine_apply(layer, pfx, _spine_read(layer, pfx))
                 else:
                     materialize_resident(layer, f"{PFX}layers.{i}.")
             if i < PIN_N:
@@ -401,7 +467,11 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
         mk = TIMES["moe_kernel"]
         print(f"[prof] KDA {PROF['kda']:.1f}s/{PROF['n_kda']} MLA {PROF['mla']:.1f}s/{PROF['n_mla']} "
               f"| moe_kernel {mk:.1f}s | fetch {TIMES['expert_fetch']:.1f}s "
-              f"| apply {TIMES['resident_io']:.1f}s", flush=True)
+              f"| apply {TIMES['resident_io']:.1f}s"
+              f"| preload_wait {TIMES['preload_wait']:.1f}s", flush=True)
+        rep = spine_fast.phase_report()
+        if rep:
+            print(rep, flush=True)
     # tail: output attn-res -> final norm -> lm_head
     tail = nn.Module()
     with torch.device("meta"):

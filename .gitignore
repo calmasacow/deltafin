@@ -6,6 +6,7 @@
 # --- model weights & caches (hundreds of GB) ----------------
 k3-resident/
 k3-resident-int8/
+k3-resident-int4/
 k3-experts/
 k3-model/
 
@@ -16,6 +17,8 @@ k3-model/
 *.npz
 *.i8
 *.sc
+*.i4
+*.s4
 *.pt
 *.pth
 
