@@ -5,7 +5,11 @@ Drop-in for tools/fast_moe.py's moe_infer_fast — same signature, same semantic
 so it can be swapped in behind a flag:
 
     import metal_moe
-    moe = metal_moe.moe_infer_metal if metal_moe.available() else fast_moe.moe_infer_fast
+    moe = metal_moe.moe_infer if metal_moe.available() else fast_moe.moe_infer_fast
+
+which is exactly what tools/kimi_run.py does behind K3_MOE=cpu|metal.  moe_infer()
+is moe_infer_metal() plus the optional K3_MOE_CHECK cross-check against the CPU
+kernel; use moe_infer_metal() directly to bypass that entirely.
 
 Build the backing dylib first (nothing in any Makefile is touched):
 
@@ -29,6 +33,34 @@ calls k3_metal_drop() before releasing the pin, so a wrap never outlives its mem
 
 Experts that arrive as separate allocations (the legacy .npz cache path) are packed
 into a page-aligned anonymous mmap slot first — one memcpy, then still zero-copy.
+
+Buffer recycling (tools/fetch_v2.py) — the correctness invariant
+---------------------------------------------------------------
+fetch_v2's pread reader owns a pool of recyclable page-aligned EXPERT_SPAN slots:
+the same base pointer carries a DIFFERENT expert a couple of layers later, and a
+surplus slot can be unmapped outright (_PreadReader._give trims to
+K3_PREAD_MAX_FREE).  A pointer-keyed wrap cache is only safe under one invariant,
+which this module now enforces explicitly:
+
+    a cached wrap exists  =>  this module holds a strong reference to the object
+                              that owns its mapping.
+
+Consequences, both of which are load-bearing:
+  * the mapping cannot be unmapped while the wrap lives, so the pointer cannot be
+    handed to a *different* mapping behind Metal's back;
+  * therefore `_pins[ptr] is owner` is a sound identity test — if the owner object
+    ever differs, the memory genuinely changed hands and `_sync_wrap` drops the
+    stale wrap (k3_metal_drop) before the dylib can reuse it.
+
+Same pointer + same owner + new contents (a recycled slot re-pread with another
+expert) needs no invalidation at all: the wrap aliases the live pages, so the GPU
+reads whatever the host last wrote there.  MTLResourceStorageModeShared on Apple
+Silicon is coherent, and every call is commit + waitUntilCompleted, so the pread
+that filled the slot always happens-before the dispatch that reads it.
+
+Pin eviction is the release valve: dropping a pin does NOT unmap a fetch_v2 slot
+(fetch_v2 still owns it), it just lets fetch_v2 unmap it later — and by then the
+wrap is already gone.  Proof harness: tools/test_metal_recycle.py.
 """
 import ctypes
 import mmap
@@ -50,6 +82,14 @@ _OFFSETS = (("w1", 0, 0, (3072, 1792)), ("w1", 1, _P, (3072, 112)),
 _SIZES = {0: _P, 1: _S}
 
 PIN_MAX = int(os.environ.get("K3_METAL_PIN_MAX", "512"))
+# cross-check the first N MoE calls against the CPU kernel (tools/fast_moe.py) and
+# raise if they disagree. 0 = off (default) and costs nothing.
+CHECK = int(os.environ.get("K3_MOE_CHECK", "0"))
+CHECK_TOL = float(os.environ.get("K3_MOE_CHECK_TOL", "1e-4"))
+# Escape hatch for tools/test_metal_recycle.py --unsafe ONLY: pretend a pointer is
+# a permanent expert identity (no owner pin, no invalidation), i.e. the failure
+# mode the pin protocol exists to prevent. Never set this in a real run.
+STALE_OK = os.environ.get("K3_METAL_STALE_OK", "0") == "1"
 
 _lib = None
 _load_error = None
@@ -117,6 +157,7 @@ def stats():
     keys = ("calls", "zero_copy_wraps", "copies", "cache_entries", "bindless")
     d = dict(zip(keys, list(buf)))
     d["pinned"] = len(_pins)
+    d["rewraps"] = _rewraps            # stale wraps dropped on owner change
     return d
 
 
@@ -128,9 +169,25 @@ def set_mode(bindless):
 
 
 # --- span assembly ---------------------------------------------------------
-_pins = {}          # ptr -> keepalive object, insertion-ordered = LRU
+_pins = {}          # ptr -> owning mapping object (strong ref), insertion-ordered = LRU
+_perm = set()       # ptrs of module-owned staging slots: never evicted
 _slots = []         # page-aligned anonymous mmaps for non-contiguous experts
 _slot_ptr = []
+_rewraps = 0        # times a pointer changed owner and the stale wrap was dropped
+
+
+def _owner(a):
+    """The object that actually owns `a`'s memory: follow the numpy .base chain to
+    its root (an mmap.mmap, a bytes, another ndarray...).  Holding this alive is
+    what keeps the pages mapped — and it is a stable identity for one mapping, so
+    two different mappings can never compare equal."""
+    o = a
+    for _ in range(8):
+        b = getattr(o, "base", None)
+        if b is None:
+            return o
+        o = b
+    return o
 
 
 def _unpin(ptr):
@@ -143,16 +200,33 @@ def _unpin(ptr):
     _pins.pop(ptr, None)
 
 
-def _pin_all(items):
-    """Pin every pointer used by the call that just ran, then trim the LRU.  The
-    cap floors at len(items) so an in-flight expert can never be evicted."""
-    for ptr, obj in items:
-        _pins.pop(ptr, None)                 # refresh recency
-        _pins[ptr] = obj
-    protect = {p for p, _ in items}
+def _sync_wrap(ptr, owner):
+    """Make the dylib's pointer-keyed wrap cache agree with reality for `ptr`, and
+    take the strong reference that keeps it true.
+
+    Called BEFORE the dispatch, so the reference is held for the whole GPU call.
+    If `ptr` was previously wrapped over a different mapping (only reachable once
+    the earlier pin was evicted and fetch_v2 then unmapped and re-mapped a slot at
+    the same address) the stale wrap is dropped first, so the dylib re-wraps the
+    memory that is live now instead of resurrecting dead pages."""
+    global _rewraps
+    if STALE_OK:                             # test-only: reproduce the naive cache
+        return
+    prev = _pins.pop(ptr, None)              # pop = refresh LRU recency
+    if prev is not None and prev is not owner:
+        lib = _load()
+        if lib:
+            lib.k3_metal_drop(ctypes.c_void_p(ptr))
+        _rewraps += 1
+    _pins[ptr] = owner
+
+
+def _trim(protect):
+    """Evict pins down to the cap. `protect` (this call's pointers) and the
+    permanent staging slots are never evicted, so the cap floors at len(protect)."""
     cap = max(PIN_MAX, len(protect))
     while len(_pins) > cap:
-        victim = next((p for p in _pins if p not in protect), None)
+        victim = next((p for p in _pins if p not in protect and p not in _perm), None)
         if victim is None:
             break
         _unpin(victim)
@@ -165,12 +239,15 @@ def _slot(i):
         arr = np.ndarray((EXPERT_SPAN,), dtype=np.uint8, buffer=m)   # writable view
         _slots.append((m, arr))
         _slot_ptr.append(arr.ctypes.data)
-    return _slots[i][1], _slot_ptr[i]
+        _perm.add(arr.ctypes.data)
+    return _slots[i][1], _slot_ptr[i], _slots[i][0]
 
 
 def _span_ptr(raw, slot):
-    """(pointer to the expert's contiguous 17,547,264-byte span, object to pin).
-    Pin is None for staged spans: those live in permanent module-owned mmaps."""
+    """(pointer to the expert's contiguous 17,547,264-byte span, its owning
+    mapping object).  The owner is never None: staged spans are owned by the
+    module's permanent mmap slots, zero-copy spans by whatever fetch_v2 handed us
+    (a recycled pread slot's mmap, an np.memmap, or the HTTP path's bytes)."""
     base = raw["w1"][0].ctypes.data
     ok = True
     for w, k, off, _shape in _OFFSETS:
@@ -180,15 +257,17 @@ def _span_ptr(raw, slot):
             ok = False
             break
     if ok:
-        return base, raw
-    dst, ptr = _slot(slot)
+        # alignment is the dylib's call: page-aligned -> cached zero-copy wrap,
+        # otherwise its own scratch buffer (one memcpy in C, never pointer-cached).
+        return base, _owner(raw["w1"][0])
+    dst, ptr, own = _slot(slot)
     for w, k, off, _shape in _OFFSETS:
         a = raw[w][k]
         if a.dtype != np.uint8 or a.nbytes != _SIZES[k]:
             raise ValueError(f"expert tensor {w}[{k}] is {a.dtype}/{a.nbytes} B, "
                              f"expected uint8/{_SIZES[k]} B")
         dst[off:off + _SIZES[k]] = np.ascontiguousarray(a).reshape(-1)
-    return ptr, None
+    return ptr, own
 
 
 def flush():
@@ -256,12 +335,14 @@ def moe_infer_metal(x, topk_ids, topk_weight, raw_experts):
         eids, wts = ids[t], ws[t]
         n = len(eids)
         ptrs = (ctypes.c_void_p * n)()
-        keep = []
+        protect = set()
         for i, e in enumerate(eids):
             p, obj = _span_ptr(raw_experts[e], i)
             ptrs[i] = p
-            if obj is not None:
-                keep.append((p, obj))
+            # BEFORE the dispatch: drop any wrap left over from a different
+            # mapping at this address, and hold the owner for the whole call.
+            _sync_wrap(p, obj)
+            protect.add(p)
         wbuf = np.ascontiguousarray(wts, dtype=np.float32)
         xt = np.ascontiguousarray(xnp[t])
         ot = out[t]                                  # view; out owns the memory
@@ -269,9 +350,42 @@ def moe_infer_metal(x, topk_ids, topk_weight, raw_experts):
                                     wbuf.ctypes.data_as(fp),
                                     xt.ctypes.data_as(fp),
                                     ot.ctypes.data_as(fp))
-        # pin AFTER the call: every wrap the dylib just cached is now held by us,
-        # so none of it can be unmapped underneath a live MTLBuffer.
-        _pin_all(keep)
         if rc != 0:
             raise RuntimeError(f"k3_metal_moe_layer rc={rc}: {last_error()}")
+        _trim(protect)                               # never evicts this call's set
     return torch.from_numpy(out).to(x.device, x.dtype)
+
+
+# --- optional CPU cross-check (K3_MOE_CHECK=N) ------------------------------
+_checked = 0
+_check_worst = 0.0
+
+
+def check_stats():
+    return {"checked": _checked, "worst_rel": _check_worst,
+            "rewraps": _rewraps, "pins": len(_pins)}
+
+
+def moe_infer(x, topk_ids, topk_weight, raw_experts):
+    """moe_infer_metal, plus a CPU cross-check on the first K3_MOE_CHECK calls.
+
+    The check runs on the SAME raw_experts buffers the GPU just read, in the same
+    layer, so it is exactly the assertion a recycled-slot aliasing bug would have
+    to survive: a stale wrap computes a different expert and the relative error
+    blows past CHECK_TOL immediately."""
+    global _checked, _check_worst
+    out = moe_infer_metal(x, topk_ids, topk_weight, raw_experts)
+    if _checked < CHECK:
+        _checked += 1
+        import fast_moe
+        ref = fast_moe.moe_infer_fast(x, topk_ids, topk_weight, raw_experts)
+        a = out.detach().to("cpu", torch.float32).numpy()
+        b = ref.detach().to("cpu", torch.float32).numpy()
+        den = max(float(np.abs(b).max()), 1e-30)
+        rel = float(np.abs(a - b).max()) / den
+        _check_worst = max(_check_worst, rel)
+        if rel > CHECK_TOL:
+            raise RuntimeError(
+                f"K3_MOE_CHECK: metal vs cpu rel {rel:.3e} > {CHECK_TOL:g} "
+                f"on call {_checked} (ids={topk_ids.view(-1).tolist()})")
+    return out

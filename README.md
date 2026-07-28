@@ -232,19 +232,24 @@ these as a floor.**
 
 | Metric | First working version | Now | Change |
 |---|---|---|---|
-| Prefill (5-token prompt) | 2,429 s | **40 s** | ~60× |
-| Decode, experts local | ~20 min/token | **16 s/token** | ~75× |
+| Prefill (5-token prompt) | 2,429 s | **25 s** | ~97× |
+| Decode, experts local | ~20 min/token | **15 s/token** | ~80× |
 | Decode, experts streamed | ~20 min/token | ~3 min/token | network-bound |
 
 Roughly 3.75 tokens per minute. Where those 16 seconds go, per token:
 
 | | |
 |---|---|
-| reading the 16 selected experts per layer (25.8 GB) | ~6 s |
-| attention and norms (93 layers) | ~5 s |
-| MoE expert matmuls | ~2 s |
-| loading the resident spine | ~2 s |
-| everything else | ~1 s |
+| waiting on the resident spine read (53 GB) | ~5 s |
+| reading the 16 selected experts per layer (25.8 GB) | ~4.3 s |
+| applying the spine (transfer + dequant) | ~3 s |
+| attention and norms (93 layers) | ~2 s |
+| MoE expert matmuls | ~1 s |
+
+Decode is now **bound by disk bandwidth on the resident spine**. Those 53 GB are
+re-read every token, and at the ~7 GB/s this access pattern sustains that is about
+7.5 s of the 15 — unavoidable without either more RAM (enough to hold the spine
+without displacing the page cache the expert reads need) or a smaller spine.
 
 ### Why newer Macs should be faster
 
@@ -259,9 +264,11 @@ the difference without any configuration:
   and the attention path both scale with it.
 - **SSD.** Expert reads are the single biggest slice, and they run at whatever
   the internal drive delivers. Later Macs ship faster NVMe.
-- **RAM.** Deltafin sizes itself at startup: a 128 GB machine pins several times
-  more of the model and leaves a much larger page cache for expert reads. That
-  is automatic — no flags.
+- **RAM.** This matters most. The 53 GB spine does not fit alongside everything
+  else on a 64 GB machine, so it is re-read from disk every token — about half
+  the total time. On a 128 GB machine it can simply stay in the page cache, and
+  that cost largely disappears. Deltafin also pins more of the model there
+  automatically, with no flags.
 
 We have only ever run this on the one machine. **If you try it on an M3, M4 or
 M5, or with 128 GB, we would genuinely like to see your numbers** — open an

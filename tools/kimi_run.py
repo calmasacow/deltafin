@@ -146,6 +146,15 @@ if spine_fast.FAST or spine_fast.DEQ == "metal":
     spine_fast.metal_available()          # compile once, on the main thread
     print(f"[spine] fast path: {spine_fast.describe()}", flush=True)
 
+# --- attention / norm fast paths (K3_KDA_RECUR, K3_SHORTCONV, K3_COMPILE) -----
+# All default to the behaviour above; see tools/attn_fast.py for the per-op
+# measurements that motivate each one.
+import attn_fast  # noqa: E402
+
+attn_fast.install(ml)
+if attn_fast.ACTIVE:
+    print(f"[attn] {attn_fast.describe()}", flush=True)
+
 
 def _ram_budget_layers():
     if TEMPLATES:
@@ -215,6 +224,30 @@ _orig_moe_infer = ml.KimiSparseMoeBlock.moe_infer
 FAST_MOE = os.environ.get("K3_FAST_MOE", "1") == "1"
 import fast_moe  # noqa: E402
 
+# --- MoE compute backend (K3_MOE=cpu|metal) ----------------------------------
+# cpu   : tools/fast_moe.py, the fused MXFP4 GEMV in libmxfp4gemv.dylib (default,
+#         unchanged behaviour).
+# metal : tools/metal_moe.py, the whole layer's selected experts as one GPU
+#         command buffer. Same signature, same semantics; matched the CPU path to
+#         2.5e-7 on real experts. Falls back to cpu (loudly) if Metal is missing.
+# K3_MOE_CHECK=N cross-checks the first N calls against the CPU kernel and raises
+# on disagreement — see tools/metal_moe.py. K3_METAL_BINDLESS=0 picks the
+# per-expert dispatch mode instead of the Tier-2 argument-buffer one.
+MOE_BACKEND = os.environ.get("K3_MOE", "metal").lower()
+_MOE_FN = fast_moe.moe_infer_fast
+if MOE_BACKEND == "metal":
+    import metal_moe  # noqa: E402
+    if metal_moe.available():
+        _MOE_FN = metal_moe.moe_infer
+        FAST_MOE = True          # metal consumes raw MXFP4, never dequantized
+        print(f"[config] MoE backend: metal "
+              f"({'bindless' if metal_moe.stats()['bindless'] else 'per-expert'}, "
+              f"pin_max={metal_moe.PIN_MAX}, check={metal_moe.CHECK})", flush=True)
+    else:
+        MOE_BACKEND = "cpu"
+        print(f"[config] K3_MOE=metal unavailable ({metal_moe.last_error()}) "
+              f"— falling back to cpu", flush=True)
+
 fetch_v2 = None
 if os.environ.get("K3_FETCH", "v2") == "v2":
     import fetch_v2
@@ -227,6 +260,11 @@ if os.environ.get("K3_FETCH", "v2") == "v2":
 # because it is speculative (39.7% measured recall) and costs wasted bandwidth.
 PREAD = fetch_v2 is not None and fetch_v2.EXPERT_READ == "pread"
 EXPERT_PREFETCH = PREAD and os.environ.get("K3_EXPERT_PREFETCH", "0") == "1"
+
+# K3_PILOT=1 replaces that previous-token oracle with a router-lookahead
+# prediction: layer L+1's router run on layer L's pre-MoE hidden state. See
+# tools/pilot.py. Default 0 = nothing below changes.
+import pilot  # noqa: E402
 
 _LAST_SEL = {}   # layer -> ids selected for the most recent token (prefetch oracle)
 _PREV_SEL = {}   # snapshot of _LAST_SEL taken when the current pass started
@@ -254,22 +292,31 @@ def prefetch_prev_token():
 
 def moe_infer_lazy(self, x, topk_ids, topk_weight):
     li = _step_ctx["layer"]
-    ids = sorted(set(topk_ids.view(-1).tolist()))
+    rows = topk_ids.tolist()                    # [positions][top_k]
+    flat = [e for r in rows for e in r]
+    ids = sorted(set(flat))
     _LAST_SEL[li] = ids
+    if pilot.enabled():
+        pilot.on_actual(li, rows)               # score the prediction made at li-1
     t0 = time.time()
     raw = k3loader.fetch_experts(li, ids, dequant=not FAST_MOE)
     TIMES["expert_fetch"] += time.time() - t0
-    if EXPERT_PREFETCH:
+    # Speculative reads are issued only AFTER this layer's demand reads have
+    # landed: the pread pool is FIFO, so a prefetch queued first would put the
+    # next layer's speculation in front of this layer's blocking reads.
+    if pilot.enabled() and fetch_v2 is not None:
+        pilot.issue_prefetch(li + 1, fetch_v2, pread=PREAD)
+    elif EXPERT_PREFETCH:
         nxt = _PREV_SEL.get(li + 1)
         if nxt:
             fetch_v2.prefetch_layer(li + 1, nxt)
     TRACE.write(json.dumps({"step": _step_ctx["step"], "layer": li,
-                            "ids": topk_ids.view(-1).tolist(),
+                            "ids": flat,
                             "w": [round(x, 5) for x in topk_weight.view(-1).tolist()]}) + "\n")
     TRACE.flush()
     if FAST_MOE:
         tk = time.time()
-        out = fast_moe.moe_infer_fast(x, topk_ids, topk_weight, raw)
+        out = _MOE_FN(x, topk_ids, topk_weight, raw)      # K3_MOE=cpu|metal
         TIMES["moe_kernel"] += time.time() - tk
         return out
     for e, w in raw.items():
@@ -285,6 +332,28 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
 
 
 ml.KimiSparseMoeBlock.moe_infer = moe_infer_lazy
+
+# Router lookahead hooks the MoE block's entry, which is the one point in the
+# graph that sits after layer L's attention and before any expert read.
+_orig_moe_forward = ml.KimiSparseMoeBlock.forward
+
+
+def moe_forward_pilot(self, hidden_states):
+    if pilot.enabled():
+        pilot.on_moe_entry(self, hidden_states, _step_ctx["layer"])
+    return _orig_moe_forward(self, hidden_states)
+
+
+ml.KimiSparseMoeBlock.forward = moe_forward_pilot
+
+
+def _pilot_load(full):
+    """The resident loader the layer templates use — so a cached gate is the
+    exact tensor the model routes with (int8-dequantized under K3_SPINE=int8)."""
+    t = _load_int8(full) if SPINE == "int8" else None
+    if t is None:
+        t = k3loader.load_resident(full).to(DEV, DT)
+    return t
 
 
 # --- embeddings via memmap (row reads only) -----------------------------------
@@ -376,11 +445,68 @@ def copy_resident(module, prefix, blobs):
 # --- resident read/apply dispatch --------------------------------------------
 # K3_SPINE_PACK=1 routes a layer through spine_fast (one packed readinto, one
 # H2D, fused dequant). Default 0 = the existing per-tensor path, unchanged.
+# --- resident spine RAM cache (K3_SPINE_CACHE_GB) ----------------------------
+# The spine is re-read from disk every token (53 GB int8). Once compute got fast
+# enough, that read stopped hiding behind it and showed up as preload_wait. Any
+# layer we can hold in RAM never touches the disk again. Sized from free RAM by
+# default; 0 disables. Layers are cached in walk order, so a partial cache still
+# eliminates a contiguous prefix of the per-token reads.
+def _spine_cache_budget():
+    # DEFAULT 0 — MEASURED HARMFUL. Holding 29.7 GB of spine blobs in RAM took a
+    # decode token from 14 s to 122 s: on this 64 GB machine it evicted the page
+    # cache the expert reads depend on and pushed the system into the memory
+    # compressor (58.8M swapouts, 3.8 GB swap). The OS was already caching the
+    # spine in "inactive" pages, which the auto-budget wrongly counted as free.
+    # Kept as an opt-in knob for machines with genuine RAM headroom (128 GB+).
+    env = os.environ.get("K3_SPINE_CACHE_GB")
+    if env is not None:
+        return float(env) * 1e9
+    return 0.0
+
+
+
+_SPINE_CACHE = {}
+_SPINE_CACHE_BYTES = 0
+_SPINE_CACHE_MAX = _spine_cache_budget()
+_SPINE_CACHE_FULL = False
+
+
+def _pack_bytes(pack):
+    n = 0
+    try:
+        for v in (pack.values() if isinstance(pack, dict) else pack):
+            for item in (v if isinstance(v, (tuple, list)) else (v,)):
+                n += len(item) if isinstance(item, (bytes, bytearray, memoryview)) \
+                    else getattr(item, "nbytes", 0)
+    except Exception:
+        return 0
+    return n
+
+
 def _spine_read(module, prefix):
+    cached = _SPINE_CACHE.get(prefix)
+    if cached is not None:
+        return cached
     if spine_fast.PACK:
-        return spine_fast.read_pack(module, prefix, INT8_DIR, k3loader.RES,
+        pack = spine_fast.read_pack(module, prefix, INT8_DIR, k3loader.RES,
                                     k3loader.INV, SPINE, k3loader.load_resident)
-    return _read_resident_bytes(module, prefix)
+    else:
+        pack = _read_resident_bytes(module, prefix)
+    global _SPINE_CACHE_BYTES, _SPINE_CACHE_FULL
+    if _SPINE_CACHE_MAX and not _SPINE_CACHE_FULL:
+        n = _pack_bytes(pack)
+        if n and _SPINE_CACHE_BYTES + n <= _SPINE_CACHE_MAX:
+            # take ownership of the pooled buffers, or the next layer's readinto
+            # would overwrite this cache entry in place
+            if spine_fast.PACK and isinstance(pack, dict):
+                spine_fast.pin(pack.get("q"), pack.get("sc"), pack.get("other"))
+            _SPINE_CACHE[prefix] = pack
+            _SPINE_CACHE_BYTES += n
+        else:
+            _SPINE_CACHE_FULL = True
+            print(f"[spine] RAM cache full: {len(_SPINE_CACHE)}/{NL} layers, "
+                  f"{_SPINE_CACHE_BYTES/1e9:.1f} GB", flush=True)
+    return pack
 
 
 def _spine_apply(module, prefix, pack):
@@ -404,7 +530,14 @@ def causal_mask(T, dtype=None):
 def forward_pass(layers, cache, hidden, step, verbose=True):
     """hidden: [1, T, H] fp32. Returns logits [1, T, vocab]."""
     T = hidden.shape[1]
-    if EXPERT_PREFETCH:
+    if pilot.PILOT:
+        pilot.init(config, DEV, _pilot_load, PFX)
+        pilot.begin_pass(fetch_v2)
+        if PREAD:
+            fetch_v2.drop_prefetch()    # nothing from the previous pass is valid
+            if pilot.ASYNC_DRAIN:
+                pilot.install_async_drain(fetch_v2.reader())
+    elif EXPERT_PREFETCH:
         global _PREV_SEL
         _PREV_SEL = dict(_LAST_SEL)     # last token's routing = this pass's oracle
         fetch_v2.drop_prefetch()        # nothing from the previous pass is valid
@@ -443,6 +576,8 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
                     materialize_resident(layer, f"{PFX}layers.{i}.")
             if i < PIN_N:
                 layer._k3_res = True   # pinned from now on
+        if pilot.enabled():
+            pilot.arm(layer)
         if PROFILE and DEV.type == "mps":
             torch.mps.synchronize()
         t0 = time.time()
@@ -470,6 +605,9 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
               f"| apply {TIMES['resident_io']:.1f}s"
               f"| preload_wait {TIMES['preload_wait']:.1f}s", flush=True)
         rep = spine_fast.phase_report()
+        if rep:
+            print(rep, flush=True)
+        rep = pilot.report(fetch_v2.stats if fetch_v2 is not None else None)
         if rep:
             print(rep, flush=True)
     # tail: output attn-res -> final norm -> lm_head

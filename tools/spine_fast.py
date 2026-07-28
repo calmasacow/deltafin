@@ -138,8 +138,21 @@ def _acquire(nbytes):
     return bytearray(max(nbytes, 1))
 
 
+# Buffers a caller has taken permanent ownership of (the driver's spine RAM
+# cache). They must never re-enter the pool, or the next layer's readinto would
+# overwrite cached weights in place — a silent wrong-weights bug, not a slow path.
+KEEP = set()
+
+
+def pin(*bufs):
+    """Take ownership of these buffers: the pool will never recycle them."""
+    for b in bufs:
+        if b is not None:
+            KEEP.add(id(b))
+
+
 def _release(buf):
-    if buf is None:
+    if buf is None or id(buf) in KEEP:
         return
     with _pool_lock:
         if len(_pool) < _POOL_MAX:
@@ -339,6 +352,10 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
         del qh, sch, qd, scd
     if oplan:
         del oh, od
+    # A pinned pack is owned by the caller's cache and will be applied again on
+    # the next token: leave its buffers intact and in place.
+    if id(pack.get("q")) in KEEP:
+        return
     _release(pack["q"])
     _release(pack["sc"])
     _release(pack["other"])

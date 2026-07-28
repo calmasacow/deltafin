@@ -1,6 +1,12 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# K3_SHORTCONV=mulsum swaps the T=1 depthwise conv for an explicit 4-tap
+# gather+multiply+sum. Default "conv1d" = the F.conv1d path this shipped with.
+SHORTCONV = os.environ.get("K3_SHORTCONV", "mulsum")
 
 
 class ShortConvolution(nn.Conv1d):
@@ -20,6 +26,21 @@ class ShortConvolution(nn.Conv1d):
         # x: [B, T, D]
         B, T, D = x.shape
         W = self.kernel_size[0]
+        if SHORTCONV == "mulsum" and T == 1 and cache is not None:
+            # Decode step. The causal window the conv would see is exactly
+            # [cache[1:], x], which is also exactly the next cache, so the
+            # separate cat+slice that builds new_cache below is redundant.
+            # 12,288 depthwise groups over a length-4 window is a grouped
+            # convolution only in name: 0.63 ms -> 0.38 ms for the three convs.
+            z = torch.cat([cache.to(torch.float32)[:, :, 1:],
+                           x.reshape(B, D, 1).to(torch.float32)], dim=-1)  # [B,D,W]
+            y = (z * self.weight.view(D, W).to(torch.float32)).sum(-1)     # [B,D]
+            if self.act in ('silu', 'swish'):
+                y = F.silu(y)
+            y = y.view(B, 1, D).to(x.dtype)
+            if residual is not None:
+                y = y + residual
+            return y, (z if output_final_state else None)
         w = self.weight.view(D, W).to(torch.float32)  # [D, W]
         xt = x.transpose(1, 2).to(torch.float32)      # [B, D, T]
         if cache is None:

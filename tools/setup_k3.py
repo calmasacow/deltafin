@@ -94,6 +94,16 @@ def _remaining_bytes():
     return max(0, SPINE_BYTES - spine_have), experts_left
 
 
+def _exclude_from_spotlight():
+    """macOS indexes new files aggressively. 1.5 TB of weight blobs sends
+    corespotlightd to ~50% CPU for hours, which contends with inference and
+    makes any benchmark meaningless. A .metadata_never_index marker stops it."""
+    for d in ("k3-experts", "k3-resident", "k3-resident-int8", "k3-resident-int4"):
+        p = os.path.join(ROOT, d)
+        if os.path.isdir(p):
+            open(os.path.join(p, ".metadata_never_index"), "a").close()
+
+
 def install_weights(mode):
     import shutil as _sh
     import subprocess
@@ -122,6 +132,9 @@ def install_weights(mode):
         sys.exit(1)
 
     py = sys.executable
+    os.makedirs(os.path.join(ROOT, "k3-experts"), exist_ok=True)
+    os.makedirs(os.path.join(ROOT, "k3-resident"), exist_ok=True)
+    _exclude_from_spotlight()
     print(f"\n== installing weights: {mode} ==", flush=True)
     subprocess.check_call([py, os.path.join(ROOT, "tools", "fetch_spine.py")])
     if mode == "full":

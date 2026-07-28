@@ -228,3 +228,63 @@ remaining read cost is partly the 12,676 legacy `.npz` cache entries (~15% of se
 that still go through `np.load` at ~2.9 GB/s — converting them to raw `.bin` is the next
 cheap read-path win. After that the ranking is: Metal MoE kernel (~2 s), then
 `torch.compile` on the layer templates (~5 s of attention compute).
+
+
+### Round 3 (2026-07-28 evening) — prefill 31.6 -> 25.2 s, decode at the disk wall
+
+**The measurement environment was the story.** Writing 1.5 TB of weights sent macOS
+Spotlight into a multi-hour indexing run (`corespotlightd` 61% CPU, `spotlightknowledged`
+55%), and identical configs were producing 26 s and 35 s. One conclusion drawn from that
+noise ("the new flags are net-negative") was wrong. After dropping `.metadata_never_index`
+into the weight directories, **run-to-run variance fell from +/-5 s to +/-0.1 s** and an
+interleaved A/B settled it:
+
+| | flags off | flags on |
+|---|---|---|
+| prefill, 3 interleaved runs | 31.7 / 31.5 / 31.6 s | 25.1 / 25.2 / 25.2 s |
+
+Now automated in `setup_k3.py`. Anyone installing the weights gets the exclusion.
+
+**Shipped default-on this round** (each gate-verified bit-exact):
+`K3_KDA_RECUR=mps` (reverses the day-old decision to run the recurrence on CPU; removes
+69 GPU queue drains per token), `K3_SHORTCONV=mulsum` (a 4-tap dot that was a 12,288-group
+convolution in name only), `K3_PILOT=1` (67.4% lookahead recall vs 30.8% previous-token;
+expert fetch -44%), `K3_MOE=metal` (MoE kernel -65%).
+
+**Killed this round:**
+- **Spine RAM cache** — 14 s -> 122 s per token. Holding 29.7 GB of spine blobs evicted
+  the page cache the expert reads need and drove the machine into the compressor (58.8M
+  swapouts, 3.8 GB swap). The auto-budget counted macOS "inactive" pages as free when
+  those pages *were already caching the spine*: the OS was doing the job better, and the
+  cache stole the memory to do it worse. Default 0, kept as an opt-in for 128 GB+ machines.
+- **torch.compile** — net negative end-to-end despite winning in isolation (822 vs 899 ms).
+- **PILOT_TWO** (colibri's shared-expert refinement) — -0.5% recall on K3, not their +2.3%.
+- **Speculative L+1 prefetch** — still zero once reads run at disk speed.
+
+Two bugs found while adding the spine cache, both the same shape: `spine_fast` hands its
+read buffers back to a pool AND nulls them out of the pack dict. Caching such a pack
+means the next layer overwrites your cache in place (silent wrong weights) and the second
+token crashes on an emptied dict. Fixed with an explicit `pin()` ownership marker.
+
+### Where the 15 s token goes now, and why this is close to the floor
+
+| | per token |
+|---|---|
+| spine preload wait | ~5 s |
+| expert reads | ~4.3 s |
+| spine apply (transfer + dequant) | ~3 s |
+| attention + norms | ~2 s |
+| MoE kernel | ~1 s |
+
+**Decode is disk-bandwidth-bound on the resident spine.** 53 GB of int8 spine is re-read
+every token; at the measured ~7 GB/s ceiling for this access pattern that is ~7.5 s of an
+unavoidable 15 s. Per layer the reader needs 81 ms against ~27 ms of compute to hide it
+behind, so deeper buffering cannot help — the reader, not the pipeline depth, is the
+limit. The two ways out are both structural: hold the spine in memory (needs a machine
+where 53 GB fits without displacing the page cache — 128 GB+), or make the spine smaller
+(uniform int4 is 10x the int8 error and was rejected; a **mixed-precision spine**, int4
+only on tensors measured to tolerate it, is the untried idea worth a quality gate).
+
+Everything cheap in the Python driver is now done. The remaining levers are lossy
+(top-k truncation, cache-aware routing — both need the avg-NLL harness first) or
+structural (the C engine in PLAN.md).

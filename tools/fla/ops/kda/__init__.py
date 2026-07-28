@@ -6,8 +6,15 @@ same per-token recurrence here. Handles per-head A_log [H] and per-channel A_log
 (the K3 checkpoint ships [128] = per-channel; broadcast across heads).
 State layout [B, H, K, V] internally; square (128x128) here, and the state only
 round-trips through this module, so transpose_state_layout is a no-op for us."""
+import os
+
 import torch
 import torch.nn.functional as F
+
+# K3_KDA_RECUR: where the T<=4 decode recurrence runs.  "cpu" (default) is the
+# historical behaviour documented in fused_recurrent_kda below; "mps" keeps it
+# on the GPU.  See tools/attn_fast.py for the measurement.
+RECUR = os.environ.get("K3_KDA_RECUR", "mps")
 
 
 def _kda_gate(g, A_log, dt_bias, lower_bound):
@@ -74,8 +81,18 @@ def fused_recurrent_kda(q, k, v, g, beta, A_log=None, dt_bias=None, scale=None,
     # launches; run it on CPU (240KB in / 48KB out per layer) and keep the
     # recurrent state CPU-resident across tokens. Profiled: KDA was 1.23 s/layer
     # on MPS at T=1 — over half of every decode token.
+    #
+    # K3_KDA_RECUR=mps re-examines that call.  Re-measured at T=1 with the rest
+    # of the pipeline as it stands today (median of 15, each variant serialized
+    # with torch.mps.synchronize):
+    #     CPU hop, state CPU-resident   3.12 ms      <- this branch
+    #     all-MPS                       1.17 ms
+    #     CPU math alone, no transfers  1.29 ms
+    # i.e. the hop itself is ~1.9 ms/layer = 135 ms/token over 69 KDA layers,
+    # and the D2H is also a hard GPU barrier that drains the queue (the layer's
+    # int8 spine dequant included) 69 times per token.
     dev = q.device
-    if dev.type == "mps" and q.shape[1] <= 4:
+    if dev.type == "mps" and q.shape[1] <= 4 and RECUR == "cpu":
         cpu = torch.device("cpu")
         o, S = _kda_core(q.to(cpu), k.to(cpu), v.to(cpu), g.to(cpu), beta.to(cpu),
                          None if A_log is None else A_log.to(cpu),
