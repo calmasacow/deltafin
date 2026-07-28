@@ -19,7 +19,8 @@ Design notes, honestly stated:
     can take hours because most experts get fetched. Warm up with short
     completions first, or let the cache grow across sessions.
 
-Usage:  K3_DEV=mps K3_SPINE=int8 python tools/serve_openai.py [--port 8000]
+Usage:  python tools/serve_openai.py [--port 8000]
+(device and spine format are auto-detected; see K3_DEV / K3_SPINE to override)
 
 No dependencies beyond the standard library + what kimi_run already needs.
 """

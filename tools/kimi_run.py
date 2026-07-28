@@ -34,15 +34,39 @@ config._attn_implementation = "eager"
 H = config.hidden_size
 NL = config.num_hidden_layers
 PFX = "language_model.model."
-DEV = torch.device(os.environ.get("K3_DEV", "cpu"))        # cpu | mps
-SPINE = os.environ.get("K3_SPINE", "bf16")                 # bf16 | int8
+# Sensible defaults, no env vars required: use the GPU when there is one, and
+# use the int8 spine when it has been built. Both remain overridable.
+INT8_DIR = os.path.join(ROOT, "k3-resident-int8/tensors")
+
+
+def _auto_dev():
+    if torch.backends.mps.is_available():
+        return "mps"
+    print("[config] no MPS GPU found — running on CPU (slow). "
+          "Deltafin targets Apple Silicon.", flush=True)
+    return "cpu"
+
+
+def _auto_spine():
+    try:
+        if any(f.endswith(".i8") for f in os.listdir(INT8_DIR)):
+            return "int8"
+    except FileNotFoundError:
+        pass
+    return "bf16"
+
+
+DEV = torch.device(os.environ.get("K3_DEV") or _auto_dev())   # cpu | mps
+SPINE = os.environ.get("K3_SPINE") or _auto_spine()           # bf16 | int8
+if SPINE == "bf16" and "K3_SPINE" not in os.environ:
+    print("[config] int8 spine not found — using bf16 (2x the per-token I/O). "
+          "Build it with: python tools/convert_spine_int8.py", flush=True)
 # K3_APPROX=1 = "approx mode": approximate numerics (fp16 weights) + n-gram
 # speculation. Output stays coherent but near-tie tokens may differ from the
 # fp32 reference — never use for oracle runs. Speed effect is unproven until a
 # quiet-machine A/B; if it measures faster it can earn a faster name.
 APPROX = os.environ.get("K3_APPROX", "0") == "1"
 DT = torch.float16 if (APPROX or os.environ.get("K3_DTYPE", "fp32") == "fp16") else torch.float32
-INT8_DIR = os.path.join(ROOT, "k3-resident-int8/tensors")
 TRACE = open(os.path.join(ROOT, "k3-meta/router_trace.jsonl"), "a")
 TIMES = {"resident_io": 0.0, "expert_fetch": 0.0, "compute": 0.0, "moe_kernel": 0.0}
 PROFILE = os.environ.get("K3_PROFILE", "0") == "1"

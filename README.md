@@ -87,12 +87,11 @@ change in our checks. Takes a few minutes:
 
 ```bash
 # generate
-K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/kimi_run.py \
-    --prompt "The capital of France is" --max-new 16
+./venv/bin/python tools/kimi_run.py --prompt "The capital of France is" --max-new 16
 
 # chat template instead of raw completion
-K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/kimi_run.py \
-    --chat --prompt "Explain MoE routing in two sentences" --max-new 64
+./venv/bin/python tools/kimi_run.py --chat \
+    --prompt "Explain MoE routing in two sentences" --max-new 64
 ```
 
 Router selections are logged to `router_trace.jsonl` if you want to study K3's
@@ -104,7 +103,7 @@ Deltafin can serve the standard OpenAI API, so chat interfaces, the `openai` SDK
 and coding agents can use it by changing a base URL:
 
 ```bash
-K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/serve_openai.py --port 8000
+./venv/bin/python tools/serve_openai.py --port 8000
 ```
 
 ```bash
@@ -145,10 +144,14 @@ Please read these caveats before pointing anything automated at it:
 
 ## Configuration
 
+Everything works with no configuration: Deltafin picks the GPU when there is
+one and the int8 spine when it has been built, and says what it chose at
+startup. These variables exist for overriding that:
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `K3_DEV` | `cpu` | `mps` recommended on Apple Silicon |
-| `K3_SPINE` | `bf16` | `int8` halves resident I/O |
+| `K3_DEV` | auto | GPU (`mps`) when available, else `cpu` |
+| `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_SPEC` | `1` | n-gram speculation (lossless) |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |
 | `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
