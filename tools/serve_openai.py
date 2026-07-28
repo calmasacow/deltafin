@@ -8,8 +8,10 @@ OpenAI-SDK client, chat UI, or coding agent can talk to Kimi K3 running locally:
 
 Design notes, honestly stated:
   * Decoding is greedy and reproducible; temperature/top_p are accepted and
-    ignored. max_tokens defaults to 32 and is clamped to 256 — at roughly a
-    token per minute, larger values are a footgun.
+    ignored. Omitted max_tokens means "until the model finishes" for chat
+    (K3 emits an end token) and 256 for raw completions (which never end on
+    their own). Explicit max_tokens is honored as-is; operators can set a
+    ceiling with K3_SERVER_MAX_TOKENS.
   * One generation at a time (a global lock). Concurrency would be meaningless
     at this speed.
   * Chat mode renders K3's template, which includes a thinking section; the
@@ -37,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kimi_run as kr  # noqa: E402
 
 MODEL_ID = "deltafin-kimi-k3"
-MAX_TOKENS_CAP = int(os.environ.get("K3_SERVER_MAX_TOKENS", "256"))
+MAX_TOKENS_CAP = int(os.environ.get("K3_SERVER_MAX_TOKENS", "0"))   # 0 = no cap
 RESPONSE_MARKER = "<|open|>response<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
 
@@ -136,7 +138,16 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(prompt, str):
                 return self._err(400, "prompt (string) required")
             ids = _tok.encode(prompt)
-        max_new = min(int(body.get("max_tokens") or 32), MAX_TOKENS_CAP)
+        # OpenAI semantics: omitted max_tokens means the model decides. Chat ends
+        # naturally at EOS; raw completions have no terminator, so only THEY get
+        # a default cap (256) — an explicit max_tokens is always honored.
+        req_max = body.get("max_tokens")
+        if req_max:
+            max_new = int(req_max)
+        else:
+            max_new = 1_000_000 if chat else 256
+        if MAX_TOKENS_CAP:
+            max_new = min(max_new, MAX_TOKENS_CAP)
         stream = bool(body.get("stream"))
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:20]
         created = int(time.time())

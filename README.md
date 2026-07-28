@@ -11,8 +11,9 @@
 ### An experiment in running [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters) on one Apple Silicon Mac
 
 Deltafin is a small research project that streams a Mixture-of-Experts model much
-larger than the machine it runs on. It is slow — about a token per minute — but it
-is exact, reproducible, and it works on a 64 GB laptop.
+larger than the machine it runs on. It is not fast — about a token per minute on
+our M1 Max — but it is exact, reproducible, and it works on a 64 GB laptop.
+Newer chips and more RAM make it faster automatically.
 
 ![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
 ![hardware](https://img.shields.io/badge/tested_on-M1_Max_·_64GB-silver)
@@ -113,7 +114,7 @@ and coding agents can use it by changing a base URL:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "deltafin-kimi-k3", "max_tokens": 32,
+  -d '{"model": "deltafin-kimi-k3",
        "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
@@ -122,7 +123,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
 r = client.chat.completions.create(
-    model="deltafin-kimi-k3", max_tokens=32,
+    model="deltafin-kimi-k3",
     messages=[{"role": "user", "content": "Hello!"}])
 
 print(r.choices[0].message.content)            # the answer
@@ -135,8 +136,10 @@ streaming (`"stream": true`) works. Most tools that read `OPENAI_BASE_URL` and
 
 Please read these caveats before pointing anything automated at it:
 
-- **Speed.** Roughly a token per minute. `max_tokens` defaults to 32 and is
-  capped at 256. Set your client's timeouts to hours, not seconds.
+- **Time.** Answers arrive when they arrive — set your client's timeouts to
+  hours, not seconds. Omitting `max_tokens` lets the model finish its answer
+  (recommended); raw completions, which never end on their own, default to 256.
+  Operators can set a hard ceiling with `K3_SERVER_MAX_TOKENS`.
 - **Streaming installs are much slower here.** A chat-template prompt is 60
   tokens or more and prefill touches many experts per layer, so on a partly
   filled cache a chat request can spend hours fetching. With a full install it's
@@ -165,11 +168,13 @@ startup. These variables exist for overriding that:
 | `K3_PROFILE` | `0` | per-phase timing for each pass |
 | `DELTAFIN_ROOT` | repo root | where caches and weights live |
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
+| `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
 
 ## Requirements
 
-- An Apple Silicon Mac. Developed on an M1 Max with 64 GB; more RAM is used
-  automatically.
+- An Apple Silicon Mac. Developed on an M1 Max with 64 GB — the slowest thing
+  it has run on. More RAM is used automatically (a 128 GB machine pins several
+  times more of the model), and newer chips bring much higher memory bandwidth.
 - Xcode Command Line Tools, for `clang` (`xcode-select --install`).
 - Python 3.12 or newer.
 - Disk: ~1.7 TB for the full install, ~215 GB for streaming (see [Install](#install)).
@@ -217,8 +222,12 @@ flowchart LR
 
 ## What to expect
 
-These numbers come from one M1 Max (64 GB) on the day the weights were released.
-They will vary with network speed, disk, and whatever else the machine is doing.
+These numbers come from one M1 Max (64 GB) on the day the weights were released
+— treat them as the floor, not the ceiling. An M3/M4/M5 machine with more RAM
+should do meaningfully better: memory bandwidth is higher across the board, and
+Deltafin automatically pins several times more of the model in RAM on a 128 GB
+machine. If you run it on newer hardware, we would genuinely love to see your
+numbers.
 
 | Metric | First attempt | After optimization | Change |
 |---|---|---|---|
@@ -237,9 +246,8 @@ after run.
 > `The capital of France is` → ` Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also in Paris. The Louvre has…`
 
 To be clear about the limitations: this is a research artifact, not a practical
-chat setup. A token a minute is a long way from interactive, prompts that haven't
-been seen before are slower still, and long prompts are expensive because prefill
-touches many experts. We think it is interesting mainly as an existence proof, and
+chat setup. On the test machine a token a minute is a long way from interactive,
+and long prompts are expensive because prefill touches many experts. We think it is interesting mainly as an existence proof, and
 as a testbed for streaming-inference techniques.
 
 ## Techniques
