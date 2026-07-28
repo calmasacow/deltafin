@@ -1,0 +1,334 @@
+<div align="center">
+
+```
+         ____       _ _         __ _
+        |  _ \  ___| | |_ __ _ / _(_)_ __
+        | | | |/ _ \ | __/ _` | |_| | '_ \
+        | |_| |  __/ | || (_| |  _| | | | |
+        |____/ \___|_|\__\__,_|_| |_|_| |_|
+```
+
+### An experiment in running [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters) on one Apple Silicon Mac
+
+Deltafin is a small research project that streams a Mixture-of-Experts model much
+larger than the machine it runs on. It is slow — about a token per minute — but it
+is exact, reproducible, and it works on a 64 GB laptop.
+
+![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
+![hardware](https://img.shields.io/badge/tested_on-M1_Max_·_64GB-silver)
+![precision](https://img.shields.io/badge/experts-MXFP4_native-teal)
+![mode](https://img.shields.io/badge/decoding-greedy_·_reproducible-green)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
+</div>
+
+---
+
+## How it works
+
+K3's weights total about 1.56 TB, which is more than this machine's free disk, let
+alone its RAM. The observation that makes local inference possible anyway is that a
+Mixture-of-Experts model only *touches* a small fraction of itself per token.
+
+- **The resident spine** (~114 GB: attention, shared experts, latent projections,
+  embeddings) is downloaded once and read layer-by-layer from local NVMe each token,
+  quantized to int8 and computed on the GPU.
+- **The 82,432 routed experts** (~1.45 TB) stay on Hugging Face's CDN. For each
+  token K3's router picks 16 experts per layer, and Deltafin fetches just those —
+  one HTTP range request per expert — into a disk cache. Over time the cache grows
+  toward the subset of the model that actually gets used.
+- **The forward pass** runs Moonshot's own modeling code, unmodified. A small
+  pure-PyTorch shim stands in for the CUDA-only `fla` kernels it expects.
+
+```mermaid
+flowchart LR
+    subgraph HF["Hugging Face CDN"]
+        W[("96 safetensors shards<br/>1.56 TB · MXFP4")]
+    end
+    subgraph MAC["MacBook (M1 Max, 64 GB)"]
+        subgraph DISK["NVMe"]
+            SP[("resident spine<br/>114 GB bf16 → 60 GB int8")]
+            EC[("expert cache<br/>raw shard spans")]
+        end
+        subgraph TOK["per token"]
+            R{"router<br/>top-16 of 896<br/>× 92 layers"}
+            L["93 decoder layers<br/>2 shared GPU templates"]
+            K["fused MXFP4 GEMV<br/>NEON"]
+        end
+    end
+    W -- "one range request<br/>per missing expert" --> EC
+    SP -- "double-buffered<br/>layer loader" --> L
+    EC -- "mmap" --> K
+    R -- "selected experts" --> K
+    K --> L
+    L -- "logits" --> R
+```
+
+## What to expect
+
+These numbers come from one M1 Max (64 GB) on the day the weights were released.
+They will vary with network speed, disk, and whatever else the machine is doing.
+
+| Metric | First attempt | After optimization | Change |
+|---|---|---|---|
+| Prefill (5-token prompt) | 2,429 s | 144 s | ~17× |
+| Warm decode | ~20 min/token | 60–76 s/token | ~16× |
+| With speculation accepts | — | ~43 s/token effective | lossless |
+| Fresh text (uncached experts) | ~20 min/token | ~3 min/token | network-bound |
+
+Output is greedy and reproducible: the same prompt yields the same tokens, run
+after run.
+
+> `The capital of France is` → ` Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also in Paris. The Louvre has…`
+
+To be clear about the limitations: this is a research artifact, not a practical
+chat setup. A token a minute is a long way from interactive, prompts that haven't
+been seen before are slower still, and long prompts are expensive because prefill
+touches many experts. We think it is interesting mainly as an existence proof, and
+as a testbed for streaming-inference techniques.
+
+## Techniques
+
+Each of these was measured on real weights before we trusted it. The full
+experiment log — including the ideas that didn't survive measurement — is in
+[BRAINSTORM-SPEED.md](BRAINSTORM-SPEED.md), and the original plan in
+[PLAN.md](PLAN.md). Little of this is novel on its own; most of it adapts ideas
+from the projects credited below to K3's particular shape.
+
+### I/O and streaming
+
+- **Coalesced expert fetch.** Each expert's six tensors happen to be contiguous in
+  the shard files (we checked all 82,432), so a whole expert is a single 17.55 MB
+  range request over a small pool of keep-alive connections. That measured about
+  6.4× faster than fetching tensors individually. We also tried HTTP/2; it was
+  slower than HTTP/1.1 keep-alive in this setting.
+- **Raw-span disk cache.** Cache files are the shard bytes verbatim — no container
+  format, `mmap` on read.
+- **Double-buffered layer loading.** A worker thread reads the next layer's spine
+  data while the current layer computes.
+- **Previous-token prefetch.** Consecutive tokens reuse roughly 40% of expert
+  selections (we measured 39.7%, close to the 41.3% colibri reported for GLM), so
+  each token's expert set is fetched in the background for the next one.
+
+### Compute
+
+- **Fused MXFP4 dequant+GEMV** ([`tools/fused_gemv.c`](tools/fused_gemv.c)) — a
+  NEON kernel that dequantizes and multiplies in one pass using a 16-entry table
+  lookup, with the e8m0 scale applied as integer arithmetic on the fp32 exponent.
+  It matches the reference implementation bit-for-bit and replaced a much slower
+  dequantize-then-matmul path. A Metal version exists as a validated prototype.
+- **Template-layer buffer reuse.** All 69 KDA layers share one set of tensor
+  shapes and all 24 MLA layers another, so two persistent GPU-resident "template"
+  layers can receive each layer's weights via `copy_()`. This avoids the allocator
+  churn that profiling showed was a large share of per-token time.
+- **int8 resident spine.** Halves the per-token resident I/O. In our checks the
+  top-5 next-token candidates kept their order and the top logit moved by 0.07%.
+- **Pure-PyTorch KDA shim** ([`tools/fla/`](tools/fla)) — Kimi Delta Attention's
+  recurrence, short convolution, and gated norm, ported from fla-core's semantics.
+  Chunked and step-by-step execution agree to about 1e-9. At decode the recurrence
+  runs on CPU, where its small state fits better than a series of GPU dispatches.
+
+### Decoding
+
+- **N-gram speculation.** Drafts come free from suffix matching against the text
+  so far, and are verified in a two-position batch whose fixed costs are shared.
+  This is worthwhile here precisely because resident I/O and compute — not expert
+  fetching — dominate a warm token. Accepted drafts reproduced the reference
+  sequence exactly in our tests, and rejection restores the model state
+  bit-for-bit (K3's recurrent states are small enough to snapshot cheaply).
+
+```mermaid
+sequenceDiagram
+    participant D as n-gram draft
+    participant M as model (one T=2 pass)
+    participant S as state snapshot
+    D->>M: [last_token, draft]
+    M->>M: 93 layers, shared cost
+    alt draft verified
+        M-->>D: 2 tokens accepted
+    else draft wrong
+        S-->>M: state restored (bit-exact)
+        M-->>D: 1 token, nothing lost
+    end
+```
+
+- **Two modes.** *exact* (default) is logit-faithful and reproducible; we use it
+  for all correctness work. *approx* (`K3_APPROX=1`) uses fp16 weights, so output
+  stays coherent but near-tie tokens can differ between runs. We haven't measured
+  approx to be reliably faster yet, which is why it isn't called "fast".
+
+### Scaling with RAM
+
+- At startup Deltafin reserves memory for the OS (`max(10 GB, 18%)`) and pins as
+  many resident layers as the remainder allows. A 128 GB machine pins several
+  times more than a 64 GB one without any configuration, and the expert cache
+  additionally benefits from whatever page cache is free.
+
+## What didn't work
+
+We kept the failures, since they may save someone else the time:
+
+| Idea | What we found |
+|---|---|
+| Low-rank expert approximations | K3's experts appear to be trained dense: rank-128 captured only ~13% of the energy, and experts share no usable common subspace |
+| Compressing expert files (APFS, zstd, lz4) | MXFP4 payloads measure 7.51 bits/byte of entropy; nothing worthwhile compresses |
+| HTTP/2 for expert fetch | slower than HTTP/1.1 keep-alive in our tests |
+| MTP self-speculation | K3 doesn't ship an MTP head |
+| Two-Mac tensor parallel | both expert halves would need to be resident; the arithmetic doesn't come close |
+| fp16 by default | ~0.1 of logit noise was enough to flip near-tie tokens and change the output sequence |
+
+## Requirements
+
+- An Apple Silicon Mac. Developed on an M1 Max with 64 GB; more RAM is used
+  automatically.
+- Xcode Command Line Tools, for `clang` (`xcode-select --install`).
+- Python 3.12 or newer.
+- Free disk: about 175 GB for the spine and its int8 copy, plus room for the
+  expert cache, which grows with use. Budget 350 GB or more to be comfortable.
+- Network access to Hugging Face.
+
+## Getting started
+
+Steps 1–3 take a few minutes. Step 4 downloads 114 GB — roughly half an hour at
+70 MB/s — and is resumable. Nothing here needs `sudo`.
+
+```bash
+# 1. environment
+python3 -m venv venv
+./venv/bin/pip install torch numpy safetensors tiktoken ml_dtypes blobfile \
+    "transformers==4.56.2" einops tokenizers
+
+# 2. build the fused MXFP4 kernel
+clang -O3 -mcpu=native -shared -DNO_MAIN -o tools/libmxfp4gemv.dylib tools/fused_gemv.c
+
+# 3. one-time setup: fetches K3's config, tokenizer and modeling files
+#    (Moonshot's code is downloaded here, not vendored) and builds the tensor index
+./venv/bin/python tools/setup_k3.py
+
+# 4. fetch the resident spine (~114 GB, resumable)
+./venv/bin/python tools/fetch_spine.py
+
+# 5. optional but recommended: int8 spine (halves per-token I/O)
+./venv/bin/python tools/convert_spine_int8.py
+
+# 6. generate
+K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/kimi_run.py \
+    --prompt "The capital of France is" --max-new 16
+```
+
+Experts are fetched on demand into `k3-experts/`, so the first pass over any
+prompt is network-bound and later passes reuse the cache. Add `--chat` to render
+K3's chat template instead of a raw completion — but read the cold-cache caveat
+below first. Router selections are logged to `router_trace.jsonl` if you want to
+study K3's routing behaviour.
+
+## OpenAI-compatible server
+
+Deltafin can serve the standard OpenAI API, so chat interfaces, the `openai` SDK
+and coding agents can use it by changing a base URL:
+
+```bash
+K3_DEV=mps K3_SPINE=int8 ./venv/bin/python tools/serve_openai.py --port 8000
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "deltafin-kimi-k3", "max_tokens": 32,
+       "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+r = client.chat.completions.create(
+    model="deltafin-kimi-k3", max_tokens=32,
+    messages=[{"role": "user", "content": "Hello!"}])
+
+print(r.choices[0].message.content)            # the answer
+print(r.choices[0].message.reasoning_content)  # K3's thinking, when present
+```
+
+`/v1/chat/completions`, `/v1/completions` and `/v1/models` are implemented, and
+streaming (`"stream": true`) works. Most tools that read `OPENAI_BASE_URL` and
+`OPENAI_API_KEY` will work by pointing those at the server.
+
+Please read these caveats before pointing anything automated at it:
+
+- **Speed.** Roughly a token per minute. `max_tokens` defaults to 32 and is
+  capped at 256. Set your client's timeouts to hours, not seconds.
+- **Cold-cache chat is very slow.** A chat-template prompt is 60 tokens or more,
+  and prefill touches many experts per layer, so on a fresh cache the first chat
+  request can spend hours fetching. Warm the cache with short completions first;
+  it persists across restarts and keeps improving.
+- **Greedy only.** `temperature` and `top_p` are accepted and ignored, and one
+  request runs at a time (a second concurrent request gets a 429).
+- **Agents are a curiosity, not a workflow.** Coding assistants work in
+  principle, but their long system prompts make prefill expensive.
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `K3_DEV` | `cpu` | `mps` recommended on Apple Silicon |
+| `K3_SPINE` | `bf16` | `int8` halves resident I/O |
+| `K3_SPEC` | `1` | n-gram speculation (lossless) |
+| `K3_TEMPLATES` | `1` | template-layer buffer reuse |
+| `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
+| `K3_APPROX` | `0` | fp16 numerics; not reproducible at near-ties |
+| `K3_RAM_GB` / `K3_PIN_LAYERS` | auto | override the RAM budget |
+| `K3_PROFILE` | `0` | per-phase timing for each pass |
+| `DELTAFIN_ROOT` | repo root | where caches and weights live |
+
+## Where this could go
+
+Roughly in order: the Metal expert kernels (already prototyped), a proper quality
+harness — average NLL against the official API — so lossy speed/quality
+trade-offs can be measured rather than argued about, smarter expert prefetching,
+and eventually a native engine in the spirit of ds4, where most of the remaining
+overhead should disappear. Details in [PLAN.md](PLAN.md).
+
+## Thanks
+
+Deltafin leans heavily on work that others published openly. In rough order of
+influence:
+
+- **[colibri](https://github.com/JustVugg/colibri)** (JustVugg, Apache-2.0) —
+  showed that a 744B MoE can run in 25 GB of RAM, and is where we learned about
+  router-lookahead prefetch, learned expert pinning, `F_NOCACHE` and `F_RDADVISE`
+  discipline on macOS, and the shard-by-shard conversion pattern. Its M5 Max
+  performance report — CPU spin-waits starving the GPU of a shared power budget —
+  changed how we schedule work.
+- **[ds4 / DwarfStar](https://github.com/antirez/ds4)** (Salvatore Sanfilippo,
+  MIT) — the clearest expert-streaming design we studied: zero-copy expert
+  buffers, masked dispatch, selection-based cache eviction, session persistence,
+  and a quality methodology (average NLL against official API outputs) that we
+  adopted outright. Its stated philosophy — correctness before speed, hide I/O
+  behind compute — is the sensible one, and we tried to follow it.
+- **[Moonshot AI](https://huggingface.co/moonshotai/Kimi-K3)** — for releasing
+  K3's weights openly with readable modeling code, which Deltafin runs directly,
+  and for the Kimi Delta Attention design, whose small recurrent state is what
+  makes long context feasible on a laptop at all.
+- **[flash-linear-attention](https://github.com/fla-org/flash-linear-attention)**
+  (fla-org, MIT) — our KDA shim is a port of semantics from its kernels and
+  reference implementations.
+- **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** — prior art for
+  in-kernel dequantization and MXFP4 handling, and the foundation of most of what
+  the local-inference community knows.
+- **[PyTorch](https://github.com/pytorch/pytorch)**,
+  **[Transformers](https://github.com/huggingface/transformers)**,
+  **[ml_dtypes](https://github.com/jax-ml/ml_dtypes)** (our bit-exactness
+  reference for e2m1) and **[tiktoken](https://github.com/openai/tiktoken)**.
+
+## License
+
+Deltafin's own code is [MIT](LICENSE). Two things in this repository are not ours:
+
+- [`tools/fla/`](tools/fla) is a pure-PyTorch port of semantics from
+  flash-linear-attention (MIT, © 2023–2026 Songlin Yang, Yu Zhang, Zhiyuan Li).
+  The attribution is repeated in the file header and in [LICENSE](LICENSE).
+- Kimi K3's weights and modeling code belong to Moonshot AI and are distributed
+  under Moonshot's own license. They are downloaded at setup, never vendored
+  here — please read that license before using them.
+
+Deltafin is an independent project with no affiliation to Moonshot AI.

@@ -1,0 +1,52 @@
+# ============================================================
+# Deltafin .gitignore — the repo ships code and docs, never weights.
+# Target size: small, like colibri and ds4.
+# ============================================================
+
+# --- model weights & caches (hundreds of GB) ----------------
+k3-resident/
+k3-resident-int8/
+k3-experts/
+k3-model/
+
+# belt and braces: no weight/tensor blobs in any form, anywhere
+*.safetensors
+*.gguf
+*.bin
+*.npz
+*.i8
+*.sc
+*.pt
+*.pth
+
+# --- downloaded third-party model code & metadata -----------
+# (re-fetched at setup from moonshotai/Kimi-K3; not ours to vendor)
+k3-meta/
+tools/k3pkg/modeling_*.py
+tools/k3pkg/configuration_*.py
+tiktoken.model
+
+# --- cloned reference repos (credited & linked, not vendored) ---
+research/colibri/
+research/ds4/
+
+# --- generated / rebuildable artifacts ----------------------
+tools/expert_index.npy
+tools/expert_index.meta.json
+tools/libmxfp4gemv.dylib
+*.dylib
+*.o
+router_trace*.jsonl
+
+# --- environments & tooling ---------------------------------
+venv/
+__pycache__/
+*.pyc
+.claude/
+
+# --- logs & scratch -----------------------------------------
+*.log
+*.tmp
+*.part
+nohup.out
+.DS_Store

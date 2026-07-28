@@ -1,0 +1,102 @@
+# Kimi K3 research report (as of 2026-07-27 ~14:00 UTC)
+
+## 1. Live HuggingFace status
+
+- `https://huggingface.co/api/models/moonshotai/Kimi-K3` returns **HTTP 401** ("Invalid username or password") — repo exists but is not yet public. Same 401 for `Kimi-K3-Base`, `Kimi-K3-Instruct`, `Kimi-K3-Thinking` (note: HF also returns 401 for nonexistent repos when unauthenticated, so variant existence is unconfirmed).
+- The HTML page `https://huggingface.co/moonshotai/Kimi-K3` renders HF's "Upcoming release" countdown page (`<title>moonshotai/Kimi-K3 · Upcoming release</title>`, components `ReleaseCountdown`, `ReleaseNotifyButton`), with embedded JSON **`"releaseDate":"2026-07-27T15:00:00.000Z"`**. At poll time (13:57 UTC) weights were ~1 hour away. Poll the API again after 15:00 UTC (=8:00 PDT / 23:00 Beijing) to grab the real `config.json`.
+- Moonshot's HF org currently ships (by lastModified): Kimi-K2.7-Code (2026-06-15), Kimi-K2.6 (2026-05-19), Kimi-K2.5 (created 2026-01-01, released ~Jan 27–31 2026), Kimi-K2-Thinking, Kimi-K2-Instruct/-0905/-Base, Kimi-Linear-48B-A3B-{Base,Instruct}, Kimi-VL-A3B, Moonlight-16B-A3B, MoonViT-SO-400M.
+- An explainx.ai article claims weights already dropped July 26 ~7:30 PM EDT; this is contradicted by the live countdown + 401 and should be treated as fabricated/AI-slop.
+
+## 2. Kimi K3 architecture (what is credibly known pre-weights)
+
+Sources: official blog kimi.com/blog/kimi-k3, vLLM preview blog (vllm.ai/blog/2026-07-22-kimi-k3-preview), MarkTechPost 2026-07-16, photoncap.net, thesoftwarefrontier.com, simonwillison.net/2026/Jul/16/kimi-k3/.
+
+- **Total params: 2.8T** (official). Sparse MoE activating **16 of 896 routed experts, plus shared experts** (official blog + vLLM preview). Activation ratio ~1.8%.
+- **Active params: ~50–60B (estimate, not official)** — 2.8T × 16/896 ≈ 50B; photoncap/Ken Huang analysis. (K2 was 1.04T total / 32B active for comparison.)
+- **Depth: 93 layers** per vLLM preview blog ("93-layer network", "MLA attention every four layers") → **~70 KDA linear-attention layers + ~23 full MLA layers, 3:1 hybrid ratio** — same ratio as Kimi-Linear. Treat 93 as strong-but-secondhand until config.json lands.
+- **Kimi Delta Attention (KDA)**: hybrid linear attention; official claim "up to 6.3x faster decoding in million-token contexts". Mechanics under §3.
+- **Attention Residuals (AttnRes)**: replaces standard residual stream; each layer *selectively* attends over previous layers' outputs via a learned per-layer pseudo-query w_l ∈ R^d (softmax over depth: h_l = Σ α_{i→l}·v_i). "Block AttnRes" groups layers into ~8 blocks (O(Nd) memory instead of O(Ld)) and is the practical variant. Official claim: ~25% higher training efficiency at <2% extra cost; "selectively retrieves representations across depth rather than accumulating them uniformly". Reference impl + paper: github.com/MoonshotAI/Attention-Residuals (arxiv 2603.15031, 3395 stars). **This is a new op no local engine implements yet.**
+- **Other new components** (MarkTechPost / kimi blog): **Stable LatentMoE** sparsity framework; **Quantile Balancing** (expert load balance from router-score quantiles, no aux-loss hyperparameter); **Per-Head Muon** optimizer; **SiTU (Sigmoid Tanh Unit)** activation (vLLM preview confirms "SiTU activation" in the served model); **Gated MLA** (attention output gating). Claimed net effect: ~2.5x scaling efficiency vs K2.
+- **Context: 1M tokens** (1,048,576) official.
+- **Quantization: native MXFP4 weights + MXFP8 activations, QAT from the SFT stage onward** (official). MXFP4 = e2m1 4-bit elements in blocks of 32 sharing one 8-bit power-of-two (e8m0) scale → **4.25 effective bits/weight**; **~1.4TB element payload, ~1.5TB on disk with scales** (thesoftwarefrontier). This is the format the open weights will ship in.
+- **Vision: native** ("native vision", vLLM preview mentions a "vision tower"); K2.5/K2.6/K2.7 use a MoonViT-style tower (27 layers, hidden 1152, patch 14, ~400M params) — K3's is likely similar scale.
+- **MTP: unknown/unconfirmed.** No source mentions MTP heads; every shipped K2-family config has `num_nextn_predict_layers: 0`.
+- **Tokenizer/vocab: not yet published for K3**; entire K2 family + Kimi-Linear share tiktoken-based tokenizer (`tiktoken.model` + `tokenization_kimi.py`), **vocab_size 163840**, bos 163584 — near-certain carryover.
+- **Reasoning**: launches with single "max" thinking effort; low/high tiers documented later (kimi blog; techtimes). API $3/M input, $15/M output. Simon Willison's pelican: 13,241 reasoning tokens for a 3,417-token answer.
+- **Serving guidance**: "supernodes of 64+ accelerators"; community sizing 8×8×80GB ≈ 5TB aggregate; EP64 = 14 experts/GPU (21GB), EP128 = 7 experts/GPU (10.5GB).
+- Derived consistency check: 2.8T/(896 experts × ~92 MoE layers) ≈ 34M params/expert (≈ moe_intermediate ~1500–1600 if hidden stays 7168); 16×92×34M ≈ 50B routed active — matches the 50B-class estimate. Expert tensor ≈ **18MB at 4.25 bits**.
+
+## 3. KDA mechanics (from Kimi Linear, arxiv 2510.26692)
+
+- KDA = **refined Gated DeltaNet** (Gated DeltaNet: arxiv 2412.06464) with **finer-grained (channel-wise) gating** "enabling more effective use of limited finite-state RNN memory". Formally a **specialized Diagonal-Plus-Low-Rank (DPLR) transition matrix** variant whose bespoke chunkwise algorithm "substantially reduces computation compared to the general DPLR formulation while remaining more consistent with the classical delta rule".
+- **State: fixed-size matrix per head.** FlashKDA API: state shape `[B, H, V, K]` with **K = V = 128 required** → 128×128 = 16K elements/head/layer, constant in sequence length. Kimi-Linear config: KDA `head_dim: 128`, `num_heads: 32`, plus a **short conv (kernel size 4)** on q/k/v (vLLM K3 preview confirms "short convolution state" too).
+- **Hybrid**: 3:1 KDA:MLA. Kimi-Linear-48B (27 layers): `full_attn_layers: [4,8,12,16,20,24,27]` (7 MLA), 20 KDA layers; **MLA layers are NoPE** (`mla_use_nope: true`), kv_lora_rank 512, qk_nope 128, qk_rope 64, v_head 128; 1M `model_max_length`; 256 experts / 8 active / 1 shared.
+- **Wins**: up to **75% KV-cache reduction**, up to **6x decoding throughput / 6.3x TPOT vs MLA at 1M tokens**; RULER 128K: 84.3 score with 3.98x speedup. Outperformed full-MLA baseline on identical 1.4T-token training recipe. Checkpoints trained on 5.7T tokens.
+- **Kernels**: KDA ops upstream in **fla-org/flash-linear-attention** (`fla/ops/kda`, Triton, `fla-core >= 0.4.0`); **MoonshotAI/FlashKDA** = CUTLASS/CUDA kernels (SM90+, CUDA 12.9+; auto-dispatch from FLA ≥0.5.0 via `chunk_kda`; benchmarks for H20/GB200). Nothing Apple-specific exists.
+- **KV-cache math for K3 local use** (if MLA dims carry over): 23 MLA layers × (512+64 rope or 512 NoPE) × bf16 ≈ 24–27KB/token → **~3.3GB @128K ctx, ~26GB @1M**; KDA state is constant: e.g. 64 heads × 128×128 × 2B ≈ 2MB/layer × 70 layers ≈ **~150MB total regardless of context**.
+
+## 4. Moonshot release patterns & repo shape
+
+Announce→weights gaps: **K2: same-day** (2025-07-11); **K2-Thinking: same-day** (2025-11-06); **K2.5: near-same-day** (~2026-01-27); **K3: first-ever delayed release — API 2026-07-16, weights 2026-07-27T15:00Z (11 days)**, with an HF countdown page (new behavior).
+
+What Moonshot ships in a model repo (from Kimi-K2.5, 87 files): `config.json` (nested `text_config` + `vision_config` for K2.5+), `configuration_*.py` + `modeling_*.py` (**trust_remote_code custom code**; K2.x text config is literally `DeepseekV3ForCausalLM`-compatible, `model_type: kimi_k2`/`kimi_k25`), `tiktoken.model` + `tokenization_kimi.py`, `chat_template.jinja`, `generation_config.json`, `preprocessor_config.json` + vision processor py files, `tool_declaration_ts.py`, `docs/deploy_guidance.md`, LICENSE (**Modified MIT**: pure MIT unless product has >100M MAU or >$20M/mo revenue, then attribution required), 64 safetensors shards + index.
+
+Quant format history: K2-Instruct = **block-FP8** (e4m3, weight_block_size [128,128]); K2-Thinking onward = **native INT4 QAT** via compressed-tensors (W4, group_size 32, symmetric, **routed experts only** — attention, shared experts, dense MLP, lm_head, vision excluded); K3 = **MXFP4/MXFP8**. K2.5 on-disk: **595GB (554.3 GiB)** for ~1.03T params.
+
+K2.x exact config (K2.5/K2.6/K2.7-Code text_config identical; K2-Thinking same minus vision): 61 layers (first_k_dense_replace 1), hidden 7168, dense intermediate 18432, **384 routed experts, 8 active, 1 shared**, moe_intermediate 2048, 64 heads, MLA q_lora_rank 1536 / kv_lora_rank 512 / qk_nope 128 / qk_rope 64 / v_head 128, vocab 163840, max_position 262144 (YaRN ×64 from 4096), rope_theta 50000, sigmoid routing (`noaux_tc`), routed_scaling_factor 2.827, **num_nextn_predict_layers 0 (no MTP)**. K2-Instruct: 131072 ctx.
+
+GitHub org: `Kimi-K2` (tech_report.pdf, 11k stars), `Kimi-K2.5` (2270 stars, "Open Visual Agentic Intelligence"), `Kimi-Linear`, `FlashKDA`, `Attention-Residuals`, `kimi-code` (CLI, pushed today 2026-07-27 13:47 UTC — likely K3-day activity), `kimi-cli`, `K2-Vendor-Verifier`, `checkpoint-engine`, `MoBA`, `Moonlight` (Muon). No `Kimi-K3` GitHub repo yet. K2.5 tech report: arxiv 2602.02276.
+
+## 5. Day-1 engine support
+
+- **vLLM**: official preview blog 2026-07-22; **Moonshot contributed KDA prefix-caching directly to vLLM**, released alongside the model; core model path, KDA-aware prefix caching (matrix recurrent state snapshots at prefix boundaries; physical block size decoupled from prefix-match granularity), multimodal, tool parsers in flight. `--tool-call-parser kimi_k2 --reasoning-parser kimi_k2` is the K2.5 pattern.
+- **SGLang**: K2.5 supported on main; K3 day-1 support reported alongside Together/Fireworks/Modal/Databricks hosting.
+- **KTransformers + SGLang**: official K2.5 deploy path for CPU+GPU heterogeneous inference (AMXINT4, `--kt-num-gpu-experts 180`) — closest official analog to expert-streaming local inference.
+- **llama.cpp**: Kimi-Linear/KDA support **merged 2026-02-06** (PR ggml-org/llama.cpp#18755, "backend agnostic + MLA KV cache"; earlier attempt #18381 closed unmerged). K2.5 support requested 2026-01-27, closed 2026-02-11 (works via DeepseekV3 arch + mmproj). **No K3 issue/PR exists yet**; K3 will NOT load in current llama.cpp because AttnRes, SiTU, and Gated MLA are new ops (KDA itself is in-tree, and ggml has had a native MXFP4 type since gpt-oss, Aug 2025).
+- **MLX**: mlx-community actively converts Moonshot models (mlx-community/Kimi-K2.5 = 190k downloads; Kimi-Linear-48B 4/6/8-bit exist).
+
+## 6. Community quants of K2/K2.5+ (the pipeline that will hit K3 within days)
+
+Unsloth dynamic GGUFs (all with imatrix, "UD" = dynamic per-layer bit allocation, attention/shared kept higher precision — mirrors Moonshot's own int4 recipe):
+- **Kimi-K2.5-GGUF** (~1.03T params): UD-TQ1_0 **223.1 GiB** (~1.86 bits/param avg), UD-IQ1_S **257 GiB**, UD-Q2_K_XL **349 GiB**, up through Q8. Ships `mmproj` vision files separately (BF16/F16/F32).
+- **Kimi-K2.7-Code-GGUF**: UD-IQ1_M **283 GiB**, UD-Q4_K_XL **543.6 GiB**; 364k downloads.
+- Kimi-K2-Instruct-GGUF, K2-Thinking-GGUF, K2.6-GGUF also exist. Community consensus: since K2-Thinking+ are int4-QAT native, ~4-bit quants are essentially lossless; UD-Q2_K_XL commonly cited as the sweet spot on 512GB M3 Ultra.
+- Linear scaling to K3 (2.8T ≈ 2.7× K2.5's 1.03T): expect **UD-TQ1_0 ≈ 600–650GB, UD-IQ1_M ≈ 750–800GB, UD-Q2_K_XL ≈ 950GB, 4-bit ≈ 1.5TB**. But note: Unsloth GGUFs require llama.cpp arch support first, which does not exist for K3's AttnRes/SiTU/Gated-MLA — expect a lag longer than the usual 1–3 days unless Moonshot upstreams.
+
+## 7. Implications for M1 Max 64GB / 1.2TB free (framing for synthesizer)
+
+- **Disk is the first wall**: official MXFP4 release ≈ 1.5TB > 1.2TB free. Full-fidelity local storage is impossible without pruning experts, sub-4-bit requant, or external storage.
+- **RAM**: resident set must be attention (23 MLA + 70 KDA + short-convs) + shared experts + router + embeddings + hot expert cache. KDA makes context nearly free (~150MB state + ~3GB MLA KV at 128K), which is a genuine local-inference gift vs K2's pure-MLA 61 layers.
+- **Streaming bound**: worst-case unique experts/token ≈ 16 × ~92 MoE layers × ~18MB ≈ 26GB/token off NVMe (~5–6GB/s internal) → hard ceiling ~0.2 tok/s without expert reuse; real throughput depends entirely on cache hit rate (colibri already demonstrates the approach at 744B/25GB).
+
+## KEY FACTS
+- Kimi-K3 weights drop at exactly 2026-07-27T15:00:00Z (embedded releaseDate on the HF countdown page); at 13:57 UTC the API still returned 401 and no Base/Instruct/Thinking variant is visible
+- K3 official: 2.8T total params, MoE activating 16 of 896 routed experts (+ shared experts), 1,048,576-token context, native vision, released as MXFP4 weights + MXFP8 activations with QAT from SFT onward (kimi.com/blog/kimi-k3)
+- K3 active params ~50-60B (estimate: 2.8T x 16/896 ~= 50B); K2 was 1.04T total / 32B active
+- vLLM preview blog (vllm.ai/blog/2026-07-22-kimi-k3-preview): K3 is a 93-layer network with MLA every four layers (~23 MLA + ~70 KDA, 3:1 hybrid like Kimi-Linear), 896 experts/16 active, SiTU activation, AttnRes, vision tower, short-conv state alongside KDA recurrent state; Moonshot contributed KDA prefix caching directly to vLLM for day-1 support
+- MXFP4 = 4-bit e2m1 in 32-element blocks with one shared e8m0 scale = 4.25 effective bits/weight; K3 on disk ~= 1.4TB payload / ~1.5TB with scales — EXCEEDS the M1 Max's 1.2TB free disk
+- KDA (arxiv 2510.26692) = Gated DeltaNet with finer-grained channel-wise gating, a specialized DPLR transition-matrix variant with a faster chunkwise algorithm; fixed state 128x128 per head (FlashKDA requires K=V=128), short conv kernel 4; up to 75% KV-cache reduction and 6x decode throughput at 1M tokens
+- K3 KV memory estimate if K2 MLA dims carry over: 23 MLA layers x (512 kv_lora + 64 rope) x bf16 ~= 26KB/token -> ~3.3GB at 128K ctx, ~26GB at 1M; all-KDA state is constant ~150MB total — long context is nearly free locally
+- Attention Residuals (github.com/MoonshotAI/Attention-Residuals, arxiv 2603.15031): h_l = softmax-weighted sum over previous layer outputs via one learned pseudo-query per layer; Block AttnRes (~8 blocks) is the practical O(Nd) variant; claimed 25% training-efficiency gain at <2% cost; NOT implemented in any local engine
+- K2.x exact config (K2.5/2.6/2.7 identical text_config): 61 layers, hidden 7168, 384 experts/8 active/1 shared, moe_intermediate 2048, MLA q_lora 1536/kv_lora 512/qk_nope 128/qk_rope 64/v_head 128, 64 heads, vocab 163840 tiktoken, 262144 ctx (YaRN x64), sigmoid routing, num_nextn_predict_layers=0 (no MTP shipped in any K2-family model)
+- Moonshot quant lineage: K2-Instruct block-FP8 (e4m3, 128x128 blocks) -> K2-Thinking/K2.5+ native INT4 QAT (compressed-tensors W4 g32, routed experts ONLY; attention/shared/dense/lm_head excluded) -> K3 MXFP4; K2.5 total on-disk 595GB for ~1.03T params
+- Release gaps: K2 (2025-07-11), K2-Thinking (2025-11-06), K2.5 (~2026-01-27) all same-day weights; K3 is Moonshot's first delayed drop: API 2026-07-16 -> weights 2026-07-27 (11 days), first use of HF countdown
+- Unsloth dynamic GGUF sizes for ~1T-param K2.5: UD-TQ1_0 223 GiB, UD-IQ1_S 257 GiB, UD-Q2_K_XL 349 GiB; K2.7-Code UD-IQ1_M 283 GiB, UD-Q4_K_XL 544 GiB; linear-scaled K3 expectations: ~600-650GB (TQ1_0) to ~1.5TB (4-bit)
+- llama.cpp: Kimi-Linear/KDA support merged 2026-02-06 (PR ggml-org/llama.cpp#18755, backend-agnostic + MLA KV cache); ggml has native MXFP4 tensor type since gpt-oss (Aug 2025); but NO K3 support exists — AttnRes/SiTU/Gated-MLA are new ops, so community GGUFs will lag until llama.cpp adds the arch
+- KDA kernels exist only as Triton (fla-org/flash-linear-attention, fla/ops/kda, fla-core>=0.4.0) and CUDA/CUTLASS SM90+ (MoonshotAI/FlashKDA); nothing for Metal/Apple
+- Kimi-Linear-48B-A3B (48B total/3B active, same 163840 tiktoken vocab, 1M ctx, 27 layers with full_attn_layers [4,8,12,16,20,24,27], MLA NoPE) is a small tokenizer-compatible relative — candidate draft model; MLX 4-bit conversion exists (mlx-community)
+- Official K3 serving guidance: 64+ accelerator 'supernodes'; community sizing 8 nodes x 8x80GB (~5TB); EP64 = 14 experts/21GB per GPU; K3 API pricing $3/M input, $15/M output; launches with single 'max' thinking effort
+- Derived K3 expert size: 2.8T / (896 experts x ~92 MoE layers) ~= 34M params/expert ~= 18MB at MXFP4 (4.25 bits); worst-case unique expert traffic 16 x 92 x 18MB ~= 26GB/token vs ~5-6GB/s internal NVMe -> ~0.2 tok/s ceiling without expert caching/reuse
+- Moonshot repo shape (from K2.5, 87 files): trust_remote_code modeling_*.py, tiktoken.model + tokenization_kimi.py, chat_template.jinja, tool_declaration_ts.py, docs/deploy_guidance.md, Modified-MIT license (pure MIT below 100M MAU / $20M-per-month revenue), 64 safetensors shards; official local-CPU path is KTransformers+SGLang (AMXINT4)
+
+## IMPROVEMENT IDEAS
+- Decode MXFP4 natively in colibri/ds4 (e2m1 nibble + shared e8m0 scale per 32-block; steal ggml's MXFP4 type added for gpt-oss) so the released weights stream straight from mmap with zero requantization loss — Moonshot QAT'd at exactly this format, so 4.25 bits/weight IS full fidelity
+- Exploit the KDA hybrid: only ~23 of 93 layers need KV cache (~26KB/token) and the ~70 KDA layers need one constant 128x128-per-head state (~150MB total) — port fla/ops/kda chunkwise Triton kernel to Metal/NEON (chunked prefill makes prompt processing compute-bound, not memory-bound); llama.cpp PR #18755 is a working C reference for KDA+MLA
+- Solve the 1.5TB > 1.2TB disk wall by storing routed experts pruned or re-quantized: (a) requant routed experts only from MXFP4 to ~1.8-2.2 bit imatrix formats (Unsloth UD recipe: keep attention/shared/dense in high precision, exactly matching Moonshot's own int4-QAT exclusion list) for ~650-800GB on disk, or (b) REAP-style usage-frequency expert pruning (drop e.g. 448/896 experts per layer) calibrated on router statistics
+- Expert-streaming runtime (colibri model scaled up): pin attention + shared experts + router + embeddings + LRU hot-expert cache in ~45-50GB wired RAM (raise iogpu.wired_limit_mb), stream cold ~18MB experts from internal NVMe; the router for layer l+1's FFN is computable before that FFN executes, so prefetch expert reads overlap with current-layer compute — hit rate, not bandwidth, becomes the throughput knob
+- Use Kimi-Linear-48B-A3B-Instruct (same tiktoken 163840 vocab, 3B active, ~25GB at 4-bit, already MLX/llama.cpp-supported) as a resident draft model for speculative decoding of K3 — each accepted draft token amortizes one 26GB worst-case expert-streaming step; if K3 ships an MTP head (check config at 15:00 UTC; all K2s had num_nextn_predict_layers=0), prefer self-speculation instead
+- Implement Block AttnRes cheaply at inference: it only needs ~8 block-representation vectors per token position plus one d-dim pseudo-query dot product per layer — trivial FLOPs, but budget the extra activation storage and get the op right before anything runs; no other engine has it yet, so this is the differentiating porting work (reference: MoonshotAI/Attention-Residuals PDF + pseudocode in README)
+- Cut streamed bandwidth at the router: allow runtime top-k reduction (e.g. 8-12 of 16 experts by score mass) and per-layer early-exit of low-weight experts — halves per-token expert traffic at modest quality cost; also skip loading the ~400M vision tower for text-only use
+- Grab moonshotai/Kimi-K3 config.json + modeling_*.py the minute the 401 clears at 2026-07-27T15:00:00Z and re-derive exact layer/head/expert/moe_intermediate dims before writing any kernel — 93 layers, hidden size, KDA head count, and MTP presence are the load-bearing unknowns; also watch MoonshotAI/kimi-code (pushed today) and the vLLM K3 tree for the authoritative KDA/AttnRes reference implementations
+- If disk stays tight, split storage: hot experts + all dense/attention weights on internal NVMe (5-6GB/s), cold expert tail on an external TB4 SSD (~2.8GB/s) with placement chosen by measured expert access frequency
+- Skip llama.cpp/GGUF entirely for week one: llama.cpp lacks AttnRes/SiTU/Gated-MLA so Unsloth K3 GGUFs will lag; a purpose-built colibri/ds4 fork reading Moonshot's native safetensors+MXFP4 directly is likely the fastest path to first tokens on the M1 Max

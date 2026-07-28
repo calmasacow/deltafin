@@ -1,0 +1,105 @@
+"""Pure-PyTorch KDA (Kimi Delta Attention) kernels, ported from fla-core 0.5.1:
+- recurrence: fla/ops/kda/naive.py (naive_recurrent_kda)
+- gate:       fla/ops/kda/gate.py  (naive_kda_lowerbound_gate / naive_kda_gate)
+chunk_kda == fused_recurrent_kda mathematically (chunking is exact); both run the
+same per-token recurrence here. Handles per-head A_log [H] and per-channel A_log [K]
+(the K3 checkpoint ships [128] = per-channel; broadcast across heads).
+State layout [B, H, K, V] internally; square (128x128) here, and the state only
+round-trips through this module, so transpose_state_layout is a no-op for us."""
+import torch
+import torch.nn.functional as F
+
+
+def _kda_gate(g, A_log, dt_bias, lower_bound):
+    # g: [B, T, H, K] raw; dt_bias: [H*K]; A_log: [H] or [K]
+    B, T, H, K = g.shape
+    g = g.to(torch.float32)
+    if dt_bias is not None:
+        g = g + dt_bias.to(torch.float32).view(H, K)
+    if A_log.numel() == H:
+        a = A_log.to(torch.float32).exp().view(H, 1)
+    elif A_log.numel() == K:
+        a = A_log.to(torch.float32).exp().view(1, K)
+    else:
+        raise ValueError(f"A_log shape {tuple(A_log.shape)} not [H]/[K]")
+    if lower_bound is not None:
+        # gate.py: g = lower_bound * sigmoid(exp(A_log) * g)
+        return lower_bound * torch.sigmoid(a * g)
+    # gate.py: g = -exp(A_log) * softplus(g)
+    return -a * F.softplus(g)
+
+
+def _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
+              use_qk_l2norm_in_kernel, use_gate_in_kernel,
+              use_beta_sigmoid_in_kernel, lower_bound):
+    # shapes: q,k [B,T,H,K]; v [B,T,H,V]; g [B,T,H,K]; beta [B,T,H]
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    if scale is None:
+        scale = K ** -0.5
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    v = v.to(torch.float32)
+    beta = beta.to(torch.float32)
+    if use_qk_l2norm_in_kernel:
+        q = F.normalize(q, p=2.0, dim=-1)
+        k = F.normalize(k, p=2.0, dim=-1)
+    if use_beta_sigmoid_in_kernel:
+        beta = torch.sigmoid(beta)
+    if use_gate_in_kernel:
+        g = _kda_gate(g, A_log, dt_bias, lower_bound)
+    else:
+        g = g.to(torch.float32)
+    S = q.new_zeros(B, H, K, V)
+    if initial_state is not None:
+        S = S + initial_state.to(torch.float32)
+    q = q * scale
+    o = torch.empty(B, T, H, V, dtype=torch.float32, device=q.device)
+    for t in range(T):
+        q_t, k_t, v_t, g_t, b_t = q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t]
+        S = S * g_t.exp().unsqueeze(-1)                                   # decay along K
+        delta = v_t - (k_t.unsqueeze(-1) * S).sum(-2)                     # [B,H,V]
+        S = S + torch.einsum('bhk,bhv->bhkv', b_t.unsqueeze(-1) * k_t, delta)
+        o[:, t] = torch.einsum('bhk,bhkv->bhv', q_t, S)
+    return o, S
+
+
+def fused_recurrent_kda(q, k, v, g, beta, A_log=None, dt_bias=None, scale=None,
+                        initial_state=None, output_final_state=False,
+                        use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False,
+                        use_beta_sigmoid_in_kernel=False, lower_bound=None,
+                        cu_seqlens=None, transpose_state_layout=False, **kw):
+    assert cu_seqlens is None, "shim: cu_seqlens unsupported (batch=1 only)"
+    # Decode (T small): the state math is ~microseconds of FLOPs but ~25 MPS op
+    # launches; run it on CPU (240KB in / 48KB out per layer) and keep the
+    # recurrent state CPU-resident across tokens. Profiled: KDA was 1.23 s/layer
+    # on MPS at T=1 — over half of every decode token.
+    dev = q.device
+    if dev.type == "mps" and q.shape[1] <= 4:
+        cpu = torch.device("cpu")
+        o, S = _kda_core(q.to(cpu), k.to(cpu), v.to(cpu), g.to(cpu), beta.to(cpu),
+                         None if A_log is None else A_log.to(cpu),
+                         None if dt_bias is None else dt_bias.to(cpu),
+                         scale,
+                         None if initial_state is None else initial_state.to(cpu),
+                         use_qk_l2norm_in_kernel, use_gate_in_kernel,
+                         use_beta_sigmoid_in_kernel, lower_bound)
+        return o.to(dev, v.dtype), (S if output_final_state else None)
+    o, S = _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
+                     use_qk_l2norm_in_kernel, use_gate_in_kernel,
+                     use_beta_sigmoid_in_kernel, lower_bound)
+    return o.to(v.dtype), (S if output_final_state else None)
+
+
+def chunk_kda(q, k, v, g, beta, A_log=None, dt_bias=None, scale=None,
+              initial_state=None, output_final_state=False,
+              use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False,
+              use_beta_sigmoid_in_kernel=False, safe_gate=False, lower_bound=None,
+              cu_seqlens=None, transpose_state_layout=False, **kw):
+    assert cu_seqlens is None, "shim: cu_seqlens unsupported (batch=1 only)"
+    if not safe_gate:
+        lower_bound = None
+    o, S = _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
+                     use_qk_l2norm_in_kernel, use_gate_in_kernel,
+                     use_beta_sigmoid_in_kernel, lower_bound)
+    return o.to(v.dtype), (S if output_final_state else None)
