@@ -34,7 +34,9 @@ mechanisms, measurements, and fallback rules behind the speed work, see
 
 ---
 
-## Install
+## Install or upgrade
+
+### New installation
 
 Clone the repository and enter it first; every path below is relative to the
 Deltafin folder. The only real decision is step 3.
@@ -61,6 +63,44 @@ For an NVIDIA system, install a CUDA-enabled PyTorch build using the
 [official PyTorch selector](https://pytorch.org/get-started/locally/) before
 installing the remaining Python packages. Deltafin does not vendor PyTorch or a
 CUDA runtime.
+
+### Upgrade without downloading the model again
+
+Once this release is installed, upgrading is one command from the Deltafin
+folder:
+
+```bash
+./venv/bin/python tools/upgrade.py
+```
+
+The upgrader is deliberately conservative. It refuses a dirty or diverged Git
+checkout, fetches the configured upstream, accepts only a fast-forward, keeps
+the host-specific PyTorch build unchanged, refreshes the other dependencies,
+and rebuilds all native libraries transactionally. It never runs model setup,
+conversion, `git clean`, or `git reset`; downloaded models and caches remain
+where they are.
+
+#### One-time upgrade from an older release
+
+Older copies do not contain `tools/upgrade.py` yet. From the existing Deltafin
+folder, first inspect the checkout:
+
+```bash
+git status --short
+```
+
+If that prints nothing, bootstrap the new upgrader and then let it finish the
+environment and native-library update:
+
+```bash
+git pull --ff-only
+./venv/bin/python tools/upgrade.py
+```
+
+If `git status --short` prints any paths, stop there rather than discarding or
+stashing them blindly. Commit or move work you want to keep, then retry. An
+upgrade never requires `setup_k3.py`, another 1.7 TB download, or manual
+one-library `clang` commands.
 
 ### Supported platforms
 
@@ -140,44 +180,6 @@ change in our checks. Takes a few minutes:
 ```bash
 ./venv/bin/python tools/convert_spine_int8.py
 ```
-
-## Upgrade without downloading the model again
-
-Once this release is installed, upgrading is one command from the Deltafin
-folder:
-
-```bash
-./venv/bin/python tools/upgrade.py
-```
-
-The upgrader is deliberately conservative. It refuses a dirty or diverged Git
-checkout, fetches the configured upstream, accepts only a fast-forward, keeps
-the host-specific PyTorch build unchanged, refreshes the other dependencies,
-and rebuilds all native libraries transactionally. It never runs model setup,
-conversion, `git clean`, or `git reset`; downloaded models and caches remain
-where they are.
-
-### One-time upgrade from an older release
-
-Older copies do not contain `tools/upgrade.py` yet. From the existing Deltafin
-folder, first inspect the checkout:
-
-```bash
-git status --short
-```
-
-If that prints nothing, bootstrap the new upgrader and then let it finish the
-environment and native-library update:
-
-```bash
-git pull --ff-only
-./venv/bin/python tools/upgrade.py
-```
-
-If `git status --short` prints any paths, stop there rather than discarding or
-stashing them blindly. Commit or move work you want to keep, then retry. An
-upgrade never requires `setup_k3.py`, another 1.7 TB download, or manual
-one-library `clang` commands.
 
 ## Usage
 
