@@ -37,6 +37,7 @@ import os
 import threading
 import time as _time
 import concurrent.futures as _cf
+import types
 
 import torch
 
@@ -184,6 +185,300 @@ def _stage_buf(n, dev, dtype):
         b = torch.empty(n, dtype=dtype, device=dev)
         _stage[key] = b
     return b[:n]
+
+
+# ------------------------------------------------ dynamic packed-q8 Q/K/V ---
+_QKV_NAMES = {
+    "self_attn.q_proj.weight": "q",
+    "self_attn.k_proj.weight": "k",
+    "self_attn.v_proj.weight": "v",
+}
+_QKV_ROLES = tuple(_QKV_NAMES.values())
+
+
+class DynamicQ8State:
+    """Shared kill switch for the packed Q/K/V projections on both templates.
+
+    A backend failure in either template disables the experiment process-wide.
+    The failing template first reconstructs its current dense weights, while
+    subsequent layers take the ordinary dequant/copy branch in ``apply_pack``.
+    """
+
+    def __init__(self, on_disable=None):
+        self.enabled = True
+        self.reason = None
+        self._on_disable = on_disable
+
+    def disable(self, reason):
+        if not self.enabled:
+            return
+        self.enabled = False
+        self.reason = f"{type(reason).__name__}: {reason}"
+        if self._on_disable is not None:
+            self._on_disable(self.reason)
+
+
+class DynamicPackedQ8QKV:
+    """Persistent, template-owned row-int8 storage for KDA Q/K/V.
+
+    ``apply_pack`` copies the current layer out of its recycled whole-layer
+    staging buffers into these arenas. Patched ``nn.Linear.forward`` methods
+    then consume stable views with ``aten::_weight_int8pack_mm``. Dense
+    parameters remain available as a cold fallback; they are reconstructed
+    from the owned packed weights before a runtime backend error is exposed to
+    the caller.
+    """
+
+    _QBUF = "_k3_q8_qkv_weight_arena"
+    _SBUF = "_k3_q8_qkv_scale_arena"
+    _CTRL = "_k3_q8_qkv_controller"
+
+    def __init__(self, module, dev, state, matmul, arenas=None):
+        attention = getattr(module, "self_attn", None)
+        if attention is None:
+            raise ValueError("dynamic q8 Q/K/V requires module.self_attn")
+        if getattr(attention, self._CTRL, None) is not None:
+            raise ValueError("dynamic q8 Q/K/V is already installed")
+
+        projections = {}
+        q_cursor = 0
+        scale_cursor = 0
+        slots = {}
+        for role in _QKV_ROLES:
+            projection = getattr(attention, f"{role}_proj", None)
+            if projection is None or not hasattr(projection, "weight"):
+                raise ValueError(f"KDA attention has no {role}_proj.weight")
+            if projection.bias is not None:
+                raise ValueError(f"{role}_proj must be bias-free")
+            shape = tuple(projection.weight.shape)
+            if len(shape) != 2:
+                raise ValueError(f"{role}_proj.weight must be a matrix")
+            rows, cols = shape
+            q_cursor = _align(q_cursor)
+            scale_cursor = _align(scale_cursor * 4) // 4
+            slots[role] = (q_cursor, rows * cols, scale_cursor, rows, cols)
+            q_cursor += rows * cols
+            scale_cursor += rows
+            projections[role] = projection
+
+        q_size = _align(q_cursor)
+        scale_size = _align(scale_cursor * 4) // 4
+        if arenas is None:
+            q_arena = torch.empty(q_size, dtype=torch.int8, device=dev)
+            scale_arena = torch.empty(
+                scale_size,
+                dtype=torch.float32,
+                device=dev,
+            )
+        else:
+            q_arena, scale_arena = arenas
+            q_device_mismatch = (
+                q_arena.device.type != dev.type
+                or (
+                    dev.index is not None
+                    and q_arena.device.index != dev.index
+                )
+            )
+            scale_device_mismatch = (
+                scale_arena.device.type != dev.type
+                or (
+                    dev.index is not None
+                    and scale_arena.device.index != dev.index
+                )
+            )
+            if (q_arena.dtype != torch.int8 or q_arena.numel() < q_size
+                    or q_device_mismatch):
+                raise ValueError("shared packed Q/K/V weight arena is incompatible")
+            if (scale_arena.dtype != torch.float32
+                    or scale_arena.numel() < scale_size
+                    or scale_device_mismatch):
+                raise ValueError("shared packed Q/K/V scale arena is incompatible")
+        attention.register_buffer(self._QBUF, q_arena, persistent=False)
+        attention.register_buffer(self._SBUF, scale_arena, persistent=False)
+        setattr(attention, self._CTRL, self)
+
+        self.module = module
+        self.attention = attention
+        self.state = state
+        self.matmul = matmul
+        self.projections = projections
+        self.slots = slots
+        self.loaded = set()
+        self.dense_loaded = set()
+        self.packed_project_calls = 0
+        self._prior_instance_forwards = {}
+        self._original_forwards = {}
+        for role, projection in projections.items():
+            self._prior_instance_forwards[role] = projection.__dict__.get(
+                "forward", None)
+            self._original_forwards[role] = projection.forward
+
+            def packed_forward(this_projection, hidden, _role=role,
+                               _controller=self):
+                return _controller.project(_role, hidden)
+
+            projection.forward = types.MethodType(packed_forward, projection)
+
+    @property
+    def enabled(self):
+        return self.state.enabled
+
+    @property
+    def nbytes(self):
+        q_arena = getattr(self.attention, self._QBUF)
+        scale_arena = getattr(self.attention, self._SBUF)
+        return (
+            q_arena.numel() * q_arena.element_size()
+            + scale_arena.numel() * scale_arena.element_size()
+        )
+
+    def _views(self, role):
+        qoff, qn, soff, rows, cols = self.slots[role]
+        q_arena = getattr(self.attention, self._QBUF)
+        scale_arena = getattr(self.attention, self._SBUF)
+        return (
+            q_arena[qoff:qoff + qn].view(rows, cols),
+            scale_arena[soff:soff + rows],
+        )
+
+    def arenas(self):
+        return (
+            getattr(self.attention, self._QBUF),
+            getattr(self.attention, self._SBUF),
+        )
+
+    @staticmethod
+    def consumes(name):
+        return name in _QKV_NAMES
+
+    def begin_load(self):
+        self.loaded.clear()
+        self.dense_loaded.clear()
+
+    def load(self, name, qweight, scale):
+        """Copy one Q/K/V role into owned storage; return True if consumed."""
+        if not self.enabled:
+            return False
+        role = _QKV_NAMES.get(name)
+        if role is None:
+            return False
+        try:
+            destination_q, destination_scale = self._views(role)
+            if destination_q.shape != qweight.shape:
+                raise ValueError(
+                    f"packed {role} shape changed: "
+                    f"{tuple(qweight.shape)} != {tuple(destination_q.shape)}")
+            if scale.numel() != destination_scale.numel():
+                raise ValueError(
+                    f"packed {role} scale count changed: "
+                    f"{scale.numel()} != {destination_scale.numel()}")
+            # These are real copies, not aliases of _stage_buf(). That staging
+            # storage is overwritten as soon as the next layer is applied.
+            destination_q.copy_(qweight)
+            destination_scale.copy_(scale)
+        except (NotImplementedError, RuntimeError, TypeError, ValueError,
+                MemoryError) as exc:
+            # The caller still owns qweight/scale and will immediately run the
+            # ordinary dense branch for this role. Preserve every earlier role
+            # first, then make all remaining roles dense process-wide.
+            self._materialize_dense()
+            self.state.disable(exc)
+            return False
+        self.loaded.add(role)
+        return True
+
+    def mark_dense(self, name):
+        """Record that apply_pack installed this layer's dense projection."""
+        role = _QKV_NAMES.get(name)
+        if role is not None:
+            self.dense_loaded.add(role)
+
+    def _materialize_dense(self, roles=None):
+        selected = _QKV_ROLES if roles is None else roles
+        for role in selected:
+            if role not in self.loaded:
+                continue
+            qweight, scale = self._views(role)
+            projection = self.projections[role]
+            weight = projection.weight
+            if (weight.device.type == "meta"
+                    or tuple(weight.shape) != tuple(qweight.shape)
+                    or weight.dtype != torch.float32):
+                dense = qweight.to(torch.float32) * scale[:, None]
+                projection.weight = torch.nn.Parameter(
+                    dense, requires_grad=False)
+            else:
+                torch.mul(
+                    qweight.to(torch.float32),
+                    scale[:, None],
+                    out=weight.data,
+                )
+
+    def finish_load(self):
+        """Finish one layer, accepting all-packed or safely densifying hybrids."""
+        missing = set(_QKV_ROLES) - self.loaded - self.dense_loaded
+        if not missing:
+            if self.enabled and self.dense_loaded:
+                # A partial int8 spine is valid: apply_pack has already installed
+                # the dense role(s). Rebuild the packed subset so this whole
+                # current layer can take nn.Linear after the shared kill switch.
+                self._materialize_dense()
+                error = RuntimeError(
+                    "packed KDA Q/K/V layer includes dense projection(s): "
+                    + ", ".join(sorted(self.dense_loaded))
+                )
+                self.state.disable(error)
+            return
+        self._materialize_dense(self.loaded)
+        error = RuntimeError(
+            "KDA Q/K/V layer is incomplete; no packed or dense value for "
+            + ", ".join(sorted(missing))
+        )
+        self.state.disable(error)
+        # A role not recorded by either path may still contain a prior layer's
+        # weight (or meta storage), so continuing would silently corrupt output.
+        raise error
+
+    def project(self, role, hidden):
+        if not self.enabled or role not in self.loaded:
+            return self._original_forwards[role](hidden)
+        qweight, scale = self._views(role)
+        try:
+            flat = hidden.reshape(-1, hidden.shape[-1])
+            output = self.matmul(flat, qweight, scale)
+            output = output.view(*hidden.shape[:-1], qweight.shape[0])
+            self.packed_project_calls += 1
+            return output
+        except (NotImplementedError, RuntimeError, TypeError) as exc:
+            # The packed operator may be present in the dispatcher yet reject
+            # a future MPS generation, shape, or PyTorch ABI. Rebuild all three
+            # current weights before switching every template to dense mode.
+            self._materialize_dense()
+            self.state.disable(exc)
+            return self._original_forwards[role](hidden)
+
+    def uninstall(self):
+        """Restore the original modules after a transactional setup failure."""
+        for role, projection in self.projections.items():
+            previous = self._prior_instance_forwards[role]
+            if previous is None:
+                projection.__dict__.pop("forward", None)
+            else:
+                projection.forward = previous
+        if getattr(self.attention, self._CTRL, None) is self:
+            delattr(self.attention, self._CTRL)
+        for name in (self._QBUF, self._SBUF):
+            if name in self.attention._buffers:
+                del self.attention._buffers[name]
+
+
+def install_dynamic_q8_qkv(module, dev, state, matmul, arenas=None):
+    return DynamicPackedQ8QKV(module, dev, state, matmul, arenas=arenas)
+
+
+def dynamic_q8_qkv(module):
+    attention = getattr(module, "self_attn", None)
+    return getattr(attention, DynamicPackedQ8QKV._CTRL, None)
 
 
 # Phase counters (always accumulated; printed by kimi_run under K3_PROFILE).
@@ -371,6 +666,9 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
     each parameter's existing buffer."""
     lay = pack["lay"]
     items = lay["items"]
+    packed_qkv = dynamic_q8_qkv(module)
+    if packed_qkv is not None:
+        packed_qkv.begin_load()
     use_metal = DEQ == "metal" and dev.type == "mps" and metal_available()
     PHASE["n_layers"] += 1
     oplan = lay["oplan"]
@@ -396,20 +694,28 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
     for name, full, shape, qoff, nb, scoff, rows in items:
         q = qd[qoff:qoff + nb].view(shape)
         sc = scd[scoff:scoff + rows]
+        if packed_qkv is not None and packed_qkv.load(name, q, sc):
+            continue
         p = module.get_parameter(name)
         fits = (p.device.type != "meta" and p.shape == torch.Size(shape)
                 and p.dtype == torch.float32 and dt == torch.float32)
         if fits and use_metal:
             dequant_into(p.data, q, sc)
+            if packed_qkv is not None and packed_qkv.consumes(name):
+                packed_qkv.mark_dense(name)
             continue
         if fits and DEQ == "mulout":
             torch.mul(q, sc.view(rows, 1).to(torch.float32), out=p.data)
+            if packed_qkv is not None and packed_qkv.consumes(name):
+                packed_qkv.mark_dense(name)
             continue
         t = (q.to(torch.float32) * sc.view(rows, 1).to(torch.float32)).to(dt)
         if p.device.type == "meta" or p.shape != t.shape:
             set_param(module, name, t)
         else:
             p.data.copy_(t)
+        if packed_qkv is not None and packed_qkv.consumes(name):
+            packed_qkv.mark_dense(name)
     PHASE["deq_s"] += _time.time() - t0
     t0 = _time.time()
     have = {rec[1] for rec in oplan}
@@ -420,6 +726,8 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
             set_param(module, name, src.to(dt).clone())
         else:
             p.data.copy_(src)                         # copy_ does the bf16->fp32
+        if packed_qkv is not None and packed_qkv.consumes(name):
+            packed_qkv.mark_dense(name)
     for name, full, path in lay["other"]:
         if full in have:
             continue
@@ -429,6 +737,10 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
             set_param(module, name, t)
         else:
             p.data.copy_(t)
+        if packed_qkv is not None and packed_qkv.consumes(name):
+            packed_qkv.mark_dense(name)
+    if packed_qkv is not None:
+        packed_qkv.finish_load()
     PHASE["other_s"] += _time.time() - t0
     # torch's cpu->mps copy_ is blocking (non_blocking=False), so the host
     # buffers are free the moment .copy_() returned.

@@ -107,6 +107,13 @@ class BenchUnitTests(unittest.TestCase):
                 "emitted_token_ids": [10, 11, 12, 13],
                 "completion_token_ids": [10, 11, 12, 13],
                 "completion_text": "fake completion",
+                "runtime": {
+                    "int8_kda_qkv": {
+                        "controllers_installed": 2,
+                        "enabled_at_end": True,
+                        "packed_project_calls": 6,
+                    },
+                },
             },
         ]
         parsed = bench.parse_structured_events(events, warmup_steps=1)
@@ -116,6 +123,10 @@ class BenchUnitTests(unittest.TestCase):
         self.assertEqual(parsed["steady_decode_ns"], 500_000_000)
         self.assertEqual(parsed["steady_tps"], 4.0)
         self.assertEqual(parsed["completion_token_ids"], [10, 11, 12, 13])
+        self.assertEqual(
+            parsed["runner_runtime"]["int8_kda_qkv"]["packed_project_calls"],
+            6,
+        )
 
 
 class BenchIntegrationTests(unittest.TestCase):

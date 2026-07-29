@@ -1,16 +1,31 @@
-// Fused MXFP4 dequant + GEMV NEON kernel for Kimi-K3 experts (Apple Silicon).
+// Fused MXFP4 dequant + GEMV kernel for Kimi-K3 experts.
 // Never materializes the fp32 weight matrix.
 //
 // Layout: packed U8 [rows, cols/2] (two e2m1 nibbles/byte, LOW first),
 //         scales U8 [rows, cols/32] (e8m0: 2^(s-127)).
 // GEMV: y[r] = dot(W[r,:], x)  (row-major, streaming rows)
 //
-// Build exe:   clang -O3 -mcpu=native -o fused_gemv fused_gemv.c -lpthread -framework Accelerate
-// Build dylib: clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4gemv.dylib fused_gemv.c -lpthread
+// macOS arm64:
+//   clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4gemv.dylib fused_gemv.c -lpthread
+// Linux aarch64:
+//   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
+// Linux x86-64 (SSSE3 + FMA3):
+//   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
 
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
 #include <arm_neon.h>
+#define MXFP4_ARCH_ARM64 1
+#elif defined(__x86_64__) || defined(_M_X64)
+#include "neon_compat_x86.h"
+#define MXFP4_ARCH_X86_64 1
+#else
+#error "The MXFP4 kernel supports only arm64 and x86-64"
+#endif
+
 #include <pthread.h>
+#if defined(__APPLE__)
 #include <pthread/qos.h>
+#endif
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,13 +35,54 @@
 #include <math.h>
 #include <sched.h>
 #ifndef NO_MAIN
+#if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
+#define MXFP4_HAVE_CBLAS 1
+#elif defined(MXFP4_USE_CBLAS)
+#include <cblas.h>
+#define MXFP4_HAVE_CBLAS 1
+#else
+#define MXFP4_HAVE_CBLAS 0
 #endif
+#endif
+
+// Keep Darwin's latency-sensitive scheduling policy.  These APIs do not exist on
+// Linux, where the helpers deliberately become no-ops.
+static inline void mxfp4_qos_self(void) {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
+static inline void mxfp4_qos_attr(pthread_attr_t *attr) {
+#if defined(__APPLE__)
+    pthread_attr_set_qos_class_np(attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#else
+    (void)attr;
+#endif
+}
+
+static inline void mxfp4_cpu_relax(void) {
+#if defined(MXFP4_ARCH_ARM64)
+    __asm__ volatile("yield");
+#elif defined(MXFP4_ARCH_X86_64)
+    __asm__ volatile("pause");
+#endif
+}
 
 static double now_s(void) {
     struct timespec ts;
+#if defined(CLOCK_MONOTONIC_RAW)
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+// Stable loader handshake.  Increment only for an incompatible exported ABI change.
+uint32_t mxfp4_abi_version(void) {
+    return 1u;
 }
 
 // ---------------- shared tables ----------------
@@ -241,26 +297,44 @@ typedef struct { // generic row-partition job for one gemv
 } gjob_t;
 
 static void *gworker(void *arg) {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    mxfp4_qos_self();
     gjob_t *j = (gjob_t *)arg;
     for (int it = 0; it < j->iters; it++)
         j->fn(j->p, j->s, j->x, j->y, j->row0, j->row1, j->cols);
     return NULL;
 }
 
+#define MXFP4_MAX_THREADS 16
+
+static inline int mxfp4_clamp_threads(int nthreads) {
+    if (nthreads < 1) return 1;
+    if (nthreads > MXFP4_MAX_THREADS) return MXFP4_MAX_THREADS;
+    return nthreads;
+}
+
 // one gemv, nthreads, iters back-to-back; returns seconds total
 static double run_gemv_mt_k(gemv_fn fn, const uint8_t *p, const uint8_t *s, const float *x, float *y,
                             int rows, int cols, int nthreads, int iters) {
-    pthread_t th[16]; gjob_t jobs[16];
+    pthread_t th[MXFP4_MAX_THREADS];
+    gjob_t jobs[MXFP4_MAX_THREADS];
+    nthreads = mxfp4_clamp_threads(nthreads);
     int per = (rows + nthreads - 1) / nthreads;
     per = (per + 1) & ~1;  // even split so rows2 stays on 2-row boundaries
     double t0 = now_s();
+    int made = 0;
     for (int t = 0; t < nthreads; t++) {
         jobs[t] = (gjob_t){ fn, p, s, x, y, t * per,
                             (t + 1) * per > rows ? rows : (t + 1) * per, cols, iters };
-        pthread_create(&th[t], NULL, gworker, &jobs[t]);
+        if (pthread_create(&th[t], NULL, gworker, &jobs[t]) != 0) break;
+        made++;
     }
-    for (int t = 0; t < nthreads; t++) pthread_join(th[t], NULL);
+    for (int t = 0; t < made; t++) pthread_join(th[t], NULL);
+    // A partial row partition is not a valid result.  If thread creation failed,
+    // recompute the complete matrix inline after all successful workers have exited.
+    if (made != nthreads) {
+        for (int it = 0; it < iters; it++)
+            fn(p, s, x, y, 0, rows, cols);
+    }
     return now_s() - t0;
 }
 static double run_gemv_mt(const uint8_t *p, const uint8_t *s, const float *x, float *y,
@@ -273,7 +347,7 @@ typedef struct {
     const uint8_t *p1, *s1, *p3, *s3, *p2, *s2;
     const float *x, *h; float *y1, *y3, *y2;
     int tid, nthreads, iters;
-    _Atomic int *bar, *ctrA, *ctrB;
+    _Atomic int *bar, *ctrA, *ctrB, *start;
 } tjob_t;
 
 static void barrier_wait(_Atomic int *ctr, int nthreads, int phase) {
@@ -282,13 +356,15 @@ static void barrier_wait(_Atomic int *ctr, int nthreads, int phase) {
     int spins = 0;
     while (atomic_load_explicit(ctr, memory_order_acquire) < target) {
         if (++spins > 2000) { sched_yield(); spins = 0; }  // machine is oversubscribed
-        else __asm__ volatile("yield");
+        else mxfp4_cpu_relax();
     }
 }
 
 static void *tworker(void *arg) {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    mxfp4_qos_self();
     tjob_t *j = (tjob_t *)arg;
+    while (!atomic_load_explicit(j->start, memory_order_acquire))
+        mxfp4_cpu_relax();
     const int C13 = 3584, C2 = 3072;
     const int CH = 32;                       // rows per work unit (even: rows2-safe)
     const int NA = 2 * (3072 / CH);          // phase A: w1 + w3 chunks
@@ -321,8 +397,10 @@ double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
                            const float *x, const float *h,
                            float *y1, float *y3, float *y2,
                            int nthreads, int iters) {
-    _Atomic int bar = 0, ctrA = 0, ctrB = 0;
-    pthread_t th[16]; tjob_t jobs[16];
+    _Atomic int bar = 0, ctrA = 0, ctrB = 0, start = 0;
+    pthread_t th[MXFP4_MAX_THREADS];
+    tjob_t jobs[MXFP4_MAX_THREADS];
+    nthreads = mxfp4_clamp_threads(nthreads);
     double t0 = now_s();
     if (nthreads <= 1) {
         for (int it = 0; it < iters; it++) {
@@ -332,12 +410,29 @@ double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
         }
         return now_s() - t0;
     }
+    int made = 0;
     for (int t = 0; t < nthreads; t++) {
         jobs[t] = (tjob_t){ p1, s1, p3, s3, p2, s2, x, h, y1, y3, y2,
-                            t, nthreads, iters, &bar, &ctrA, &ctrB };
-        pthread_create(&th[t], NULL, tworker, &jobs[t]);
+                            t, nthreads, iters, &bar, &ctrA, &ctrB, &start };
+        if (pthread_create(&th[t], NULL, tworker, &jobs[t]) != 0) break;
+        made++;
     }
-    for (int t = 0; t < nthreads; t++) pthread_join(th[t], NULL);
+    // Workers wait on start, so a partial pthread_create can safely reduce the
+    // barrier width before any worker enters a phase.
+    for (int t = 0; t < made; t++) {
+        jobs[t].nthreads = made;
+        jobs[t].tid = t;
+    }
+    atomic_store_explicit(&start, 1, memory_order_release);
+    if (made == 0) {
+        for (int it = 0; it < iters; it++) {
+            mxfp4_gemv_rows2(p1, s1, x, y1, 0, 3072, 3584);
+            mxfp4_gemv_rows2(p3, s3, x, y3, 0, 3072, 3584);
+            mxfp4_gemv_rows2(p2, s2, h, y2, 0, 3584, 3072);
+        }
+        return now_s() - t0;
+    }
+    for (int t = 0; t < made; t++) pthread_join(th[t], NULL);
     return now_s() - t0;
 }
 
@@ -420,11 +515,13 @@ int main(int argc, char **argv) {
     }
     // numpy fp32 vs fp64 for context
     errstats(r32_1, r64_1, R13, "w1 numpy-fp32 vs numpy-fp64");
-    // Accelerate baseline correctness
+#if MXFP4_HAVE_CBLAS
+    // Accelerate/OpenBLAS baseline correctness
     float *Wbuf = aligned_alloc(128, (size_t)R13 * C13 * sizeof(float));
     dequant_neon_a(w1p, w1s, Wbuf, 0, R13, C13);
     cblas_sgemv(CblasRowMajor, CblasNoTrans, R13, C13, 1.0f, Wbuf, C13, x, 1, 0.0f, y_ref, 1);
     errstats(y_ref, r64_1, R13, "w1 dequant+sgemv vs fp64");
+#endif
 
     // ---- benchmarks ----
     double tgt = argc > 1 ? atof(argv[1]) : 0.12;
@@ -461,7 +558,8 @@ int main(int argc, char **argv) {
                best * 1e6, PK_TRIPLE / best / 1e9, TOT_TRIPLE / best / 1e9);
     }
 
-    // Accelerate baseline: full dequant (1T neon_a) + sgemv, per matrix, x3 for triple
+#if MXFP4_HAVE_CBLAS
+    // BLAS baseline: full dequant (1T SIMD) + sgemv, per matrix, x3 for triple
     printf("\n== baseline: full dequant + cblas_sgemv (1T dequant) ==\n");
     {
         double bd = 1e9, bs = 1e9;
@@ -480,6 +578,7 @@ int main(int argc, char **argv) {
     }
 
     free(Wbuf);
+#endif
     return 0;
 }
 #endif

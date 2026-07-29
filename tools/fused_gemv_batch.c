@@ -1,4 +1,4 @@
-// Batched MXFP4 dequant+GEMV entry point for Kimi-K3 MoE layers (Apple Silicon).
+// Batched MXFP4 dequant+GEMV entry point for Kimi-K3 MoE layers.
 //
 // Problem this solves: tools/fast_moe.py calls libmxfp4gemv.so once per GEMV, i.e.
 // 48 ctypes calls per MoE layer (16 experts x {w1,w3,w2}). Each of those calls does
@@ -15,6 +15,7 @@
 //
 // Build:
 //   clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4batch.dylib fused_gemv_batch.c -lpthread
+//   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4batch.so fused_gemv_batch.c -lpthread -lm
 //
 // Exports:
 //   int  mxfp4_pool_init(int nthreads)      // idempotent; rebuilds if size changed
@@ -83,7 +84,7 @@ static pthread_cond_t  g_cv_work = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_cv_done = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_api     = PTHREAD_MUTEX_INITIALIZER;  // serializes dispatches
 
-static inline void k3_pause(void) { __asm__ __volatile__("yield"); }
+static inline void k3_pause(void) { mxfp4_cpu_relax(); }
 
 // unit index -> (matrix, row range). n_mats is tiny (<=48 in practice) so a binary
 // search costs nothing next to 32 rows x 3584 cols of streaming work.
@@ -131,7 +132,7 @@ static void k3_run_units(void) {
 // ---------------------------------------------------------------- worker
 static void *k3_worker(void *arg) {
     (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    mxfp4_qos_self();
     // Latch the start generation and announce readiness. mxfp4_pool_init() blocks until
     // every worker has done this, so no dispatch can be missed by a slow-starting thread
     // (which would hang the caller waiting for a completion that never arrives).
@@ -194,7 +195,7 @@ int mxfp4_pool_init(int nthreads) {
         atomic_store_explicit(&g_ready, 0, memory_order_relaxed);
         pthread_attr_t at;
         pthread_attr_init(&at);
-        pthread_attr_set_qos_class_np(&at, QOS_CLASS_USER_INTERACTIVE, 0);
+        mxfp4_qos_attr(&at);
         int made = 0;
         for (int i = 0; i < nthreads; i++) {
             if (pthread_create(&g_th[i], &at, k3_worker, NULL) != 0) break;
@@ -222,7 +223,11 @@ int mxfp4_pool_threads(void) { return g_nworkers; }
 // Caller must hold g_api. g_job must be fully populated (incl. n_units).
 static void k3_dispatch(void) {
     if (g_job.n_units <= 0) return;
-    if (g_nworkers <= 0) { k3_run_units(); return; }   // degenerate: run inline
+    if (g_nworkers <= 0) {                            // degenerate: run inline
+        atomic_store_explicit(&g_cursor, 0, memory_order_relaxed);
+        k3_run_units();
+        return;
+    }
 
     atomic_store_explicit(&g_cursor, 0, memory_order_relaxed);
     atomic_store_explicit(&g_finished, 0, memory_order_relaxed);

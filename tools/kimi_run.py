@@ -439,6 +439,78 @@ if spine_fast.FAST or spine_fast.DEQ == "metal":
     spine_fast.metal_available()          # compile once, on the main thread
     print(f"[spine] fast path: {spine_fast.describe()}", flush=True)
 
+# N1: keep streamed KDA Q/K/V as row-int8 and call PyTorch's native MPS
+# weight-only matmul instead of dequantizing 3x12288x7168 into the shared fp32
+# template arena. Balanced full-sequence gates passed on the M1 reference;
+# capability and exception gates retain the dense path everywhere else.
+# Eligibility is based on runtime capabilities, never a Mac product name, so a
+# newer Apple GPU can take the path as soon as its PyTorch backend supports it.
+_INT8_KDA_QKV_REQUESTED = (
+    os.environ.get("K3_INT8_KDA_QKV", "0").strip().lower()
+    in apple_silicon.TRUE_MODES
+)
+_INT8_KDA_QKV_REASONS = []
+if SPINE != "int8":
+    _INT8_KDA_QKV_REASONS.append("requires K3_SPINE=int8")
+if DT != torch.float32:
+    _INT8_KDA_QKV_REASONS.append("requires fp32 activations")
+if DEV.type != "mps":
+    _INT8_KDA_QKV_REASONS.append("requires MPS")
+if not NATIVE_INT8_MPS:
+    _INT8_KDA_QKV_REASONS.append(
+        "aten::_weight_int8pack_mm has no usable MPS kernel")
+if not TEMPLATES:
+    _INT8_KDA_QKV_REASONS.append("requires shared templates")
+if not spine_fast.PACK:
+    _INT8_KDA_QKV_REASONS.append("requires K3_SPINE_PACK=1")
+INT8_KDA_QKV = _INT8_KDA_QKV_REQUESTED and not _INT8_KDA_QKV_REASONS
+
+
+def _int8_kda_qkv_disabled(reason):
+    print(
+        f"[kda-qkv] native packed-int8 unavailable ({reason}); "
+        "falling back to dequantized dense projections",
+        flush=True,
+    )
+
+
+_INT8_KDA_QKV_STATE = (
+    spine_fast.DynamicQ8State(_int8_kda_qkv_disabled)
+    if INT8_KDA_QKV else None
+)
+_INT8_KDA_QKV_CONTROLLERS = []
+if _INT8_KDA_QKV_REQUESTED and not INT8_KDA_QKV:
+    print(
+        "[kda-qkv] packed-int8 request unavailable: "
+        + "; ".join(_INT8_KDA_QKV_REASONS)
+        + "; using dequantized dense projections",
+        flush=True,
+    )
+
+
+def _int8_kda_qkv_runtime_status():
+    """Report what actually happened, not just the pre-build capability gate."""
+    state = _INT8_KDA_QKV_STATE
+    controllers = _INT8_KDA_QKV_CONTROLLERS
+    packed_project_calls = sum(
+        getattr(controller, "packed_project_calls", 0)
+        for controller in controllers
+    )
+    return {
+        "requested": _INT8_KDA_QKV_REQUESTED,
+        "eligible": INT8_KDA_QKV,
+        "controllers_installed": len(controllers),
+        "enabled_at_end": bool(
+            INT8_KDA_QKV
+            and state is not None
+            and state.enabled
+            and controllers
+        ),
+        "packed_project_calls": packed_project_calls,
+        "disable_reason": state.reason if state is not None else None,
+    }
+
+
 # --- attention / norm fast paths (K3_KDA_RECUR, K3_SHORTCONV, K3_COMPILE) -----
 # All default to the behaviour above; see tools/attn_fast.py for the per-op
 # measurements that motivate each one.
@@ -820,6 +892,7 @@ class LazyEmbed:
 
 
 def build_layers():
+    global _INT8_KDA_QKV_CONTROLLERS
     layers = []
     if not TEMPLATES:
         with torch.device("meta"):
@@ -830,6 +903,35 @@ def build_layers():
         l0 = ml.KimiDecoderLayer(config, 0).eval()        # dense KDA (unique shape)
         tpl_kda = ml.KimiDecoderLayer(config, 1).eval()   # KDA + MoE class
         tpl_mla = ml.KimiDecoderLayer(config, 3).eval()   # MLA + MoE class
+    if INT8_KDA_QKV and _INT8_KDA_QKV_STATE.enabled:
+        installed = []
+        shared_qkv_arenas = None
+        try:
+            for candidate in (l0, tpl_kda):
+                if candidate.is_linear_attn:
+                    controller = spine_fast.install_dynamic_q8_qkv(
+                        candidate,
+                        DEV,
+                        _INT8_KDA_QKV_STATE,
+                        torch._weight_int8pack_mm,
+                        arenas=shared_qkv_arenas,
+                    )
+                    installed.append(controller)
+                    if shared_qkv_arenas is None:
+                        shared_qkv_arenas = controller.arenas()
+        except (RuntimeError, ValueError, MemoryError) as exc:
+            for controller in reversed(installed):
+                controller.uninstall()
+            _INT8_KDA_QKV_STATE.disable(exc)
+        else:
+            _INT8_KDA_QKV_CONTROLLERS = installed
+            packed_bytes = installed[0].nbytes if installed else 0
+            print(
+                f"[kda-qkv] native packed-int8 active for "
+                f"{len(installed)} KDA template(s), "
+                f"{packed_bytes/2**20:.1f} MiB shared persistent storage",
+                flush=True,
+            )
     if TEMPLATE_ARENA:
         _bind_template_arena(((0, l0), (1, tpl_kda), (3, tpl_mla)))
     for i in range(NL):
@@ -843,8 +945,14 @@ def _template_layout(layer_idx, module):
     align_elems = max(1, 256 // torch.empty((), dtype=DT).element_size())
     offset = 0
     layout = []
+    packed_qkv = spine_fast.dynamic_q8_qkv(module)
     for name, p in module.named_parameters():
         if ".experts." in name:
+            continue
+        if packed_qkv is not None and packed_qkv.consumes(name):
+            # The patched projection reads its shared packed arena directly.
+            # Leave the dense Parameter on meta unless a guarded fallback must
+            # reconstruct it after a backend failure.
             continue
         full = f"{PFX}layers.{layer_idx}.{name}"
         meta = k3loader.INV.get(full)
@@ -1434,6 +1542,8 @@ def main():
             "approx": APPROX,
             "templates": TEMPLATES,
             "template_arena": bool(_TEMPLATE_ARENA_STORAGE is not None),
+            "int8_kda_qkv_requested": _INT8_KDA_QKV_REQUESTED,
+            "int8_kda_qkv_eligible": INT8_KDA_QKV,
             "preload": PRELOAD,
             "pin_layers": PIN_N,
             "fast_moe": FAST_MOE,
@@ -1505,7 +1615,10 @@ def main():
     except BaseException as exc:
         events.emit("run_error", error_type=type(exc).__name__, message=str(exc),
                     duration_ns=time.perf_counter_ns() - run_started_ns,
-                    emitted_token_ids=generated)
+                    emitted_token_ids=generated,
+                    runtime={
+                        "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
+                    })
         events.close()
         raise
     decoder_tail = stream_decoder.finish()
@@ -1533,7 +1646,10 @@ def main():
     events.emit("run_end", status=status, duration_ns=duration_ns,
                 emitted_token_ids=emitted_with_eos,
                 completion_token_ids=generated, completion_text=completion,
-                phase_seconds=TIMES)
+                phase_seconds=TIMES,
+                runtime={
+                    "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
+                })
     events.close()
     print(f"total {duration_ns/1e9:.6f}s | times {TIMES}")
     print(k3loader.cache_report())

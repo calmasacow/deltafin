@@ -30,9 +30,13 @@ forward to newer Apple Silicon Macs.
 
 ## Install
 
-Three commands, then you're generating. The only real decision is step 3.
+Clone the repository and enter it first; every path below is relative to the
+Deltafin folder. The only real decision is step 3.
 
 ```bash
+git clone https://github.com/gavamedia/deltafin.git
+cd deltafin
+
 # 1. environment (Python 3.12+, and Xcode CLT for clang)
 python3 -m venv venv
 ./venv/bin/pip install torch numpy safetensors tiktoken ml_dtypes blobfile \
@@ -174,6 +178,7 @@ startup. These variables exist for overriding that:
 | `K3_DEV` | auto | GPU (`mps`) when available, else `cpu` |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head when supported; exact dense fallback remains available |
+| `K3_INT8_KDA_QKV` | `0` | experimental packed-int8 KDA Q/K/V path; set `1` to enable its capability-gated, sequence-parity-checked MPS implementation |
 | `K3_SPEC` | `1` | n-gram speculation (lossless) |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |
 | `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
@@ -277,6 +282,7 @@ oracles were checked for every full-model run.
 | Change | Measured result | Shipping behavior |
 |---|---|---|
 | Packed MPS int8 output head | **+17.3%** median steady decode, **+23.1%** prefill, and **+26.8%** wall throughput; resident head storage fell from 4.7 GB to 1.17 GB | enabled when the operator and int8 weights are available, with an exception-guarded dense fallback |
+| Packed MPS int8 KDA Q/K/V | An initial balanced two-pair full-model A/B measured **+2.8%** median steady decode and **−4.7%** prefill; the run ranges overlap, so more repetitions are welcome | sequence-parity-checked opt-in via `K3_INT8_KDA_QKV=1`; capability-gated, with dense fallback on setup or backend failure |
 | Reference-only speculative snapshots | 0.001 ms instead of 3.56 ms and no ~475 MB state clone | enabled by default; replay and partial-accept tests preserve the exact future sequence |
 | Position-major Metal MoE for accepted drafts | **+4.7%** on a real T=2 layer and **+2.0%** pooled full-model throughput | exact opt-in via `K3_METAL_POSITION_BATCH=1`, pending per-Mac tuning |
 | 128-byte-aligned CPU worker counters | **+0.2%** at four threads and **+3.6%** at eight threads | automatic in the persistent CPU fallback |
@@ -396,6 +402,12 @@ below to K3's particular shape.
   existing row-int8 checkpoint directly, avoiding a 4.7 GB fp32 head and its
   dequantization. Capability checks and a caught dense fallback preserve support
   across PyTorch releases and Apple GPU families.
+- **Packed int8 KDA projections.** The same native MPS operator consumes each
+  KDA layer's Q/K/V matrices directly from the row-int8 spine. The two reusable
+  KDA templates share one 252 MiB packed arena, so those three large matrices
+  are neither dequantized nor retained as dense fp32 weights. This remains an
+  sequence-parity-checked opt-in while its early A/B is repeated; capability
+  and failure guards preserve the dense path.
 - **Pure-PyTorch KDA shim** ([`tools/fla/`](tools/fla)) — Kimi Delta Attention's
   recurrence, short convolution, and gated norm, ported from fla-core's semantics.
   Chunked and step-by-step execution agree to about 1e-9. At decode the recurrence

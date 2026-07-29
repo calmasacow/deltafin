@@ -570,6 +570,7 @@ def parse_structured_events(
         "source": "structured_events",
         "parse_errors": errors,
         "runner_config": starts[-1].get("config") if starts else None,
+        "runner_runtime": end.get("runtime"),
         "input_token_ids": starts[-1].get("input_token_ids") if starts else None,
         "prefill_ns": prefill.get("duration_ns"),
         "prefill_s": ns_to_s(prefill.get("duration_ns")),
