@@ -69,6 +69,11 @@ import time
 import numpy as np
 import torch
 
+try:
+    from runtime_platform import native_build_command
+except ImportError:  # imported as tools.metal_moe instead of top-level
+    from .runtime_platform import native_build_command
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DYLIB = os.environ.get("K3_METAL_LIB", os.path.join(_HERE, "libk3metalmoe.dylib"))
 _MSL = os.environ.get("K3_METAL_SRC", os.path.join(_HERE, "metal", "moe_mxfp4.metal"))
@@ -106,7 +111,10 @@ def _load():
     try:
         lib = ctypes.CDLL(_DYLIB)
     except OSError as e:
-        _load_error = f"{_DYLIB}: {e}"
+        _load_error = (
+            f"{_DYLIB}: {e}. Build this checkout's native libraries with: "
+            f"{native_build_command(_HERE)}"
+        )
         return None
     lib.k3_metal_init.argtypes = [ctypes.c_char_p]
     lib.k3_metal_init.restype = ctypes.c_int

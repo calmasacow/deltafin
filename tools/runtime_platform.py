@@ -13,6 +13,7 @@ import importlib
 import os
 import platform as host_platform
 import re
+import shlex
 import sys
 from typing import Callable, Iterable
 
@@ -23,6 +24,16 @@ GIB = 1 << 30
 
 class NativeLibraryError(ImportError):
     """A required Deltafin native library is absent or API-incompatible."""
+
+
+def native_build_command(
+    tools_directory: str,
+    *,
+    executable: str | None = None,
+) -> str:
+    """Return a copy/paste-safe command that builds this checkout's libraries."""
+    script = os.path.join(os.path.abspath(tools_directory), "build_native.py")
+    return shlex.join((executable or sys.executable, script))
 
 
 def native_library_filename(stem: str, platform: str | None = None) -> str:
@@ -68,8 +79,10 @@ def load_native_library(
     ))
     if not os.path.isfile(path):
         raise NativeLibraryError(
-            f"required native library not found: {path}. Rebuild {default_name} "
-            f"for this machine, or set {env_var} to a compatible build"
+            f"required native library not found: {path}. Build this checkout's "
+            "native libraries with: "
+            f"{native_build_command(directory)} ; or set {env_var} to a "
+            "compatible build"
         )
 
     missing_features = missing_native_cpu_features(
