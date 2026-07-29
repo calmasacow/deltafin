@@ -61,11 +61,20 @@ typedef struct {
 
 static k3_job_t g_job;
 
-static _Atomic long g_gen      = 0;   // dispatch generation counter
-static _Atomic int  g_cursor   = 0;   // work-stealing cursor into [0, n_units)
-static _Atomic int  g_finished = 0;   // workers done with the current dispatch
-static _Atomic int  g_stop     = 0;
-static _Atomic int  g_ready    = 0;   // workers that have latched the start generation
+// These fields are touched by different actors at different frequencies:
+// every worker contends on g_cursor, the last workers update g_finished while
+// the caller polls it, and idle workers poll g_gen.  Keeping adjacent atomics
+// on one cache line makes those independent protocols invalidate each other.
+// This is layout-only: it changes neither the synchronization order nor the
+// kernel arithmetic, and remains useful across Apple CPU generations.
+#ifndef K3_ATOMIC_ALIGN
+#define K3_ATOMIC_ALIGN __attribute__((aligned(128)))
+#endif
+static _Atomic long g_gen      K3_ATOMIC_ALIGN = 0;   // dispatch generation
+static _Atomic int  g_cursor   K3_ATOMIC_ALIGN = 0;   // next work unit
+static _Atomic int  g_finished K3_ATOMIC_ALIGN = 0;   // completed workers
+static _Atomic int  g_stop     K3_ATOMIC_ALIGN = 0;
+static _Atomic int  g_ready    K3_ATOMIC_ALIGN = 0;   // startup latch
 
 static pthread_t       g_th[K3_MAX_THREADS];
 static int             g_nworkers = 0;

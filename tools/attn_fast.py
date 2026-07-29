@@ -25,18 +25,14 @@ attacks.
 
 Flags
 -----
-K3_KDA_RECUR = cpu (default) | mps
-    Where the T<=4 KDA state recurrence runs.  "cpu" is what the shim has been
-    doing: 240 KB of q/k/v/g/beta go D2H, ~10 tiny ops run on CPU, the output
-    comes back.  That decision was taken when the recurrence measured 1.23 s on
-    MPS; today the same math costs 1.17 ms on MPS against 3.12 ms for the CPU
-    round trip, so the hop is now 1.95 ms/layer of pure loss (135 ms/token over
-    69 KDA layers).  It is also a full GPU barrier 69 times per token: the D2H
-    copy waits for every kernel queued before it, including the ~2.5 GB of int8
-    spine dequant for the layer, so that GPU time is charged to the recurrence
-    and cannot overlap with the expert reads that follow.
+K3_KDA_RECUR = mps (default) | cpu
+    Where the T<=4 KDA state recurrence runs.  The historical "cpu" path moves
+    240 KB of q/k/v/g/beta D2H, runs ~10 tiny ops, and copies the output back.
+    Re-measurement found 1.17 ms on MPS against 3.12 ms for the CPU round trip,
+    so "mps" is the shipped default.  The CPU hop is also a full GPU barrier 69
+    times per token.
 
-K3_SHORTCONV = conv1d (default) | mulsum
+K3_SHORTCONV = mulsum (default) | conv1d
     At T=1 the depthwise conv is a per-channel dot of 4 taps over 12,288
     channels; F.conv1d with 12,288 groups is a bad fit for MPS.  "mulsum"
     builds the 4-tap window once (which IS the new conv cache -- bit-identical,
@@ -55,14 +51,16 @@ import time
 
 import torch
 
-RECUR = os.environ.get("K3_KDA_RECUR", "cpu")            # cpu | mps
-SHORTCONV = os.environ.get("K3_SHORTCONV", "conv1d")     # conv1d | mulsum
+RECUR = os.environ.get("K3_KDA_RECUR", "mps")            # mps | cpu
+SHORTCONV = os.environ.get("K3_SHORTCONV", "mulsum")     # mulsum | conv1d
 COMPILE = os.environ.get("K3_COMPILE", "0")              # 0 | attn | layer | 1
 COMPILE_MODE = os.environ.get("K3_COMPILE_MODE", "default")
 if COMPILE == "1":
     COMPILE = "attn"
 
-ACTIVE = (RECUR != "cpu") or (SHORTCONV != "conv1d") or (COMPILE != "0")
+# The line is useful even with no overrides: it proves that the live lower-level
+# shims and this reporting module agree on the optimized defaults.
+ACTIVE = True
 STATS = {"compile_s": 0.0, "graphs": 0}
 
 _ORIG = {}

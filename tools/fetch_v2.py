@@ -18,6 +18,7 @@ Expert layout facts (verified against tensor_inventory_offsets.json for all
 w1_p, w1_s, w2_p, w2_s, w3_p, w3_s with fixed sizes; each MoE layer's 896
 experts occupy ONE shard, back-to-back with zero gaps, sorted by str(eid).
 """
+import atexit
 import collections
 import fcntl
 import http.client
@@ -32,6 +33,11 @@ import urllib.parse
 import concurrent.futures
 
 import numpy as np
+
+try:
+    from cache_writer import AsyncCacheWriter, atomic_publish
+except ImportError:  # imported as tools.fetch_v2 instead of a top-level module
+    from .cache_writer import AsyncCacheWriter, atomic_publish
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INV_PATH = os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")
@@ -68,13 +74,30 @@ MAX_COALESCE = int(os.environ.get("K3_FETCH_COALESCE", "4"))  # experts per merg
 #           persistent worker pool into reused page-aligned buffers, so the
 #           kernel only ever touches resident memory. Measured ~7.0 GB/s.
 EXPERT_READ = os.environ.get("K3_EXPERT_READ", "pread")
-PREAD_WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "6"))
+# Real F_NOCACHE grid on the 8 TB M1 Max SSD: 8 workers sustained 7.51
+# logical GB/s versus 6.91/6.69/6.91 for 4/6/12.  Keep the env override: newer
+# chips and different SSD widths must rerun tools/bench_expert_io_grid.py.
+PREAD_WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "8"))
 PREAD_NOCACHE = os.environ.get("K3_PREAD_NOCACHE", "1") == "1"
 # free-slot high-water mark; prefill unions (up to 5 x 16 experts/layer) grow the
 # pool transiently and are trimmed back to this after the layer is done.
 PREAD_MAX_FREE = int(os.environ.get("K3_PREAD_MAX_FREE", "40"))
 # how many read_layer() results stay valid at once (buffer recycling depth).
 PREAD_DEPTH = int(os.environ.get("K3_PREAD_DEPTH", "2"))
+# X4 opt-in: replace one concurrent.futures.Future per raw expert with a
+# persistent fixed-width worker ring.  The default remains the proven
+# ThreadPoolExecutor path until repeated physical-read layer benchmarks win on
+# each hardware/SSD combination.  K3_PREAD_WORKERS remains the capability-keyed
+# width knob; never inherit this M1's value blindly on M5.
+PREAD_RING = os.environ.get("K3_PREAD_RING", "0") == "1"
+# Cache-miss requests historically publish their downloaded bytes synchronously.
+# Q13 is opt-in until a real miss-path/full-token A/B establishes that moving
+# writes off the request thread beats the extra retained-buffer pressure.
+ASYNC_CACHE_WRITE = os.environ.get("K3_ASYNC_CACHE_WRITE", "0") == "1"
+CACHE_WRITE_QUEUE = max(1, int(os.environ.get("K3_CACHE_WRITE_QUEUE", "4")))
+CACHE_WRITE_WORKERS = max(1, int(os.environ.get("K3_CACHE_WRITE_WORKERS", "1")))
+if CACHE_WRITE_WORKERS > CACHE_WRITE_QUEUE:
+    CACHE_WRITE_WORKERS = CACHE_WRITE_QUEUE
 F_NOCACHE = 48          # <sys/fcntl.h>, Darwin: bypass the unified buffer cache
 
 stats = {
@@ -83,14 +106,128 @@ stats = {
     "resolve_s": 0.0, "retries": 0, "coalesced_spans": 0,
     "pread_experts": 0, "pread_bytes": 0, "pread_s": 0.0, "pread_slots": 0,
     "prefetch_hits": 0, "prefetch_wasted": 0, "npz_experts": 0,
+    "grouped_calls": 0, "grouped_yields": 0, "grouped_fallbacks": 0,
+    "pread_ring_batches": 0, "pread_ring_jobs": 0,
+    "pread_ring_canceled": 0, "pread_ring_failures": 0,
+    "cache_write_enqueued": 0, "cache_write_sync": 0,
+    "cache_write_sync_fallbacks": 0, "cache_write_completed": 0,
+    "cache_write_failures": 0, "cache_write_bytes": 0,
 }
 _stats_lock = threading.Lock()
+_cache_observer = None
+_cache_writer_instance = None
+_cache_writer_lock = threading.Lock()
+_cache_writer_atexit_registered = False
+
+
+def _initial_raw_presence():
+    """Validate raw expert spans once; hot-path membership is then syscall-free."""
+    present = set()
+    try:
+        entries = os.scandir(ECACHE)
+    except FileNotFoundError:
+        return present
+    with entries:
+        for ent in entries:
+            if not ent.name.endswith(".bin"):
+                continue
+            try:
+                if ent.stat(follow_symlinks=False).st_size == EXPERT_SPAN:
+                    present.add(ent.name)
+            except OSError:
+                continue
+    return present
+
+
+_raw_presence = _initial_raw_presence()
+_raw_presence_lock = threading.Lock()
 
 
 def _bump(**kw):
     with _stats_lock:
         for k, v in kw.items():
             stats[k] += v
+
+
+def set_cache_observer(observer):
+    """Install a cheap callback invoked after an expert file is published."""
+    global _cache_observer
+    _cache_observer = observer
+
+
+def _cache_write_published(path, nbytes):
+    # Atomic rename is the visibility boundary. Presence and telemetry are
+    # published only afterward, from the same writer thread.
+    with _raw_presence_lock:
+        _raw_presence.add(os.path.basename(path))
+    _bump(cache_write_completed=1, cache_write_bytes=nbytes)
+    if _cache_observer is not None:
+        _cache_observer(path)
+
+
+def _cache_write_error(path, stage, exc):
+    # The demand request may already have returned its downloaded bytes. Keep
+    # persistence failures observable; an unpublished path remains absent and
+    # will be fetched again on the next demand.
+    del path, stage, exc
+    _bump(cache_write_failures=1)
+
+
+def _shutdown_cache_writer_at_exit():
+    try:
+        status = shutdown_cache_writes(raise_errors=False)
+        if status["failures"]:
+            print(
+                "[fetch_v2] asynchronous cache write failures: "
+                f"{status['failures']} (inspect cache_write_status())",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[fetch_v2] cache writer shutdown failed: {exc}", flush=True)
+
+
+def _get_cache_writer():
+    global _cache_writer_instance, _cache_writer_atexit_registered
+    with _cache_writer_lock:
+        if _cache_writer_instance is None:
+            _cache_writer_instance = AsyncCacheWriter(
+                max_pending=CACHE_WRITE_QUEUE,
+                workers=CACHE_WRITE_WORKERS,
+                name="k3-cache-write",
+            )
+        if not _cache_writer_atexit_registered:
+            atexit.register(_shutdown_cache_writer_at_exit)
+            _cache_writer_atexit_registered = True
+        return _cache_writer_instance
+
+
+def cache_write_status():
+    """Return live async-publication state without blocking."""
+    if _cache_writer_instance is None:
+        return {
+            "submitted": 0, "completed": 0, "publish_failures": 0,
+            "callback_failures": 0, "failures": 0, "bytes": 0,
+            "pending": 0, "pending_peak": 0, "backpressure_events": 0,
+            "backpressure_s": 0.0, "recent_failures": [],
+            "accepting": ASYNC_CACHE_WRITE, "stopped": False,
+            "max_pending": CACHE_WRITE_QUEUE, "workers": CACHE_WRITE_WORKERS,
+            "alive_workers": 0,
+        }
+    return _cache_writer_instance.snapshot()
+
+
+def flush_cache_writes(raise_errors=True):
+    """Drain accepted cache writes; synchronous mode is an immediate no-op."""
+    if _cache_writer_instance is None:
+        return cache_write_status()
+    return _cache_writer_instance.flush(raise_errors=raise_errors)
+
+
+def shutdown_cache_writes(raise_errors=True):
+    """Permanently stop and drain this process's asynchronous cache writer."""
+    if _cache_writer_instance is None:
+        return cache_write_status()
+    return _cache_writer_instance.shutdown(raise_errors=raise_errors)
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +514,279 @@ class _Slot:
             os.close(fd)
 
 
+class GroupReadError(IOError):
+    """A grouped local read failed after the pipeline had already started.
+
+    Callers must discard partial output and take the ordinary fetch path.  The
+    generator settles every outstanding future and retires its slots before
+    propagating this exception.
+    """
+
+
+_RING_QUEUED = 0
+_RING_RUNNING = 1
+_RING_DONE = 2
+_RING_CANCELED = 3
+_RING_FAILED = 4
+
+
+class _RingBatch:
+    """One shared completion record for a submitted expert set.
+
+    A ThreadPoolExecutor allocates one full ``Future`` per expert.  The ring
+    instead allocates one condition and compact parallel state arrays per
+    layer/prefetch set.  Handles are intentionally tiny and implement only the
+    ``cancel``/``result`` contract used by the reader.
+    """
+
+    __slots__ = (
+        "slots", "paths", "states", "errors", "condition", "remaining",
+        "successes", "canceled", "failures", "read_s", "stats_published",
+        "next_index",
+    )
+
+    def __init__(self, slots, paths):
+        self.slots = tuple(slots)
+        self.paths = tuple(paths)
+        self.states = [_RING_QUEUED] * len(self.slots)
+        self.errors = [None] * len(self.slots)
+        self.condition = threading.Condition()
+        self.remaining = len(self.slots)
+        self.successes = 0
+        self.canceled = 0
+        self.failures = 0
+        self.read_s = 0.0
+        self.stats_published = False
+        self.next_index = 0
+
+    def _publish_if_complete_locked(self):
+        if self.remaining or self.stats_published:
+            return None
+        self.stats_published = True
+        return {
+            "pread_experts": self.successes,
+            "pread_bytes": self.successes * EXPERT_SPAN,
+            "pread_s": self.read_s,
+            "pread_ring_canceled": self.canceled,
+            "pread_ring_failures": self.failures,
+        }
+
+    @staticmethod
+    def _publish(metrics):
+        if metrics is not None:
+            _bump(**metrics)
+
+    def claim(self):
+        """Claim the next uncancelled expert for one persistent worker-drain."""
+        with self.condition:
+            while (self.next_index < len(self.states)
+                   and self.states[self.next_index] != _RING_QUEUED):
+                self.next_index += 1
+            if self.next_index == len(self.states):
+                return None
+            index = self.next_index
+            self.next_index += 1
+            self.states[index] = _RING_RUNNING
+            return index
+
+    def finish(self, index, error, elapsed):
+        metrics = None
+        with self.condition:
+            if self.states[index] != _RING_RUNNING:
+                raise AssertionError("ring worker finished a non-running job")
+            self.read_s += elapsed
+            if error is None:
+                self.states[index] = _RING_DONE
+                self.successes += 1
+            else:
+                self.states[index] = _RING_FAILED
+                self.errors[index] = error
+                self.failures += 1
+            self.remaining -= 1
+            metrics = self._publish_if_complete_locked()
+            self.condition.notify_all()
+        self._publish(metrics)
+
+    def cancel(self, index):
+        metrics = None
+        with self.condition:
+            if self.states[index] != _RING_QUEUED:
+                return False
+            self.states[index] = _RING_CANCELED
+            self.canceled += 1
+            self.remaining -= 1
+            metrics = self._publish_if_complete_locked()
+            self.condition.notify_all()
+        self._publish(metrics)
+        return True
+
+    def cancel_all_queued(self):
+        """Cancel every expert not yet claimed by a worker."""
+        for index in range(len(self.states)):
+            self.cancel(index)
+
+    def result(self, index, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self.condition:
+            while self.states[index] in (_RING_QUEUED, _RING_RUNNING):
+                if deadline is None:
+                    self.condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                self.condition.wait(remaining)
+            state = self.states[index]
+            if state == _RING_DONE:
+                return self.slots[index]
+            if state == _RING_CANCELED:
+                raise concurrent.futures.CancelledError()
+            if state == _RING_FAILED:
+                raise self.errors[index]
+            raise AssertionError(f"unexpected ring state {state}")
+
+
+class _RingHandle:
+    """Future-compatible view of one index in a shared ``_RingBatch``."""
+
+    __slots__ = ("_batch", "_index")
+
+    def __init__(self, batch, index):
+        self._batch = batch
+        self._index = index
+
+    def cancel(self):
+        return self._batch.cancel(self._index)
+
+    def result(self, timeout=None):
+        return self._batch.result(self._index, timeout=timeout)
+
+    def cancelled(self):
+        with self._batch.condition:
+            return self._batch.states[self._index] == _RING_CANCELED
+
+
+class _PreadWorkerRing:
+    """Persistent FIFO worker ring for complete-expert reads.
+
+    Workers sleep on one condition and pull one drain ticket per participating
+    worker, then claim experts from the batch's compact shared arrays.  Thus a
+    16-expert layer queues at most ``workers`` records rather than 16 jobs or
+    Futures. Cancellation marks unclaimed indices terminal; running reads remain
+    non-cancelable, matching ``Future.cancel`` and the reader's two-phase drain.
+    """
+
+    def __init__(self, workers=PREAD_WORKERS, name="k3pread-ring"):
+        if workers <= 0:
+            raise ValueError("ring workers must be positive")
+        self.workers = workers
+        self._queue = collections.deque()
+        self._condition = threading.Condition()
+        self._closed = False
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"{name}-{index}",
+                daemon=True,
+            )
+            for index in range(workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, slots, paths):
+        slots = list(slots)
+        paths = list(paths)
+        if len(slots) != len(paths):
+            raise ValueError("slot/path count mismatch")
+        if not slots:
+            return []
+        batch = _RingBatch(slots, paths)
+        handles = [
+            _RingHandle(batch, index) for index in range(len(slots))
+        ]
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("expert worker ring is closed")
+            self._queue.extend(
+                batch for _ in range(min(self.workers, len(slots)))
+            )
+            self._condition.notify_all()
+        # One scheduling-stat lock acquisition for the entire expert set.
+        _bump(pread_ring_batches=1, pread_ring_jobs=len(slots))
+        return handles
+
+    def _worker(self):
+        while True:
+            with self._condition:
+                while not self._queue and not self._closed:
+                    self._condition.wait()
+                if not self._queue:
+                    return
+                batch = self._queue.popleft()
+            while True:
+                index = batch.claim()
+                if index is None:
+                    break
+                started = time.perf_counter()
+                error = None
+                try:
+                    batch.slots[index].read(batch.paths[index])
+                except BaseException as exc:
+                    error = exc
+                batch.finish(index, error, time.perf_counter() - started)
+
+    def close(self, cancel_pending=True):
+        queued = []
+        with self._condition:
+            if self._closed:
+                threads = list(self._threads)
+            else:
+                self._closed = True
+                queued = list(self._queue) if cancel_pending else []
+                if cancel_pending:
+                    self._queue.clear()
+                threads = list(self._threads)
+                self._condition.notify_all()
+        for batch in queued:
+            batch.cancel_all_queued()
+        for thread in threads:
+            thread.join()
+
+
 class _PreadReader:
     """Persistent worker pool + recycled slot pool. One instance per process."""
 
-    def __init__(self):
-        self._ex = concurrent.futures.ThreadPoolExecutor(
-            PREAD_WORKERS, thread_name_prefix="k3pread")
+    def __init__(self, use_ring=None, workers=None):
+        self._workers = workers or PREAD_WORKERS
+        self._use_ring = PREAD_RING if use_ring is None else bool(use_ring)
+        self._ring = (
+            _PreadWorkerRing(self._workers)
+            if self._use_ring else None
+        )
+        # The legacy path creates this eagerly. Ring mode keeps a lazy executor
+        # only for legacy .npz fallbacks, so the all-.bin steady state really
+        # uses exactly the fixed ring threads.
+        self._ex = (
+            None if self._use_ring
+            else concurrent.futures.ThreadPoolExecutor(
+                self._workers, thread_name_prefix="k3pread"
+            )
+        )
         self._free = []                       # idle _Slot objects
         self._gens = collections.deque()      # [[slot, ...]] youngest last
         self._pending = {}                    # layer -> {eid: (slot, future)}
         self._lock = threading.Lock()
+
+    def _fallback_executor(self):
+        if self._ex is not None:
+            return self._ex
+        with self._lock:
+            if self._ex is None:
+                self._ex = concurrent.futures.ThreadPoolExecutor(
+                    self._workers, thread_name_prefix="k3pread-fallback"
+                )
+            return self._ex
 
     # -- slot bookkeeping ---------------------------------------------------
     def _take(self, n):
@@ -421,8 +821,23 @@ class _PreadReader:
 
     def _submit(self, layer, eids):
         slots = self._take(len(eids))
-        return {e: (s, self._ex.submit(self._job, s, _cache_path_bin(layer, e)))
-                for e, s in zip(eids, slots)}
+        if self._ring is not None:
+            handles = self._ring.submit(
+                slots, [_cache_path_bin(layer, e) for e in eids]
+            )
+            return {
+                e: (slot, handle)
+                for e, slot, handle in zip(eids, slots, handles)
+            }
+        return {
+            e: (
+                slot,
+                self._fallback_executor().submit(
+                    self._job, slot, _cache_path_bin(layer, e)
+                ),
+            )
+            for e, slot in zip(eids, slots)
+        }
 
     def prefetch(self, layer, eids):
         """Speculatively start layer `layer`'s reads. At most one layer is kept
@@ -441,13 +856,21 @@ class _PreadReader:
     def _drain(self, jobs):
         """Wait out unwanted in-flight reads and hand their slots back."""
         spare = []
+        # Cancel every queued loser *before* waiting for any running loser.
+        # The old single loop waited on the first active future; while it was
+        # blocked, workers pulled the still-queued speculative futures behind
+        # it, often completing the entire wrong prefetch before demand could be
+        # submitted.  Two phases bound waste to the jobs already inside pread().
+        running = []
         for slot, fut in jobs.values():
             if not fut.cancel():
-                try:
-                    fut.result()
-                except Exception:
-                    pass
+                running.append(fut)
             spare.append(slot)
+        for fut in running:
+            try:
+                fut.result()
+            except Exception:
+                pass
         _bump(prefetch_wasted=len(spare))
         self._give(spare)
 
@@ -467,7 +890,10 @@ class _PreadReader:
         want, other = [], []
         for e in eids:
             (want if _has_bin(layer, e) else other).append(e)
-        npz = {e: self._ex.submit(_cache_load, layer, e) for e in other}
+        npz = {
+            e: self._fallback_executor().submit(_cache_load, layer, e)
+            for e in other
+        }
         missing = []
         with self._lock:
             pend = self._pending.pop(layer, None)
@@ -483,19 +909,18 @@ class _PreadReader:
         if want:
             jobs.update(self._submit(layer, want))
         raw, slots = {}, []
-        err = None
         for e, (slot, fut) in jobs.items():
             try:
                 fut.result()
                 raw[e] = slot.raw
-            except Exception as ex:           # unreadable .bin -> other path
-                err = err or ex
+            except Exception:                 # unreadable .bin -> other path
+                _drop_bin(layer, e)
                 missing.append(e)
             slots.append(slot)
         self._retire(slots)
         _bump(expert_disk=len(raw))
-        if err is not None and not raw:
-            raise err
+        # A stale presence record degrades to the ordinary npz/HTTP path; the
+        # miss list below owns recovery rather than taking down the run.
         for e, fut in npz.items():
             hit = fut.result()
             if hit is None:
@@ -504,6 +929,95 @@ class _PreadReader:
                 raw[e] = hit
                 _bump(npz_experts=1)
         return raw, missing
+
+    def read_layer_groups(self, layer, eids, group_size):
+        """Yield ``(eids, raw)`` groups while later real experts stay in flight.
+
+        ``begin_layer_groups`` proves every requested expert has a raw .bin
+        before this generator is created.  All jobs are submitted up front in
+        caller order, so a weight-priority caller gets its first useful group
+        as soon as those futures land while the pool continues later reads.
+
+        Slots are retired only after the generator finishes or is closed.  This
+        keeps every yielded raw view valid through all Metal dispatches and
+        makes exception/fallback cleanup capability-neutral.
+        """
+        eids = list(eids)
+        if group_size <= 0 or len(set(eids)) != len(eids):
+            raise ValueError("group_size must be positive and eids unique")
+        with self._lock:
+            pend = self._pending.pop(layer, None)
+        jobs = {}
+        if pend:
+            hits = [e for e in eids if e in pend]
+            _bump(prefetch_hits=len(hits))
+            for e in hits:
+                jobs[e] = pend.pop(e)
+            if pend:
+                self._drain(pend)
+        want = [e for e in eids if e not in jobs]
+        if want:
+            jobs.update(self._submit(layer, want))
+
+        slots = [jobs[e][0] for e in eids]
+        settled = set()
+        successful = set()
+        _bump(grouped_calls=1)
+        try:
+            for start in range(0, len(eids), group_size):
+                group_eids = eids[start:start + group_size]
+                raw = {}
+                for e in group_eids:
+                    slot, fut = jobs[e]
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        _drop_bin(layer, e)
+                        settled.add(e)
+                        _bump(grouped_fallbacks=1)
+                        raise GroupReadError(
+                            f"grouped read failed for L{layer}-E{e}") from exc
+                    settled.add(e)
+                    successful.add(e)
+                    raw[e] = slot.raw
+                _bump(grouped_yields=1)
+                yield group_eids, raw
+        finally:
+            # A Metal failure, explicit generator close, or later read failure
+            # must not recycle a slot while pread is still writing into it.
+            running = []
+            for e in eids:
+                if e in settled:
+                    continue
+                _slot, fut = jobs[e]
+                if not fut.cancel():
+                    running.append((e, fut))
+                settled.add(e)
+            # Cancel every queued group before blocking on running reads. This
+            # is the same lifetime rule as _drain(): otherwise workers can turn
+            # all later groups into I/O while cleanup waits on the first one.
+            for e, fut in running:
+                try:
+                    fut.result()
+                    successful.add(e)
+                except Exception:
+                    _drop_bin(layer, e)
+            self._retire(slots)
+            _bump(expert_disk=len(successful))
+
+    def shutdown(self):
+        """Drain owned work and stop worker threads (primarily tests/tools)."""
+        self.drop_prefetch()
+        if self._ring is not None:
+            self._ring.close(cancel_pending=True)
+        if self._ex is not None:
+            self._ex.shutdown(wait=True, cancel_futures=True)
+        self._ring = None
+        self._ex = None
+        with self._lock:
+            self._pending.clear()
+            self._free.clear()
+            self._gens.clear()
 
 
 _reader = None
@@ -528,6 +1042,21 @@ def prefetch_layer(layer, eids):
 def drop_prefetch():
     if EXPERT_READ == "pread" and _reader is not None:
         _reader.drop_prefetch()
+
+
+def begin_layer_groups(layer, eids, group_size):
+    """Return a local grouped-read iterator, or ``None`` for safe fallback.
+
+    Grouping is intentionally local-pread-only.  A legacy .npz, absent expert,
+    HTTP fetch, non-positive group size, or duplicate ID takes the unchanged
+    ``fetch_experts`` path before any grouped work is submitted.
+    """
+    eids = list(eids)
+    if (EXPERT_READ != "pread" or group_size <= 0
+            or len(set(eids)) != len(eids)
+            or any(not _has_bin(layer, e) for e in eids)):
+        return None
+    return reader().read_layer_groups(layer, eids, group_size)
 
 
 # ---------------------------------------------------------------------------
@@ -555,18 +1084,35 @@ def _cache_path_bin(layer, eid):
 
 
 def _has_bin(layer, eid):
-    try:
-        return os.stat(_cache_path_bin(layer, eid)).st_size == EXPERT_SPAN
-    except OSError:
-        return False
+    # Startup validated every entry's size. Individual set operations are
+    # atomic under CPython; writes still use a lock so alternate runtimes have
+    # an uncomplicated synchronization contract.
+    return f"L{layer}-E{eid}.bin" in _raw_presence
+
+
+def _drop_bin(layer, eid):
+    """Forget a stale cache entry after an actual open/read failure."""
+    with _raw_presence_lock:
+        _raw_presence.discard(f"L{layer}-E{eid}.bin")
 
 
 def _cache_store_raw(layer, eid, span):
     path = _cache_path_bin(layer, eid)
-    tmp = path + f".tmp{os.getpid()}-{threading.get_ident()}"
-    with open(tmp, "wb") as f:
-        f.write(span)
-    os.replace(tmp, path)
+    if ASYNC_CACHE_WRITE:
+        writer = _get_cache_writer()
+        if writer.submit(
+            path,
+            span,
+            on_published=_cache_write_published,
+            on_error=_cache_write_error,
+        ):
+            _bump(cache_write_enqueued=1)
+            return
+        # A caller racing explicit shutdown still preserves the cache object.
+        _bump(cache_write_sync_fallbacks=1)
+    atomic_publish(path, span)
+    _bump(cache_write_sync=1)
+    _cache_write_published(path, len(span))
 
 
 def _cache_load(layer, eid):
@@ -664,6 +1210,9 @@ def fetch_experts(layer, eids, workers=None, dequant=True, coalesce=True):
 def close():
     """Close pooled connections (safe to call between batches)."""
     global _httpx_client
+    # Surface background persistence errors at an ordinary lifecycle boundary
+    # without permanently disabling the writer; atexit performs final shutdown.
+    flush_cache_writes(raise_errors=True)
     with _pool._lock:
         for _, c in _pool._idle:
             try:

@@ -37,9 +37,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kimi_run as kr  # noqa: E402
+from response_memo import DeterministicResponseMemo  # noqa: E402
 
 MODEL_ID = "deltafin-kimi-k3"
 MAX_TOKENS_CAP = int(os.environ.get("K3_SERVER_MAX_TOKENS", "0"))   # 0 = no cap
+RESPONSE_MEMO_ENTRIES = int(
+    os.environ.get("K3_RESPONSE_MEMO_ENTRIES", "32"))
 RESPONSE_MARKER = "<|open|>response<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
 
@@ -47,6 +50,7 @@ _lock = threading.Lock()
 _tok = None
 _layers = None
 _embed = None
+_memo = DeterministicResponseMemo(RESPONSE_MEMO_ENTRIES)
 
 
 def _boot():
@@ -73,19 +77,22 @@ def _split_reasoning(text):
 def _gen(ids, max_new, on_delta=None):
     """Run one generation under the global lock; stream decoded-text deltas."""
     cache = kr.ml.KimiDynamicCache(kr.config)
-    toks, decoded = [], ""
+    toks = []
+    decoder = kr.IncrementalTokenDecoder(_tok) if on_delta else None
 
     def on_token(t):
-        nonlocal decoded
         if t == kr.EOS_ID:
             return
         toks.append(t)
-        full = _tok.decode(toks)
-        delta, decoded = full[len(decoded):], full
+        delta = decoder.append(t) if decoder is not None else ""
         if on_delta and delta:
             on_delta(delta)
 
     out = kr.generate(_layers, cache, _embed, ids, max_new, on_token=on_token)
+    if decoder is not None:
+        tail = decoder.finish()
+        if tail:
+            on_delta(tail)
     if kr.EOS_ID in out:
         out = out[:out.index(kr.EOS_ID)]
         finish = "stop"
@@ -155,6 +162,11 @@ class Handler(BaseHTTPRequestHandler):
         if not _lock.acquire(timeout=5):
             return self._err(429, "a generation is already running (Deltafin serves one at a time)")
         try:
+            mode = "chat" if chat else "completion"
+            cached = _memo.get(mode, ids, max_new)
+            if cached is not None:
+                print(f"[serve] deterministic response memo hit "
+                      f"({len(cached.token_ids)} tokens)", flush=True)
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -177,7 +189,16 @@ class Handler(BaseHTTPRequestHandler):
                              "model": MODEL_ID,
                              "choices": [{"index": 0, "text": delta, "finish_reason": None}]})
 
-                _, _, finish = _gen(ids, max_new, on_delta=on_delta)
+                if cached is None:
+                    out, text, finish = _gen(
+                        ids, max_new, on_delta=on_delta)
+                    _memo.put(mode, ids, max_new, out, text, finish)
+                else:
+                    out = list(cached.token_ids)
+                    text = cached.text
+                    finish = cached.finish_reason
+                    if text:
+                        on_delta(text)
                 key = "delta" if chat else "text"
                 sse({"id": rid, "object": "chat.completion.chunk" if chat else "text_completion",
                      "created": created, "model": MODEL_ID,
@@ -186,7 +207,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
 
-            out, text, finish = _gen(ids, max_new)
+            if cached is None:
+                out, text, finish = _gen(ids, max_new)
+                _memo.put(mode, ids, max_new, out, text, finish)
+            else:
+                out = list(cached.token_ids)
+                text = cached.text
+                finish = cached.finish_reason
             usage = {"prompt_tokens": len(ids), "completion_tokens": len(out),
                      "total_tokens": len(ids) + len(out)}
             if chat:

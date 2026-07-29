@@ -39,6 +39,16 @@
 //        out[3584]           fp32 result, overwritten.
 //        Returns 0 on success, negative on error.  Synchronous.
 //
+//   int  k3_metal_moe_positions(
+//            const uint8_t *const *expert_blobs, int n_edges,
+//            const int *position_offsets, int n_positions,
+//            const float *weights, const float *x, float *out)
+//        Opt-in N5 path. `position_offsets` has n_positions+1 entries, starts at
+//        zero, ends at n_edges, and partitions row-major expert_blobs/weights.
+//        x/out are [n_positions, 3584]. The ordinary per-position kernels are
+//        encoded in the same order into ONE command buffer and waited once.
+//        Arithmetic and reduction order within every position are unchanged.
+//
 //   void k3_metal_drop(const uint8_t *blob)
 //        Release the cached MTLBuffer for one blob pointer.  MUST be called
 //        before the caller unmaps/frees that memory, otherwise a later call that
@@ -60,6 +70,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
@@ -101,9 +112,14 @@ id<MTLComputePipelineState> g_pGlu1 = nil, g_pW21 = nil;
 id<MTLComputePipelineState> g_pRed = nil;
 
 id<MTLBuffer> g_bX = nil, g_bH = nil, g_bY = nil, g_bOut = nil, g_bW = nil, g_bArgs = nil;
+// N5 uses separate pools so the default one-position allocation and execution
+// path above remain byte-for-byte untouched until explicitly requested.
+id<MTLBuffer> g_bBatchX = nil, g_bBatchH = nil, g_bBatchY = nil;
+id<MTLBuffer> g_bBatchOut = nil, g_bBatchW = nil, g_bBatchArgs = nil;
 NSMutableDictionary<NSNumber *, id<MTLBuffer>> *g_cache = nil;   // blob ptr -> wrap
 NSMutableArray<id<MTLBuffer>> *g_scratch = nil;                  // copy-path staging
 int g_cap = 0;                                                   // pool capacity in experts
+int g_batch_edge_cap = 0, g_batch_position_cap = 0;
 int g_bindless = -1;                                             // -1 = auto
 long long g_calls = 0, g_wraps = 0, g_copies = 0;
 
@@ -147,6 +163,47 @@ bool ensure_capacity(int n) {
                                         options:MTLResourceStorageModeShared];
   if (!bH || !bY || !bW || !bA) { seterr("pool alloc", nil); return false; }
   g_bH = bH; g_bY = bY; g_bW = bW; g_bArgs = bA; g_cap = cap;
+  return true;
+}
+
+// Separate capacity for the opt-in multi-position ABI. Keeping it out of
+// ensure_capacity() prevents a speculative T=8 call from permanently inflating
+// the established T=1 scratch pools.
+bool ensure_batch_capacity(int edges, int positions) {
+  if (edges <= g_batch_edge_cap && positions <= g_batch_position_cap) return true;
+  const int edge_cap = std::max(std::max(edges, g_batch_edge_cap), 1);
+  const int position_cap =
+      std::max(std::max(positions, g_batch_position_cap), 1);
+  id<MTLBuffer> bX =
+      [g_dev newBufferWithLength:(size_t)position_cap * K3_H * 4
+                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bH =
+      [g_dev newBufferWithLength:(size_t)edge_cap * K3_I * 4
+                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bY =
+      [g_dev newBufferWithLength:(size_t)edge_cap * K3_H * 4
+                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bOut =
+      [g_dev newBufferWithLength:(size_t)position_cap * K3_H * 4
+                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bW =
+      [g_dev newBufferWithLength:(size_t)edge_cap * 4
+                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bArgs =
+      [g_dev newBufferWithLength:(size_t)edge_cap * 8
+                         options:MTLResourceStorageModeShared];
+  if (!bX || !bH || !bY || !bOut || !bW || !bArgs) {
+    seterr("position-batch pool alloc", nil);
+    return false;
+  }
+  g_bBatchX = bX;
+  g_bBatchH = bH;
+  g_bBatchY = bY;
+  g_bBatchOut = bOut;
+  g_bBatchW = bW;
+  g_bBatchArgs = bArgs;
+  g_batch_edge_cap = edge_cap;
+  g_batch_position_cap = position_cap;
   return true;
 }
 
@@ -380,6 +437,172 @@ int k3_metal_moe_layer(const uint8_t *const *expert_blobs, int n_experts,
     }
     memcpy(out, [g_bOut contents], K3_H * 4);
     g_calls++;
+  }
+  return 0;
+}
+
+int k3_metal_moe_positions(const uint8_t *const *expert_blobs, int n_edges,
+                           const int *position_offsets, int n_positions,
+                           const float *weights, const float *x, float *out) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!init_locked(nullptr)) return -1;
+  if (n_edges < 0 || n_positions < 0) return -2;
+  if (n_positions == 0) return n_edges == 0 ? 0 : -2;
+  if (!position_offsets || !x || !out) return -2;
+  if (position_offsets[0] != 0) return -2;
+  for (int p = 0; p < n_positions; ++p) {
+    if (position_offsets[p] < 0 ||
+        position_offsets[p] > position_offsets[p + 1] ||
+        position_offsets[p + 1] > n_edges) {
+      return -2;
+    }
+  }
+  if (position_offsets[n_positions] != n_edges) return -2;
+  if (n_edges > 0 && (!expert_blobs || !weights)) return -2;
+  if (!ensure_batch_capacity(n_edges, n_positions)) return -3;
+
+  @autoreleasepool {
+    std::vector<id<MTLBuffer>> bufs((size_t)n_edges);
+    for (int edge = 0; edge < n_edges; ++edge) {
+      if (!expert_blobs[edge]) return -2;
+      bufs[edge] = wrap_blob(expert_blobs[edge], edge);
+      if (!bufs[edge]) return -4;
+    }
+    memcpy([g_bBatchX contents], x, (size_t)n_positions * K3_H * 4);
+    if (n_edges > 0)
+      memcpy([g_bBatchW contents], weights, (size_t)n_edges * 4);
+    // Empty route rows are legal at the ABI boundary. Their reduce dispatch is
+    // skipped, so pre-zero every output row before encoding the nonempty ones.
+    memset([g_bBatchOut contents], 0, (size_t)n_positions * K3_H * 4);
+
+    id<MTLCommandBuffer> cb = [g_q commandBuffer];
+    if (!cb) {
+      seterr("position-batch command buffer", nil);
+      return -5;
+    }
+
+    if (g_bindless == 1) {
+      uint64_t *addr = (uint64_t *)[g_bBatchArgs contents];
+      for (int edge = 0; edge < n_edges; ++edge)
+        addr[edge] = [bufs[edge] gpuAddress];
+
+      // One serial encoder preserves every dependency in the proven N5 probe:
+      // position 0 GLU -> W2 -> reduce, then position 1, and so on.
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      for (int edge = 0; edge < n_edges; ++edge)
+        [enc useResource:bufs[edge] usage:MTLResourceUsageRead];
+
+      for (int p = 0; p < n_positions; ++p) {
+        const int edge0 = position_offsets[p];
+        const int count = position_offsets[p + 1] - edge0;
+        if (count == 0) continue;
+        const size_t xoff = (size_t)p * K3_H * 4;
+        const size_t hoff = (size_t)edge0 * K3_I * 4;
+        const size_t yoff = (size_t)edge0 * K3_H * 4;
+        const size_t woff = (size_t)edge0 * 4;
+        const size_t aoff = (size_t)edge0 * 8;
+        const size_t ooff = (size_t)p * K3_H * 4;
+        MoeDims D = {(uint32_t)count, K3_H, K3_I,
+                     OFF_W1P, OFF_W1S, OFF_W2P, OFF_W2S,
+                     OFF_W3P, OFF_W3S, 0, (uint32_t)count * K3_I};
+
+        [enc setComputePipelineState:g_pGluB];
+        [enc setBuffer:g_bBatchArgs offset:aoff atIndex:0];
+        [enc setBuffer:g_bBatchX offset:xoff atIndex:1];
+        [enc setBuffer:g_bBatchH offset:hoff atIndex:2];
+        [enc setBytes:&D length:sizeof D atIndex:3];
+        [enc dispatchThreadgroups:
+                 MTLSizeMake((D.nt + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+
+        D.nt = (uint32_t)count * K3_H;
+        [enc setComputePipelineState:g_pW2B];
+        [enc setBuffer:g_bBatchArgs offset:aoff atIndex:0];
+        [enc setBuffer:g_bBatchH offset:hoff atIndex:1];
+        [enc setBuffer:g_bBatchY offset:yoff atIndex:2];
+        [enc setBytes:&D length:sizeof D atIndex:3];
+        [enc dispatchThreadgroups:
+                 MTLSizeMake((D.nt + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+
+        [enc setComputePipelineState:g_pRed];
+        [enc setBuffer:g_bBatchY offset:yoff atIndex:0];
+        [enc setBuffer:g_bBatchW offset:woff atIndex:1];
+        [enc setBuffer:g_bBatchOut offset:ooff atIndex:2];
+        [enc setBytes:&D length:sizeof D atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((K3_H + 255) / 256, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      [enc endEncoding];
+    } else {
+      // The direct-bind fallback keeps the established concurrent-per-stage
+      // schedule. Encoder boundaries preserve GLU/W2/reduce dependencies while
+      // all positions still share one command buffer and one completion wait.
+      for (int p = 0; p < n_positions; ++p) {
+        const int edge0 = position_offsets[p];
+        const int count = position_offsets[p + 1] - edge0;
+        if (count == 0) continue;
+        const size_t xoff = (size_t)p * K3_H * 4;
+        const size_t hoff = (size_t)edge0 * K3_I * 4;
+        const size_t yoff = (size_t)edge0 * K3_H * 4;
+        const size_t woff = (size_t)edge0 * 4;
+        const size_t ooff = (size_t)p * K3_H * 4;
+        MoeDims D = {(uint32_t)count, K3_H, K3_I,
+                     OFF_W1P, OFF_W1S, OFF_W2P, OFF_W2S,
+                     OFF_W3P, OFF_W3S, 0, 0};
+
+        id<MTLComputeCommandEncoder> e1 =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        [e1 setComputePipelineState:g_pGlu1];
+        [e1 setBuffer:g_bBatchX offset:xoff atIndex:1];
+        [e1 setBuffer:g_bBatchH offset:hoff atIndex:2];
+        for (int edge = 0; edge < count; ++edge) {
+          D.expert = (uint32_t)edge;
+          D.nt = K3_I;
+          [e1 setBuffer:bufs[(size_t)edge0 + edge] offset:0 atIndex:0];
+          [e1 setBytes:&D length:sizeof D atIndex:3];
+          [e1 dispatchThreadgroups:
+                  MTLSizeMake((K3_I + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        }
+        [e1 endEncoding];
+
+        id<MTLComputeCommandEncoder> e2 =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        [e2 setComputePipelineState:g_pW21];
+        [e2 setBuffer:g_bBatchH offset:hoff atIndex:1];
+        [e2 setBuffer:g_bBatchY offset:yoff atIndex:2];
+        for (int edge = 0; edge < count; ++edge) {
+          D.expert = (uint32_t)edge;
+          D.nt = K3_H;
+          [e2 setBuffer:bufs[(size_t)edge0 + edge] offset:0 atIndex:0];
+          [e2 setBytes:&D length:sizeof D atIndex:3];
+          [e2 dispatchThreadgroups:
+                  MTLSizeMake((K3_H + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        }
+        [e2 endEncoding];
+
+        id<MTLComputeCommandEncoder> e3 = [cb computeCommandEncoder];
+        [e3 setComputePipelineState:g_pRed];
+        [e3 setBuffer:g_bBatchY offset:yoff atIndex:0];
+        [e3 setBuffer:g_bBatchW offset:woff atIndex:1];
+        [e3 setBuffer:g_bBatchOut offset:ooff atIndex:2];
+        [e3 setBytes:&D length:sizeof D atIndex:3];
+        [e3 dispatchThreadgroups:MTLSizeMake((K3_H + 255) / 256, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e3 endEncoding];
+      }
+    }
+
+    [cb commit];
+    [cb waitUntilCompleted];
+    if ([cb status] == MTLCommandBufferStatusError) {
+      seterr("position-batch command buffer", [cb error]);
+      return -5;
+    }
+    memcpy(out, [g_bBatchOut contents], (size_t)n_positions * K3_H * 4);
+    g_calls += n_positions;
   }
   return 0;
 }

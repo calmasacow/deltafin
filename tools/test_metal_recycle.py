@@ -116,7 +116,12 @@ def main():
         ids = torch.tensor([eids], dtype=torch.long)
         wt = torch.from_numpy(w[None, :])
 
-        gpu = metal_moe.moe_infer_metal(x, ids, wt, raw).numpy()[0]
+        routing_record = {
+            "ids": [eids],
+            "weights": wt.to(torch.float32).tolist(),
+        }
+        gpu = metal_moe.moe_infer_metal(
+            x, ids, wt, raw, routing_record=routing_record).numpy()[0]
         cpu = fast_moe.moe_infer_fast(x, ids, wt, raw).numpy()[0]
         den = max(float(np.abs(cpu).max()), 1e-30)
         rel = float(np.abs(gpu - cpu).max()) / den

@@ -20,7 +20,8 @@ import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_LIB = ctypes.CDLL(os.path.join(_HERE, "libmxfp4batch.dylib"))
+_LIB = ctypes.CDLL(os.environ.get(
+    "K3_BATCH_LIB", os.path.join(_HERE, "libmxfp4batch.dylib")))
 
 _u8p = np.ctypeslib.ndpointer(np.uintp, flags="C_CONTIGUOUS")   # array of raw pointers
 _i32 = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")

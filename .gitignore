@@ -4,27 +4,49 @@
 # ============================================================
 
 # --- model weights & caches (hundreds of GB) ----------------
-k3-resident/
-k3-resident-int8/
-k3-resident-int4/
-k3-experts/
-k3-model/
+# Every resident conversion starts with this prefix (int4/int8/i6/mixed/etc.).
+# Keep the wildcard rooted so an unrelated nested source directory cannot match.
+/k3-resident*/
+/k3-experts/
+/k3-model/
+/k3-cache*/
+/models/
+/weights/
+/checkpoints/
 
 # belt and braces: no weight/tensor blobs in any form, anywhere
 *.safetensors
 *.gguf
 *.bin
+*.npy
 *.npz
 *.i8
 *.sc
 *.i4
 *.s4
+*.i[0-9]*
+*.s[0-9]*
+*.bf16
+*.fp16
+*.fp32
+*.f16
+*.f32
+*.mxfp4
+*.onnx
+*.ckpt
+*.mlmodel
+*.mlpackage/
+*.mlmodelc/
+*.blob
+*.pte
+*.pkl
+*.pickle
 *.pt
 *.pth
 
 # --- downloaded third-party model code & metadata -----------
 # (re-fetched at setup from moonshotai/Kimi-K3; not ours to vendor)
-k3-meta/
+/k3-meta/
 tools/k3pkg/modeling_*.py
 tools/k3pkg/configuration_*.py
 tiktoken.model
@@ -39,17 +61,84 @@ tools/expert_index.meta.json
 tools/libmxfp4gemv.dylib
 *.dylib
 *.o
-router_trace*.jsonl
 
 # --- environments & tooling ---------------------------------
 venv/
 __pycache__/
 *.pyc
 .claude/
+.codex/
+.agents/
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+*.dSYM/
+*.air
+*.metallib
+*.swp
+*~
 
-# --- logs & scratch -----------------------------------------
+# --- private planning / experiment ledgers ------------------
+/BRAINSTORM-SPEED.md
+/PLAN.md
+/experiments/
+
+# --- logs, profiles & generated benchmark output ------------
 *.log
+*.log.*
+*.out
+*.prof
+*.profraw
+*.profdata
+*.trace
 *.tmp
 *.part
+/bench-results/
+/probe_command_tape.plist
+router_trace*.jsonl
 nohup.out
 .DS_Store
+
+# --- local optimization workbenches --------------------------
+# These are one-off measurement/probe sources, not runtime dependencies.
+/tools/bench_*.py
+/tools/probe_*
+/tools/idea_inventory.py
+/tools/test_idea_inventory.py
+/tools/build_spine_layer_pack.py
+/tools/lut_codec_kernels.c
+
+# Unfinished or rejected native experiments.
+/tools/metal_mps_bridge.mm
+/tools/metal_mps_bridge.py
+/tools/metal/*_probe.metal
+/tools/metal/command_tape.metal
+/tools/metal/depth_argmax.metal
+/tools/metal/q8_texture_gemv.metal
+/tools/metal/router_mailbox.metal
+/tools/metal/texture_view_pool.metal
+
+# Regression harnesses that only exercise the private probe catalog.
+/tools/test_backend_layer_bakeoff.py
+/tools/test_batch_topk_composition.py
+/tools/test_cache_route_surrogate.py
+/tools/test_coreml_pilot_gate.py
+/tools/test_forked_response.py
+/tools/test_lut_codecs.py
+/tools/test_mpp_traversal.py
+/tools/test_mpsgraph_placement.py
+/tools/test_progressive_experts.py
+/tools/test_r_family_offline.py
+/tools/test_routing_budget.py
+/tools/test_w_activation_family.py

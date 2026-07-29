@@ -40,6 +40,8 @@ import concurrent.futures as _cf
 
 import torch
 
+import spine_io
+
 # ---------------------------------------------------------------- flags -----
 FAST = os.environ.get("K3_FAST_SPINE", "1") == "1"
 # fine-grained overrides so the orchestrator can bisect the three changes
@@ -47,6 +49,8 @@ DEQ = os.environ.get("K3_SPINE_DEQ", "metal" if FAST else "torch")   # metal|mul
 PACK = os.environ.get("K3_SPINE_PACK", "1" if FAST else "0") == "1"  # packed read + 1 H2D
 READ_THREADS = int(os.environ.get("K3_SPINE_READ_THREADS", "4" if FAST else "1"))
 ALIGN = 256          # byte alignment of every slot inside the packed buffer
+
+spine_io.set_process_io_policy()
 
 
 # --------------------------------------------------------- metal dequant ----
@@ -151,6 +155,15 @@ def pin(*bufs):
             KEEP.add(id(b))
 
 
+def unpin(*bufs):
+    """Hand ownership back.  ONLY call this after the pack has been dropped from
+    whatever cache pinned it -- an unpinned buffer can be recycled by the next
+    layer's read, which would silently rewrite it in place."""
+    for b in bufs:
+        if b is not None:
+            KEEP.discard(id(b))
+
+
 def _release(buf):
     if buf is None or id(buf) in KEEP:
         return
@@ -247,6 +260,63 @@ def plan_layout(module, prefix, int8_dir, res_dir, inv, spine):
     return lay
 
 
+# ---------------------------------------------------- chunked job planning ---
+# Which packed buffer a job writes into.  The plan (paths, file offsets, byte
+# counts, destination offsets) is identical on every token, so it is built once
+# per layer and only the memoryview slices are materialised per call.
+_QB, _SCB, _OB = 0, 1, 2
+
+
+def plan_jobs(lay):
+    """-> [(path, file_off, buf_id, dest_off, nbytes)] split at spine_io.CHUNK
+    and sorted longest-first for a balanced greedy makespan."""
+    jobs = lay.get("jobs")
+    if jobs is not None:
+        return jobs
+    int8_dir = lay["int8_dir"]
+    raw = []
+    for _n, full, _sh, qoff, nb, scoff, rows in lay["items"]:
+        base = os.path.join(int8_dir, full)
+        raw.append((base + ".i8", _QB, qoff, nb))
+        raw.append((base + ".sc", _SCB, scoff * 2, rows * 2))
+    for _n, _f, _dt, _sh, ooff, nb, bp in lay["oplan"]:
+        raw.append((bp, _OB, ooff, nb))
+    ch = spine_io.CHUNK
+    jobs = []
+    for path, bid, doff, nb in raw:
+        if ch <= 0 or nb <= ch:
+            jobs.append((path, 0, bid, doff, nb))
+            continue
+        o = 0
+        while o < nb:
+            k = min(ch, nb - o)
+            jobs.append((path, o, bid, doff + o, k))
+            o += k
+    jobs.sort(key=lambda j: -j[4])
+    lay["jobs"] = jobs
+    return jobs
+
+
+def _rdadvise_next(prefix):
+    """Kick the kernel's readahead for the layer AFTER the one we are about to
+    read, so its pages are already in flight when the preloader gets there.
+    Only fires once a layer has been seen before (its layout is cached), i.e.
+    from the second forward pass on -- prefill is unaffected."""
+    try:
+        head, _, tail = prefix.rpartition("layers.")
+        idx = int(tail.rstrip("."))
+    except (ValueError, AttributeError):
+        return
+    nxt = _layouts.get(f"{head}layers.{idx + 1}.")
+    if nxt is None:
+        return
+    seen = set()
+    for path, _fo, _b, _d, _n in plan_jobs(nxt):
+        if path not in seen:
+            seen.add(path)
+            spine_io.rdadvise(path)
+
+
 # ------------------------------------------------------------- read side ----
 def read_pack(module, prefix, int8_dir, res_dir, inv, spine, load_resident):
     """Runs in the preloader thread.  Returns a pack the main thread applies."""
@@ -254,6 +324,21 @@ def read_pack(module, prefix, int8_dir, res_dir, inv, spine, load_resident):
     items = lay["items"]
     qbuf = _acquire(lay["qtotal"])
     scbuf = _acquire(lay["sctotal"] * 2)
+    obuf = _acquire(max(lay["ototal"], 1))
+
+    if spine_io.ENABLED:
+        t0 = _time.time()
+        if spine_io.RDADVISE:
+            _rdadvise_next(prefix)
+        bufs = (memoryview(qbuf), memoryview(scbuf), memoryview(obuf))
+        jobs = [(path, fo, bufs[bid][doff:doff + nb])
+                for path, fo, bid, doff, nb in plan_jobs(lay)]
+        spine_io.run_jobs(jobs, _pool_exec(), READ_THREADS,
+                          nocache=spine_io.stream_tier(prefix))
+        PHASE["read_s"] += _time.time() - t0
+        PHASE["read_bytes"] += lay["qtotal"] + lay["ototal"]
+        return {"lay": lay, "q": qbuf, "sc": scbuf, "other": obuf}
+
     qmv, scmv = memoryview(qbuf), memoryview(scbuf)
 
     def _one(it):
@@ -271,7 +356,6 @@ def read_pack(module, prefix, int8_dir, res_dir, inv, spine, load_resident):
         for it in items:
             _one(it)
 
-    obuf = _acquire(max(lay["ototal"], 1))
     omv = memoryview(obuf)
     for _n, _f, _dt, _sh, ooff, nb, bp in lay["oplan"]:
         with open(bp, "rb") as f:
@@ -366,6 +450,8 @@ def describe():
     bits = [f"pack={int(PACK)}", f"deq={DEQ}", f"read_threads={READ_THREADS}"]
     if DEQ == "metal":
         bits.append("metal_ok=" + ("1" if metal_available() else f"0({metal_error()})"))
+    if spine_io.ENABLED:
+        bits.append("| io: " + spine_io.describe())
     return " ".join(bits)
 
 

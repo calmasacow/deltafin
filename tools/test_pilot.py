@@ -37,6 +37,47 @@ def _digest(ws):
 
 
 # ---------------------------------------------------------------------------
+def test_native_int8_capability_fallback():
+    """A future wheel/chip without the private MPS op keeps PILOT functional."""
+    print("native-int8 capability fallback")
+    import pilot
+
+    config = type("Config", (), {
+        "num_hidden_layers": 2,
+        "first_k_dense_replace": 1,
+        "moe_layer_freq": 1,
+        "num_experts_per_token": 2,
+        "rms_norm_eps": 1e-5,
+    })()
+
+    def load(name):
+        if name.endswith("gate.weight"):
+            return torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        if name.endswith("e_score_correction_bias"):
+            return torch.zeros(4)
+        if name.endswith("post_attention_layernorm.weight"):
+            return torch.ones(3)
+        raise KeyError(name)
+
+    def packed_must_not_run(_name):
+        raise AssertionError("packed loader called with native_int8=False")
+
+    pilot.init(
+        config, torch.device("cpu"), load, "model.",
+        load_packed=packed_must_not_run, native_int8=False)
+    check("PILOT remains enabled", pilot.enabled())
+    check("fallback gate is fp32", pilot._W[1].dtype == torch.float32)
+    check("fallback is reported", pilot.STATS["gate_dtype"] == "fp32")
+
+    pilot._W.clear()
+    pilot._S.clear()
+    pilot._B.clear()
+    pilot._LN.clear()
+    pilot._READY = False
+    pilot._BROKEN = False
+
+
+# ---------------------------------------------------------------------------
 def test_router_mirror():
     """pilot._route must reproduce KimiMoEGate.forward, and pilot._rms must
     reproduce KimiRMSNorm.forward, or the recall number means nothing."""
@@ -175,6 +216,7 @@ def test_pread_slots():
 
 
 if __name__ == "__main__":
+    test_native_int8_capability_fallback()
     test_router_mirror()
     test_npz_hook()
     if "--slots" in sys.argv:

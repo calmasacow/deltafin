@@ -15,6 +15,64 @@ _DT = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "U8":
 
 stats = {"expert_http": 0, "expert_disk": 0, "http_bytes": 0, "http_s": 0.0}
 _stats_lock = threading.Lock()
+_runtime_stats = stats
+_cache_totals_lock = threading.Lock()
+
+
+def _initial_cache_totals():
+    """Scan the expert directory once, never once per generated token."""
+    files = {}
+    experts = set()
+    try:
+        entries = os.scandir(ECACHE)
+    except FileNotFoundError:
+        return files, experts, 0
+    with entries:
+        for ent in entries:
+            if not ent.name.endswith((".bin", ".npz")):
+                continue
+            try:
+                size = ent.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            files[ent.name] = size
+            experts.add(ent.name.rsplit(".", 1)[0])
+    return files, experts, sum(files.values())
+
+
+_cache_file_sizes, _cache_experts, _cache_bytes = _initial_cache_totals()
+
+
+def register_cache_file(path):
+    """Increment the cached count/bytes after an atomic cache-file publish.
+
+    Both the legacy .npz writer below and fetch_v2's raw .bin writer call this.
+    Keeping per-file sizes makes a replacement idempotent and thread-safe.
+    """
+    global _cache_bytes
+    name = os.path.basename(path)
+    if not name.endswith((".bin", ".npz")):
+        return
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return
+    with _cache_totals_lock:
+        old = _cache_file_sizes.get(name, 0)
+        _cache_file_sizes[name] = size
+        _cache_experts.add(name.rsplit(".", 1)[0])
+        _cache_bytes += size - old
+
+
+def set_runtime_stats(source):
+    """Point cache_report at a drop-in fetcher's live counters."""
+    global _runtime_stats
+    _runtime_stats = source
+
+
+def cache_totals():
+    with _cache_totals_lock:
+        return len(_cache_experts), _cache_bytes
 
 
 def _range_fetch(name, retries=6):
@@ -77,6 +135,7 @@ def fetch_expert_raw(layer, eid):
     np.savez(tmp, **{w + suf: arr for w, (p, s) in out.items()
                      for suf, arr in (("_p", p), ("_s", s))})
     os.replace(tmp + ".npz" if os.path.exists(tmp + ".npz") else tmp, path)
+    register_cache_file(path)
     with _stats_lock:
         stats["expert_http"] += 1
     return out
@@ -100,7 +159,10 @@ def fetch_experts(layer, eids, workers=12, dequant=True):
 
 
 def cache_report():
-    n = len([f for f in os.listdir(ECACHE) if f.endswith(".npz")])
-    gb = sum(os.path.getsize(os.path.join(ECACHE, f)) for f in os.listdir(ECACHE)) / 1e9
-    bw = stats["http_bytes"] / 1e6 / max(stats["http_s"], 1e-9)
-    return f"expert cache: {n} experts / {gb:.1f} GB on disk | this run: {stats['expert_disk']} disk hits, {stats['expert_http']} http fetches ({bw:.0f} MB/s eff)"
+    n, total = cache_totals()
+    gb = total / 1e9
+    live = _runtime_stats
+    bw = live["http_bytes"] / 1e6 / max(live["http_s"], 1e-9)
+    return (f"expert cache: {n} experts / {gb:.1f} GB on disk | this run: "
+            f"{live['expert_disk']} disk hits, {live['expert_http']} http fetches "
+            f"({bw:.0f} MB/s eff)")

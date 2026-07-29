@@ -25,8 +25,10 @@ Env flags (all default to current behaviour):
   K3_PILOT_K=<n>          how many experts to predict (default = router top_k=16)
   K3_PILOT_MAX_PREFETCH=n cap on the per-layer prefetch union during prefill,
                           where the union over T positions can reach T*16 (32)
-  K3_PILOT_GATE_DT=       resident gate-weight cache dtype: fp32 (default, 2.4 GB)
-                          | fp16 | bf16 (1.2 GB)
+  K3_PILOT_GATE_DT=       resident gate-weight cache dtype: int8 (default,
+                          ~0.56 GB) | fp32 (2.4 GB) | fp16 | bf16 (1.2 GB).
+                          int8 uses the checkpoint's existing row scales and
+                          torch._weight_int8pack_mm without dequantizing.
   K3_PILOT_MEASURE_ONLY=1 colibri's LOOKA: compute recall, never issue a read
   K3_PILOT_SELFTEST=1     also route layer L with the cached layer-L gate and
                           report recall against the model's own routing; this is
@@ -78,7 +80,7 @@ PILOT_TWO = os.environ.get("K3_PILOT_TWO", "0") == "1"
 MEASURE_ONLY = os.environ.get("K3_PILOT_MEASURE_ONLY", "0") == "1"
 SELFTEST = os.environ.get("K3_PILOT_SELFTEST", "0") == "1"
 ASYNC_DRAIN = os.environ.get("K3_PILOT_ASYNC_DRAIN", "0") == "1"
-GATE_DT = os.environ.get("K3_PILOT_GATE_DT", "fp32")
+GATE_DT = os.environ.get("K3_PILOT_GATE_DT", "int8")
 _K_ENV = int(os.environ.get("K3_PILOT_K", "0"))
 MAX_PREFETCH = int(os.environ.get("K3_PILOT_MAX_PREFETCH", "32"))
 
@@ -86,11 +88,13 @@ _DTS = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 # --- state -------------------------------------------------------------------
 _W = {}          # layer -> gate.weight            [num_experts, H]
+_S = {}          # layer -> row scales (native-int8 gates only)
 _B = {}          # layer -> e_score_correction_bias [num_experts]
 _LN = {}         # layer -> post_attention_layernorm.weight [H]
 _CFG = {}        # top_k / eps / NL / first_moe
 _READY = False
 _BROKEN = False
+_INT8_WARNED = False
 
 _CAP = {"x": None}      # pre-MoE hidden captured from post_attention_layernorm
 _PRED = {}              # layer -> [[eid, ...], ...] per token position
@@ -111,7 +115,9 @@ def enabled():
 
 
 # --- gate cache --------------------------------------------------------------
-def init(config, dev, load, prefix="language_model.model."):
+def init(
+        config, dev, load, prefix="language_model.model.", load_packed=None,
+        native_int8=None):
     """Load every MoE layer's router once.  `load(name)` must be the driver's own
     resident loader so the cached gate matches the one the model will run."""
     global _READY, _BROKEN
@@ -121,18 +127,48 @@ def init(config, dev, load, prefix="language_model.model."):
     nl = config.num_hidden_layers
     first = getattr(config, "first_k_dense_replace", 1)
     freq = getattr(config, "moe_layer_freq", 1)
-    want = _DTS.get(GATE_DT, torch.float32)
+    effective_dt = GATE_DT
+    if GATE_DT == "int8":
+        if native_int8 is None:
+            probe = getattr(
+                getattr(torch, "_C", None),
+                "_dispatch_has_kernel_for_dispatch_key",
+                None,
+            )
+            try:
+                native_int8 = (
+                    dev.type == "mps"
+                    and hasattr(torch, "_weight_int8pack_mm")
+                    and (probe is None or bool(probe(
+                        "aten::_weight_int8pack_mm", "MPS")))
+                )
+            except Exception:
+                native_int8 = False
+        if not native_int8 or load_packed is None:
+            effective_dt = "fp32"
+            print("[pilot] native-int8 gate path unavailable; "
+                  "falling back to fp32 gates", flush=True)
+    want = _DTS.get(effective_dt, torch.float32)
     nbytes = 0
     try:
         for i in range(nl):
             if i < first or i % freq != 0:
                 continue
             g = f"{prefix}layers.{i}.block_sparse_moe.gate."
-            w = load(g + "weight").to(want)
+            if effective_dt == "int8":
+                packed = load_packed(g + "weight")
+                if packed is None:
+                    raise FileNotFoundError(g + "weight int8 blobs")
+                w, scale = packed
+                _S[i] = scale
+            else:
+                w = load(g + "weight").to(want)
             b = load(g + "e_score_correction_bias").to(torch.float32)
             ln = load(f"{prefix}layers.{i}.post_attention_layernorm.weight").to(torch.float32)
             _W[i], _B[i], _LN[i] = w, b, ln
             nbytes += w.numel() * w.element_size() + b.numel() * 4 + ln.numel() * 4
+            if i in _S:
+                nbytes += _S[i].numel() * _S[i].element_size()
     except Exception as e:                       # never take the run down
         _BROKEN = True
         print(f"[pilot] DISABLED — gate cache build failed: {e!r}", flush=True)
@@ -141,9 +177,10 @@ def init(config, dev, load, prefix="language_model.model."):
                 eps=config.rms_norm_eps, nl=nl, first=first,
                 k=_K_ENV or config.num_experts_per_token)
     STATS["gate_bytes"] = nbytes
+    STATS["gate_dtype"] = effective_dt
     STATS["build_s"] = time.time() - t0
     _READY = True
-    print(f"[pilot] router cache: {len(_W)} gates on {dev} as {GATE_DT} "
+    print(f"[pilot] router cache: {len(_W)} gates on {dev} as {effective_dt} "
           f"({nbytes / 2**30:.2f} GB) in {STATS['build_s']:.1f}s | k={_CFG['k']} "
           f"two_step={int(PILOT_TWO)} measure_only={int(MEASURE_ONLY)}", flush=True)
 
@@ -182,7 +219,24 @@ def _route(li, h, k):
     Returns (values [N,k], indices [N,k]).  num_expert_group == 1 for K3, so the
     group-masking branch of KimiMoEGate.forward is inactive and omitted."""
     w = _W[li]
-    logits = torch.nn.functional.linear(h, w if w.dtype == torch.float32 else w.float())
+    if w.dtype == torch.int8:
+        try:
+            logits = torch._weight_int8pack_mm(h.float(), w, _S[li])
+        except (NotImplementedError, RuntimeError) as exc:
+            # Capability fallback for PyTorch/chip combinations that expose
+            # the op but lack a usable MPS kernel. Keep the optimization
+            # selectable per chip rather than hard-coding Apple generations.
+            global _INT8_WARNED
+            if not _INT8_WARNED:
+                print(f"[pilot] native int8 gate unavailable ({exc}); "
+                      "dequantizing gates lazily", flush=True)
+                _INT8_WARNED = True
+            w = w.to(torch.float32) * _S.pop(li)[:, None]
+            _W[li] = w
+            logits = torch.nn.functional.linear(h.float(), w)
+    else:
+        logits = torch.nn.functional.linear(
+            h if h.dtype == w.dtype else h.to(w.dtype), w).float()
     scores = logits.sigmoid()
     scores_for_choice = scores + _B[li].unsqueeze(0)
     return torch.topk(scores_for_choice, k, dim=-1, sorted=False)
