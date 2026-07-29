@@ -4,10 +4,11 @@ fast_moe.py issues one ctypes call per GEMV: 48 per MoE layer (16 experts x w1/w
 and each of those spins up + tears down a fresh pthread pool (4 create + 4 join), i.e.
 ~192 thread create/destroy per layer per token.
 
-This module talks to libmxfp4batch.dylib (tools/fused_gemv_batch.c), which keeps ONE
-persistent QOS_CLASS_USER_INTERACTIVE worker pool alive and work-steals rows across a
-whole batch of matrices. Per layer that is 2 dispatches (w1+w3 phase, then w2 phase)
-instead of 48, with zero thread creation after the first call.
+This module talks to the platform's libmxfp4batch native library
+(tools/fused_gemv_batch.c), which keeps one persistent worker pool alive and
+work-steals rows across a whole batch of matrices. Per layer that is 2
+dispatches (w1+w3 phase, then w2 phase) instead of 48, with zero thread
+creation after the first call.
 
 Bit-exact with fast_moe.moe_infer_fast: the same mxfp4_gemv_rows2() row loop runs on
 the same 32-row-aligned partitions, the activation stays in numpy, and the per-token
@@ -15,13 +16,34 @@ combine accumulates in the same order.
 
 Interface mirrors fast_moe: expert_ffn(raw, x), moe_infer_fast(x, ids, w, raw_experts).
 """
-import ctypes, os
+import ctypes
+import os
+import threading
+
 import numpy as np
 import torch
 
+try:
+    from runtime_platform import load_native_library
+except ImportError:  # imported as tools.fast_moe_batch instead of top-level
+    from .runtime_platform import load_native_library
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_LIB = ctypes.CDLL(os.environ.get(
-    "K3_BATCH_LIB", os.path.join(_HERE, "libmxfp4batch.dylib")))
+_REQUIRED_SYMBOLS = (
+    "mxfp4_gemv_batch",
+    "mxfp4_moe_layer",
+    "mxfp4_situ_batch",
+    "mxfp4_moe_expert_set",
+    "mxfp4_pool_init",
+    "mxfp4_pool_threads",
+    "mxfp4_pool_shutdown",
+)
+_LIB, _LIB_PATH = load_native_library(
+    _HERE,
+    "libmxfp4batch",
+    env_var="K3_BATCH_LIB",
+    required_symbols=_REQUIRED_SYMBOLS,
+)
 
 _u8p = np.ctypeslib.ndpointer(np.uintp, flags="C_CONTIGUOUS")   # array of raw pointers
 _i32 = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
@@ -50,24 +72,28 @@ THREADS = int(os.environ.get("K3_GEMV_THREADS", "4"))
 SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0
 
 _POOL_READY = False
+_CALL_LOCK = threading.RLock()
 
 
 def pool_init(nthreads=None):
     """Create the persistent worker pool up front (otherwise done lazily in C)."""
     global _POOL_READY
-    n = _LIB.mxfp4_pool_init(THREADS if nthreads is None else nthreads)
-    _POOL_READY = True
-    return n
+    with _CALL_LOCK:
+        n = _LIB.mxfp4_pool_init(THREADS if nthreads is None else nthreads)
+        _POOL_READY = True
+        return n
 
 
 def pool_shutdown():
     global _POOL_READY
-    _LIB.mxfp4_pool_shutdown()
-    _POOL_READY = False
+    with _CALL_LOCK:
+        _LIB.mxfp4_pool_shutdown()
+        _POOL_READY = False
 
 
 def pool_threads():
-    return _LIB.mxfp4_pool_threads()
+    with _CALL_LOCK:
+        return _LIB.mxfp4_pool_threads()
 
 
 # --------------------------------------------------------------- scratch (reused)
@@ -107,17 +133,23 @@ def gemv_batch(mats, nthreads=None):
     n = len(mats)
     if n == 0:
         return
-    _S.grow(n)
-    pp, sp, xp, yp, rows, cols = _S.pp, _S.sp, _S.xp, _S.yp, _S.rows, _S.cols
-    for i, (p, s, x, y) in enumerate(mats):
-        pp[i] = _addr(p)
-        sp[i] = _addr(s)
-        xp[i] = _addr(x)
-        yp[i] = _addr(y)
-        rows[i] = p.shape[0]
-        cols[i] = p.shape[1] * 2
-    _LIB.mxfp4_gemv_batch(pp, sp, xp, yp, rows, cols, n,
-                          THREADS if nthreads is None else nthreads)
+    # CDLL calls release the GIL. Keep the shared pointer/shape arena stable
+    # until every native worker has finished consuming it.
+    with _CALL_LOCK:
+        _S.grow(n)
+        pp, sp = _S.pp, _S.sp
+        xp, yp, rows, cols = _S.xp, _S.yp, _S.rows, _S.cols
+        for i, (p, s, x, y) in enumerate(mats):
+            pp[i] = _addr(p)
+            sp[i] = _addr(s)
+            xp[i] = _addr(x)
+            yp[i] = _addr(y)
+            rows[i] = p.shape[0]
+            cols[i] = p.shape[1] * 2
+        _LIB.mxfp4_gemv_batch(
+            pp, sp, xp, yp, rows, cols, n,
+            THREADS if nthreads is None else nthreads,
+        )
 
 
 def _situ(gate, up):
@@ -209,7 +241,10 @@ def moe_infer_fused(x, topk_ids, topk_weight, raw_experts, nthreads=None):
             p2[i], s2[i] = _addr(r["w2"][0]), _addr(r["w2"][1])
         wts = np.ascontiguousarray(ws[t], dtype=np.float32)
         yt = np.empty(d_model, dtype=np.float32)
-        _LIB.mxfp4_moe_expert_set(p13, s13, p2, s2, xt, wts,
-                                  ne, d_ff, d_model, None, yt, nt)
+        with _CALL_LOCK:
+            _LIB.mxfp4_moe_expert_set(
+                p13, s13, p2, s2, xt, wts,
+                ne, d_ff, d_model, None, yt, nt,
+            )
         out[t] = yt
     return torch.from_numpy(out).to(x.device, x.dtype)

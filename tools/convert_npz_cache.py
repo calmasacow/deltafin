@@ -26,9 +26,9 @@ Safety
   .bin (fetch_v2._has_bin / _cache_load); unlinking a .npz that a reader already
   opened is harmless on POSIX. Concurrent converters race harmlessly (same bytes,
   last rename wins, a lost unlink is ignored). Use --shard i/n to split the work.
-* F_NOCACHE by default on every read and write, so 222 GB of conversion traffic
-  does not evict the page cache the resident spine depends on. --throttle-ms
-  yields disk bandwidth back to a running inference.
+* On macOS, F_NOCACHE is enabled by default on every read and write, so 222 GB
+  of conversion traffic does not evict the page cache the resident spine
+  depends on. --throttle-ms yields disk bandwidth back to a running inference.
 
 Usage
 -----
@@ -82,7 +82,7 @@ _NPZ = re.compile(r"^(L(\d+)-E(\d+))\.npz$")
 
 # --- io helpers -------------------------------------------------------------
 def _nocache(fd, on):
-    if on:
+    if on and sys.platform == "darwin":
         try:
             fcntl.fcntl(fd, F_NOCACHE, 1)
         except OSError:

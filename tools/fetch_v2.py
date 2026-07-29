@@ -27,6 +27,7 @@ import mmap
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import urllib.parse
@@ -78,7 +79,20 @@ EXPERT_READ = os.environ.get("K3_EXPERT_READ", "pread")
 # logical GB/s versus 6.91/6.69/6.91 for 4/6/12.  Keep the env override: newer
 # chips and different SSD widths must rerun tools/bench_expert_io_grid.py.
 PREAD_WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "8"))
-PREAD_NOCACHE = os.environ.get("K3_PREAD_NOCACHE", "1") == "1"
+_IS_DARWIN = sys.platform == "darwin"
+_IS_LINUX = sys.platform.startswith("linux")
+
+
+def _pread_nocache_default(platform):
+    return "1" if platform == "darwin" else "0"
+
+
+# Darwin's proven default uses F_NOCACHE before the read. Linux stays buffered
+# by default; an explicit override discards only these completed expert ranges
+# with POSIX_FADV_DONTNEED rather than issuing a Darwin fcntl command number.
+PREAD_NOCACHE = os.environ.get(
+    "K3_PREAD_NOCACHE", _pread_nocache_default(sys.platform)
+) == "1"
 # free-slot high-water mark; prefill unions (up to 5 x 16 experts/layer) grow the
 # pool transiently and are trimmed back to this after the layer is done.
 PREAD_MAX_FREE = int(os.environ.get("K3_PREAD_MAX_FREE", "40"))
@@ -118,6 +132,29 @@ _cache_observer = None
 _cache_writer_instance = None
 _cache_writer_lock = threading.Lock()
 _cache_writer_atexit_registered = False
+
+
+def _apply_pread_nocache(fd):
+    """Before-read Darwin cache bypass; command 48 is invalid on Linux."""
+    if not (_IS_DARWIN and PREAD_NOCACHE):
+        return False
+    fcntl.fcntl(fd, F_NOCACHE, 1)
+    return True
+
+
+def _drop_linux_pread_cache(fd):
+    """After-read Linux cache eviction for the explicit nocache override."""
+    if not (_IS_LINUX and PREAD_NOCACHE):
+        return False
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advise is None or dontneed is None:
+        return False
+    try:
+        advise(fd, 0, 0, dontneed)
+    except OSError:
+        return False
+    return True
 
 
 def _initial_raw_presence():
@@ -502,14 +539,14 @@ class _Slot:
     def read(self, path):
         fd = os.open(path, os.O_RDONLY)
         try:
-            if PREAD_NOCACHE:
-                fcntl.fcntl(fd, F_NOCACHE, 1)
+            _apply_pread_nocache(fd)
             off = 0
             while off < EXPERT_SPAN:
                 n = os.preadv(fd, [self.mv[off:]], off)
                 if n <= 0:
                     raise IOError(f"short read {off}/{EXPERT_SPAN} from {path}")
                 off += n
+            _drop_linux_pread_cache(fd)
         finally:
             os.close(fd)
 

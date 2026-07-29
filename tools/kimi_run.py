@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""lazy-K3: real Kimi-K3 inference on Apple Silicon by layer-streaming.
+"""lazy-K3: real Kimi-K3 inference on macOS or Linux by layer-streaming.
 
 Uses Moonshot's own modeling_kimi_linear.py (audited) with a pure-PyTorch fla shim.
 Per forward pass, each of the 93 decoder layers is materialized from the local
 resident-spine download, routed experts are fetched on demand (HTTP Range, disk
-cached) and dequantized from MXFP4, the layer runs in fp32 on CPU, then its
-weights are freed. Router selections can optionally be logged to
+cached) and dequantized from MXFP4, the layer runs on the selected MPS, CUDA, or
+CPU device, then its weights are freed. Router selections can optionally be logged to
 router_trace.jsonl with K3_TRACE=buffered (or K3_TRACE=sync for debugging).
 The published baseline is a 64 GB M1 Max; tunable choices are not dispatched
 from that product name.
@@ -29,6 +29,7 @@ torch.set_num_threads(TORCH_THREADS)
 import k3loader  # noqa: E402
 import importlib  # noqa: E402
 import apple_silicon  # noqa: E402
+import runtime_platform  # noqa: E402
 
 from k3pkg import modeling_kimi_linear as ml
 
@@ -56,12 +57,49 @@ INT8_DIR = os.path.join(ROOT, "k3-resident-int8/tensors")
 APPLE_CAPS = apple_silicon.snapshot()
 
 
-def _auto_dev():
-    if torch.backends.mps.is_available():
-        return "mps"
-    print("[config] no MPS GPU found — running on CPU (slow). "
-          "Deltafin targets Apple Silicon.", flush=True)
-    return "cpu"
+def _mps_available():
+    backend = getattr(torch.backends, "mps", None)
+    return bool(backend is not None and backend.is_available())
+
+
+def _cuda_available():
+    return bool(torch.cuda.is_available())
+
+
+def _resolve_device():
+    requested = os.environ.get("K3_DEV")
+    normalized = (
+        requested.strip().lower()
+        if requested is not None and requested.strip() else None
+    )
+    mps_available = (
+        _mps_available()
+        if normalized is None or normalized == "mps" else False
+    )
+    # Preserve the established Mac path: once MPS is available, do not
+    # initialize or even query an unrelated CUDA runtime.
+    need_cuda = (
+        not mps_available
+        and (normalized is None or normalized.startswith("cuda"))
+    )
+    cuda_available = _cuda_available() if need_cuda else False
+    spec = runtime_platform.choose_device_spec(
+        requested,
+        mps_available=mps_available,
+        cuda_available=cuda_available,
+        cuda_device_count=torch.cuda.device_count() if cuda_available else 0,
+    )
+    if requested is None:
+        if spec == "cuda":
+            print("[config] MPS unavailable; auto-selected CUDA", flush=True)
+        elif spec == "cpu":
+            print("[config] no MPS or CUDA GPU found — running on CPU (slow)",
+                  flush=True)
+    return torch.device(spec)
+
+
+def _device_synchronize():
+    runtime_platform.synchronize_device(torch, DEV)
 
 
 def _auto_spine():
@@ -73,7 +111,7 @@ def _auto_spine():
     return "bf16"
 
 
-DEV = torch.device(os.environ.get("K3_DEV") or _auto_dev())   # cpu | mps
+DEV = _resolve_device()                                      # cpu | mps | cuda[:N]
 SPINE = os.environ.get("K3_SPINE") or _auto_spine()           # bf16 | int8 | mixed
 if SPINE == "bf16" and "K3_SPINE" not in os.environ:
     print("[config] int8 spine not found — using bf16 (2x the per-token I/O). "
@@ -526,17 +564,56 @@ def _ram_budget_layers():
         return 0  # one shared module cannot hold different layers concurrently
     if os.environ.get("K3_PIN_LAYERS") is not None:
         return int(os.environ["K3_PIN_LAYERS"])
-    total_bytes = APPLE_CAPS.physical_memory_bytes
+    explicit_budget = float(os.environ.get("K3_RAM_GB", 0))
+    if explicit_budget < 0:
+        raise ValueError("K3_RAM_GB must be non-negative")
+
+    linux_memory = None
+    if sys.platform.startswith("linux"):
+        linux_memory = runtime_platform.linux_memory_limits()
+        total_bytes = linux_memory.effective_total_bytes
+    else:
+        total_bytes = APPLE_CAPS.physical_memory_bytes or 0
     if not total_bytes:
+        print("[ram] physical/cgroup memory limit unavailable; pinning no layers",
+              flush=True)
         return 0
     total_gb = total_bytes / 2**30
     reserve = max(10.0, 0.18 * total_gb)
-    explicit_budget = float(os.environ.get("K3_RAM_GB", 0))
-    safe_bytes = APPLE_CAPS.safe_unified_budget(
-        host_reserve_bytes=int(reserve * 2**30),
-    )
+    reserve_bytes = int(reserve * 2**30)
+    if linux_memory is not None:
+        safe_bytes = runtime_platform.safe_linux_host_budget(
+            linux_memory, reserve_bytes
+        )
+    else:
+        safe_bytes = APPLE_CAPS.safe_unified_budget(
+            host_reserve_bytes=reserve_bytes,
+        )
     safe_gb = safe_bytes / 2**30
-    budget = explicit_budget or safe_gb
+    if explicit_budget and linux_memory is not None:
+        # An explicit target may tune within the safe envelope, but cannot
+        # escape a container/cgroup limit or consume another process's RAM.
+        budget = min(explicit_budget, safe_gb)
+    else:
+        budget = explicit_budget or safe_gb
+
+    cuda_note = ""
+    if DEV.type == "cuda":
+        try:
+            cuda_free, cuda_total = torch.cuda.mem_get_info(DEV)
+        except (RuntimeError, TypeError) as exc:
+            print(f"[ram] CUDA free-memory query failed ({exc}); "
+                  "pinning no private layers", flush=True)
+            return 0
+        cuda_cap_gb = runtime_platform.cuda_free_memory_budget(
+            cuda_free, cuda_total
+        ) / 2**30
+        budget = min(budget, cuda_cap_gb)
+        cuda_note = (
+            f", CUDA {cuda_free/2**30:.1f}/{cuda_total/2**30:.1f} GB free/total "
+            f"-> {cuda_cap_gb:.1f} GB cap"
+        )
+
     head_gb = 1.18 if INT8_LM_HEAD else (4.7 if DT == torch.float32 else 2.35)
     overhead = 8.0 + head_gb + 2.0   # process + lm_head + transients
     per_layer = (113.5 / NL) * (2 if DT == torch.float32 else 1)    # fp32=2x int8 bytes, fp16=1x
@@ -546,7 +623,8 @@ def _ram_budget_layers():
         if explicit_budget
         else f"safe budget {safe_gb:.1f} GB"
     )
-    print(f"[ram] total {total_gb:.0f} GB, {budget_source} -> pinning "
+    scope = "effective host/cgroup" if linux_memory is not None else "total"
+    print(f"[ram] {scope} {total_gb:.0f} GB, {budget_source}{cuda_note} -> pinning "
           f"{min(n, NL)} of {NL} layers ({min(n, NL) * per_layer:.1f} GB at {DT})", flush=True)
     return min(n, NL)
 
@@ -600,7 +678,7 @@ _orig_moe_infer = ml.KimiSparseMoeBlock.moe_infer
 
 
 FAST_MOE = os.environ.get("K3_FAST_MOE", "1") == "1"
-import fast_moe  # noqa: E402
+fast_moe = runtime_platform.import_when_enabled(FAST_MOE, "fast_moe")
 
 # --- MoE compute backend (K3_MOE=cpu|metal) ----------------------------------
 # cpu   : tools/fast_moe_batch.py when its native library is present, otherwise
@@ -612,8 +690,11 @@ import fast_moe  # noqa: E402
 # K3_MOE_CHECK=N cross-checks the first N calls against the CPU kernel and raises
 # on disagreement — see tools/metal_moe.py. K3_METAL_BINDLESS=0 picks the
 # per-expert dispatch mode instead of the Tier-2 argument-buffer one.
-MOE_BACKEND = os.environ.get("K3_MOE", "metal").lower()
-_MOE_FN = fast_moe.moe_infer_fast
+_MOE_BACKEND_EXPLICIT = os.environ.get("K3_MOE")
+MOE_BACKEND = runtime_platform.choose_moe_backend(
+    _MOE_BACKEND_EXPLICIT, DEV.type
+)
+_MOE_FN = fast_moe.moe_infer_fast if fast_moe is not None else None
 CPU_BATCH_ACTIVE = False
 _CPU_BATCH_MODE = os.environ.get("K3_CPU_MOE_BATCH", "auto").strip().lower()
 if FAST_MOE and _CPU_BATCH_MODE not in ("0", "off", "false", "no"):
@@ -1092,16 +1173,17 @@ def _pack_bytes(pack):
 
 # --- page-cache resident tier (K3_SPINE_RESIDENT_GB + K3_SPINE_STREAM_NOCACHE)
 # Decode scans the 53 GB spine cyclically, the worst case for LRU: a page cache
-# smaller than the working set gets a ~0% hit rate. Pinning a fixed subset by
-# reading everything else with F_NOCACHE turns that into a hit rate equal to the
-# fraction that fits, using clean file pages rather than swappable heap.
+# smaller than the working set gets a ~0% hit rate. Pinning a fixed subset and
+# keeping the streaming tier out of cache turns that into a hit rate equal to
+# the fraction that fits, using clean file pages rather than swappable heap.
 _RESIDENT_SPEC = os.environ.get("K3_SPINE_RESIDENT_GB")
 _RESIDENT_GB = float(_RESIDENT_SPEC or 0)
 if _RESIDENT_SPEC is not None and _RESIDENT_GB >= 0 and spine_io.STREAM_TIER and QUANT:
     _rset, _rbytes = spine_cache.resident_tier(INT8_DIR, PFX, NL, _RESIDENT_GB * 1e9)
     spine_io.set_resident_tier(_rset)
     print(f"[spine] page-cache resident tier: {len(_rset)}/{NL} layers, "
-          f"{_rbytes/1e9:.1f} GB; the rest read F_NOCACHE", flush=True)
+          f"{_rbytes/1e9:.1f} GB; the rest use streaming cache advice",
+          flush=True)
 
 
 def _spine_read(module, prefix):
@@ -1206,14 +1288,14 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
                 layer._k3_res = True   # pinned from now on
         if pilot.enabled():
             pilot.arm(layer)
-        if PROFILE and DEV.type == "mps":
-            torch.mps.synchronize()
+        if PROFILE and DEV.type in ("mps", "cuda"):
+            _device_synchronize()
         t0 = time.time()
         hidden, block_residual = layer(
             hidden, attention_mask=mask, position_ids=None,
             past_key_values=cache, use_cache=True, block_residual=block_residual)
-        if PROFILE and DEV.type == "mps":
-            torch.mps.synchronize()
+        if PROFILE and DEV.type in ("mps", "cuda"):
+            _device_synchronize()
         dt_layer = time.time() - t0
         TIMES["compute"] += dt_layer
         if PROFILE:

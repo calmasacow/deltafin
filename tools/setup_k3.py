@@ -98,6 +98,8 @@ def _exclude_from_spotlight():
     """macOS indexes new files aggressively. 1.5 TB of weight blobs sends
     corespotlightd to ~50% CPU for hours, which contends with inference and
     makes any benchmark meaningless. A .metadata_never_index marker stops it."""
+    if sys.platform != "darwin":
+        return
     for d in ("k3-experts", "k3-resident", "k3-resident-int8", "k3-resident-int4"):
         p = os.path.join(ROOT, d)
         if os.path.isdir(p):

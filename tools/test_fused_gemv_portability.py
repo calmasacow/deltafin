@@ -22,6 +22,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,12 @@ F32P = ctypes.POINTER(ctypes.c_float)
 I32P = ctypes.POINTER(ctypes.c_int)
 
 
-def _build(source: str, output: Path) -> None:
+def _build(
+    source: str,
+    output: Path,
+    *,
+    extra_cflags: tuple[str, ...] = (),
+) -> None:
     machine = platform.machine().lower()
     if machine not in {"arm64", "aarch64", "x86_64", "amd64"}:
         raise RuntimeError(f"unsupported test architecture: {machine}")
@@ -47,6 +53,7 @@ def _build(source: str, output: Path) -> None:
         cc,
         "-O3",
         "-std=gnu11",
+        *extra_cflags,
         "-DNO_MAIN",
         "-shared",
         str(HERE / source),
@@ -55,10 +62,12 @@ def _build(source: str, output: Path) -> None:
         "-lpthread",
         "-lm",
     ]
-    if sys.platform == "darwin" and machine in {"arm64", "aarch64"}:
+    if machine in {"arm64", "aarch64"}:
         cmd[1:1] = ["-mcpu=native"]
     else:
-        cmd[1:1] = ["-march=native", "-fPIC"]
+        cmd[1:1] = ["-march=x86-64-v3"]
+    if sys.platform != "darwin":
+        cmd[1:1] = ["-fPIC"]
     subprocess.run(cmd, check=True, cwd=HERE)
 
 
@@ -226,7 +235,10 @@ def _test_expert_thread_bound(lib: ctypes.CDLL, rng: np.random.Generator) -> Non
     x = np.ascontiguousarray(rng.standard_normal(3584, dtype=np.float32))
     h = np.ascontiguousarray(rng.standard_normal(3072, dtype=np.float32))
 
-    def run(nthreads: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def run(
+        nthreads: int,
+        iters: int = 3,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         y1 = np.full(3072, np.nan, dtype=np.float32)
         y3 = np.full(3072, np.nan, dtype=np.float32)
         y2 = np.full(3584, np.nan, dtype=np.float32)
@@ -236,7 +248,7 @@ def _test_expert_thread_bound(lib: ctypes.CDLL, rng: np.random.Generator) -> Non
             p2.ctypes.data_as(U8P), s2.ctypes.data_as(U8P),
             x.ctypes.data_as(F32P), h.ctypes.data_as(F32P),
             y1.ctypes.data_as(F32P), y3.ctypes.data_as(F32P), y2.ctypes.data_as(F32P),
-            nthreads, 1,
+            nthreads, iters,
         )
         if any(np.isnan(y).any() for y in (y1, y3, y2)):
             raise AssertionError("expert triple left output rows unwritten")
@@ -249,25 +261,69 @@ def _test_expert_thread_bound(lib: ctypes.CDLL, rng: np.random.Generator) -> Non
             raise AssertionError(f"expert triple {name} differs above thread limit")
 
 
-def main() -> int:
+def _test_partial_pthread_create(
+    lib: ctypes.CDLL,
+    rng: np.random.Generator,
+) -> None:
+    """Exercise both recovery protocols after exactly two workers start."""
+    _bind_gemv(lib)
+    reset = lib.mxfp4_test_reset_pthread_create
+    reset.argtypes = []
+    reset.restype = None
+
+    packed = np.ascontiguousarray(
+        rng.integers(0, 256, size=(19, 48), dtype=np.uint8))
+    scales = np.ascontiguousarray(
+        rng.integers(120, 132, size=(19, 3), dtype=np.uint8))
+    x = np.ascontiguousarray(rng.standard_normal(96, dtype=np.float32))
+    expected = _gemv(lib, packed, scales, x)
+    reset()
+    got = _gemv(lib, packed, scales, x, nthreads=5)
+    if not np.array_equal(_bits(got), _bits(expected)):
+        raise AssertionError("partial pthread_create GEMV recovery differs")
+
+    # A fresh counter lets mxfp4_expert_triple start two of four requested
+    # workers. Its start latch must reduce every barrier to that live width.
+    reset()
+    _test_expert_thread_bound(lib, rng)
+
+
+def _run_portability_suite() -> None:
     suffix = ".dylib" if sys.platform == "darwin" else ".so"
     with tempfile.TemporaryDirectory(prefix="deltafin-kernel-test-") as td:
         tmp = Path(td)
         gemv_path = tmp / f"libmxfp4gemv{suffix}"
         batch_path = tmp / f"libmxfp4batch{suffix}"
+        fail_path = tmp / f"libmxfp4gemv-pthread-fail{suffix}"
         _build("fused_gemv.c", gemv_path)
         _build("fused_gemv_batch.c", batch_path)
+        _build(
+            "fused_gemv.c",
+            fail_path,
+            extra_cflags=("-DMXFP4_TEST_PTHREAD_FAIL_AFTER=2",),
+        )
         gemv = _load(gemv_path)
         batch = _load(batch_path)
+        fail = _load(fail_path)
         _bind_gemv(gemv)
         _test_single_and_mt(gemv)
         rng = np.random.default_rng(0xD37AF1)
         _test_batch(batch, rng)
         _test_expert_thread_bound(gemv, rng)
+        _test_partial_pthread_create(fail, rng)
+
+
+class TestFusedGemvPortability(unittest.TestCase):
+    def test_native_kernel_suite(self):
+        _run_portability_suite()
+
+
+def main() -> int:
+    _run_portability_suite()
 
     print(
         f"PASS: {platform.system()} {platform.machine()} "
-        "ABI=1, E2M1, GEMV/MT, batch, and expert thread bounds"
+        "ABI=1, E2M1, GEMV/MT, batch, thread bounds, and pthread failure recovery"
     )
     return 0
 

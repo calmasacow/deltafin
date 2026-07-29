@@ -1,11 +1,28 @@
-"""Fast MoE expert path: fused MXFP4 dequant+GEMV via libmxfp4gemv.dylib (bit-exact
-kernel, 41-123x the numpy-dequant + torch-matmul path). Replaces KimiSparseMoeBlock.moe_infer
-math exactly: per selected expert w1/w3 GEMV -> SiTU -> w2 GEMV -> weighted sum."""
-import ctypes, os
+"""Fast MoE expert path via the platform's fused MXFP4 dequant+GEMV library.
+
+The native kernel is bit-exact and 41-123x the numpy-dequant + torch-matmul
+path. It replaces KimiSparseMoeBlock.moe_infer math exactly: per selected
+expert w1/w3 GEMV -> SiTU -> w2 GEMV -> weighted sum.
+"""
+import ctypes
+import os
+
 import numpy as np
 import torch
 
-_LIB = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmxfp4gemv.dylib"))
+try:
+    from runtime_platform import load_native_library
+except ImportError:  # imported as tools.fast_moe instead of a top-level module
+    from .runtime_platform import load_native_library
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REQUIRED_SYMBOLS = ("mxfp4_gemv_mt",)
+_LIB, _LIB_PATH = load_native_library(
+    _HERE,
+    "libmxfp4gemv",
+    env_var="K3_GEMV_LIB",
+    required_symbols=_REQUIRED_SYMBOLS,
+)
 _u8 = np.ctypeslib.ndpointer(np.uint8, flags="C_CONTIGUOUS")
 _f32 = np.ctypeslib.ndpointer(np.float32, flags="C_CONTIGUOUS")
 _LIB.mxfp4_gemv_mt.argtypes = [_u8, _u8, _f32, _f32,

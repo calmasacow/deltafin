@@ -8,18 +8,20 @@
         |____/ \___|_|\__\__,_|_| |_|_| |_|
 ```
 
-### An experiment in running [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters) on one Apple Silicon Mac
+### An experiment in running [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters) on one local workstation
 
 Deltafin is a small research project that runs a Mixture-of-Experts model far
-larger than the machine it sits on. The current exact-path median is **0.0687
-token/s (14.6 seconds/token)** on our 64 GB M1 Max. Every published run so far
-comes from that one first-generation machine—not a newer Max or Ultra—and
-capability-gated paths plus automatic RAM budgeting carry the same engine
-forward to newer Apple Silicon Macs.
+larger than the machine it sits on. It supports Apple Silicon macOS and
+x86-64/aarch64 Linux, automatically selecting MPS, CUDA or CPU for the resident
+model path and a compatible native MXFP4 expert kernel. The maintainer-run
+reference is **0.0687 token/s (14.6 seconds/token)** on a modest 64 GB M1 Max;
+that is one first-generation machine, not a ceiling for newer hardware.
 
 ![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
 ![hardware](https://img.shields.io/badge/measured_on-M1_Max_·_64GB-silver)
 ![speed](https://img.shields.io/badge/decode-0.0687_tok%2Fs_·_14.6s%2Ftoken_(M1_Max)-orange)
+![platforms](https://img.shields.io/badge/platforms-macOS_arm64_·_Linux_x86--64%2Faarch64-informational)
+![accelerators](https://img.shields.io/badge/accelerators-MPS_·_CUDA_·_CPU-9cf)
 ![precision](https://img.shields.io/badge/experts-MXFP4_native-teal)
 ![mode](https://img.shields.io/badge/decoding-greedy_·_reproducible-green)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -37,17 +39,39 @@ Deltafin folder. The only real decision is step 3.
 git clone https://github.com/gavamedia/deltafin.git
 cd deltafin
 
-# 1. environment (Python 3.12+, and Xcode CLT for clang)
+# 1. environment (Python 3.12+)
 python3 -m venv venv
 ./venv/bin/pip install torch numpy safetensors tiktoken ml_dtypes blobfile \
     "transformers==4.56.2" einops tokenizers
 
-# 2. build the fused MXFP4 kernel
-clang -O3 -mcpu=native -shared -DNO_MAIN -o tools/libmxfp4gemv.dylib tools/fused_gemv.c
+# 2. build and validate the native libraries for this host
+python3 tools/build_native.py
 
 # 3. download the model  (see the two modes below)
 ./venv/bin/python tools/setup_k3.py --full
 ```
+
+On macOS, install Xcode Command Line Tools first (`xcode-select --install`). On
+Linux, install a C/C++ compiler toolchain such as `build-essential` or GCC/Clang.
+For an NVIDIA system, install a CUDA-enabled PyTorch build using the
+[official PyTorch selector](https://pytorch.org/get-started/locally/) before
+installing the remaining Python packages. Deltafin does not vendor PyTorch or a
+CUDA runtime.
+
+### Supported platforms
+
+| Host | Resident model / attention | Routed-expert MoE |
+|---|---|---|
+| Apple Silicon macOS | MPS | Metal, with native CPU fallback |
+| NVIDIA Linux, x86-64 or aarch64 | CUDA | native CPU MXFP4 |
+| Linux x86-64-v3 (including AVX2/FMA3) | CPU | native SSSE3/FMA MXFP4 |
+| Linux aarch64 | CPU | native NEON MXFP4 |
+
+The NVIDIA path is deliberately described as hybrid: CUDA accelerates the
+resident spine and attention, while routed MXFP4 experts still execute in the
+native CPU kernel. There is not yet a native CUDA MXFP4 MoE kernel.
+`build_native.py` selects `.dylib` or `.so`, applies the appropriate host ISA
+flags, validates required symbols and ABI, and only then installs the artifacts.
 
 ### The two modes
 
@@ -169,23 +193,25 @@ Please read these caveats before pointing anything automated at it:
 
 ## Configuration
 
-Everything works with no configuration: Deltafin picks the GPU when there is
-one and the int8 spine when it has been built, and says what it chose at
+Everything works with no configuration: Deltafin picks the best available
+device and the int8 spine when it has been built, and says what it chose at
 startup. These variables exist for overriding that:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `K3_DEV` | auto | GPU (`mps`) when available, else `cpu` |
+| `K3_DEV` | auto | `mps` when available, then `cuda`, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
+| `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
+| `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
-| `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head when supported; exact dense fallback remains available |
-| `K3_INT8_KDA_QKV` | `0` | experimental packed-int8 KDA Q/K/V path; set `1` to enable its capability-gated, sequence-parity-checked MPS implementation |
+| `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |
+| `K3_INT8_KDA_QKV` | `0` | experimental packed-int8 KDA Q/K/V path for supported MPS systems; sequence-parity-checked, capability-gated, with dense fallback |
 | `K3_SPEC` | `1` | n-gram speculation (lossless) |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |
 | `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
-| `K3_METAL_POSITION_BATCH` | `0` | exact opt-in T>1 position-major Metal MoE; measured +2.0% on accepted speculative passes and should be retuned per Mac |
+| `K3_METAL_POSITION_BATCH` | `0` | MPS/Metal-specific exact opt-in T>1 position-major MoE; measured +2.0% on accepted speculative passes and should be retuned per Mac |
 | `K3_MOE_TOP_K` | `16` | explicit quality/speed dial; fewer routed experts reduce expert bytes and can change output |
 | `K3_CPU_MOE_BATCH` | `auto` | exact persistent CPU MXFP4 worker ring; padded counters measured +3.6% at eight threads |
-| `K3_ASYNC_CACHE_WRITE` | `0` | opt-in cache-miss write overlap; `K3_CACHE_WRITE_QUEUE` (4) bounds outstanding buffers and `K3_CACHE_WRITE_WORKERS` (1) is retunable per Mac |
+| `K3_ASYNC_CACHE_WRITE` | `0` | opt-in cache-miss write overlap; `K3_CACHE_WRITE_QUEUE` (4) bounds outstanding buffers and `K3_CACHE_WRITE_WORKERS` (1) is retunable per host |
 | `K3_APPROX` | `0` | fp16 numerics; not reproducible at near-ties |
 | `K3_RAM_GB` / `K3_PIN_LAYERS` | auto | override the RAM budget |
 | `K3_PROFILE` | `0` | per-phase timing for each pass |
@@ -197,26 +223,30 @@ startup. These variables exist for overriding that:
 
 ## Requirements
 
-- An Apple Silicon Mac. All published numbers are from the same first-generation
-  M1 Max with 64 GB—the only Mac benchmarked so far. More RAM is used
-  automatically (a 128 GB machine pins several times more of the model), and
-  newer chips can bring higher memory bandwidth, more GPU resources, and faster
-  storage. See
-  [Why newer Macs should be faster](#why-newer-macs-should-be-faster).
-- Xcode Command Line Tools, for `clang` (`xcode-select --install`).
+- Apple Silicon macOS, or x86-64/aarch64 Linux. Linux x86-64 requires the
+  x86-64-v3 instruction-set level (including AVX2 and FMA3).
+- A C/C++ compiler: Xcode Command Line Tools on macOS, or GCC/Clang on Linux.
 - Python 3.12 or newer.
+- PyTorch for the selected device. NVIDIA acceleration requires a CUDA-enabled
+  PyTorch build; CPU-only Linux remains supported.
 - Disk: ~1.7 TB for the full install, ~215 GB for streaming (see [Install](#install)).
 - Network access to Hugging Face.
 
+RAM, accelerator memory and container/cgroup limits are budgeted
+automatically. More memory lets Deltafin retain more of the resident spine and
+expert page cache. See
+[Why newer hardware should be faster](#why-newer-hardware-should-be-faster).
+
 ## How it works
 
-K3's weights total about 1.56 TB, which is more than this machine's free disk, let
-alone its RAM. The observation that makes local inference possible anyway is that a
-Mixture-of-Experts model only *touches* a small fraction of itself per token.
+K3's weights total about 1.56 TB, which is more than most single workstations
+can hold in RAM. The observation that makes local inference possible anyway is
+that a Mixture-of-Experts model only *touches* a small fraction of itself per
+token.
 
 - **The resident spine** (~114 GB: attention, shared experts, latent projections,
-  embeddings) is downloaded once and read layer-by-layer from local NVMe each token,
-  quantized to int8 and computed on the GPU.
+  embeddings) is downloaded once and read layer-by-layer from local storage each
+  token, quantized to int8 and computed on the selected MPS, CUDA or CPU device.
 - **The 82,432 routed experts** (~1.45 TB). For each token K3's router picks 16
   experts per layer, and only those are read. Install them all locally if you can
   (recommended); otherwise Deltafin fetches them from Hugging Face on demand —
@@ -229,15 +259,15 @@ flowchart LR
     subgraph HF["Hugging Face CDN"]
         W[("96 safetensors shards<br/>1.56 TB · MXFP4")]
     end
-    subgraph MAC["MacBook (M1 Max, 64 GB)"]
-        subgraph DISK["NVMe"]
+    subgraph HOST["Local workstation (macOS or Linux)"]
+        subgraph DISK["Local SSD / NVMe"]
             SP[("resident spine<br/>114 GB bf16 → 60 GB int8")]
             EC[("expert cache<br/>raw shard spans")]
         end
         subgraph TOK["per token"]
             R{"router<br/>top-16 of 896<br/>× 92 layers"}
-            L["93 decoder layers<br/>2 shared GPU templates"]
-            K["fused MXFP4 GEMV<br/>NEON"]
+            L["93 decoder layers<br/>MPS / CUDA / CPU"]
+            K["fused MXFP4 MoE<br/>Metal or CPU SIMD"]
         end
     end
     W -- "one range request<br/>per missing expert" --> EC
@@ -250,10 +280,11 @@ flowchart LR
 
 ## What to expect
 
-All current numbers below were measured on **one M1 Max (10-core CPU, 32-core
-GPU, 64 GB, internal NVMe)** with the full model installed locally, int8
-resident weights and output head, Metal MoE, exact fp32 numerics, greedy
-decoding, and tracing disabled.
+The maintainer reference below was measured on **one modest M1 Max (10-core CPU,
+32-core GPU, 64 GB, internal NVMe)** with the full model installed locally,
+int8 resident weights and output head, Metal MoE, exact fp32 numerics, greedy
+decoding, and tracing disabled. It is a transparent baseline from an early
+Apple Silicon machine, not a claim that every supported host performs alike.
 
 The current column pools **six exact full-model runs** from balanced ABBA/BAAB
 campaigns. Each run used the five-token prompt `The capital of France is`,
@@ -273,6 +304,34 @@ shows how much this I/O-heavy workload moved even on the same quiet machine.
 > Max or Ultra. It is a conservative reference point, not a cross-Mac benchmark.
 > We expect newer, higher-bandwidth and higher-RAM systems to do better, but will
 > label those numbers separately when someone measures them.
+
+### Community Linux + CUDA result
+
+[Maurice Brown (`trumb`)](https://github.com/trumb) reported an end-to-end run
+on an NVIDIA DGX Spark (GB10 Grace-Blackwell, 20-core Cortex-X925, 128 GB unified
+LPDDR5X) using Ubuntu 24.04 and GCC 13.3. With no device environment variables
+set, Deltafin selected CUDA plus the int8 spine and completed
+`The capital of France is` → ` Paris. The Eiffel Tower is located` in **213
+seconds** in that reported single run (139.6 s compute, 51.9 s expert fetch,
+40.8 s MoE kernel, 37.4 s preload wait). This is a community measurement from
+[pull request #2](https://github.com/gavamedia/deltafin/pull/2), not a
+maintainer-replicated benchmark.
+
+The contributor also reported this four-configuration comparison on the same
+system; all four runs produced the same expected output:
+
+| Configuration | Total | Compute | Resident I/O | Preload wait |
+|---|---:|---:|---:|---:|
+| bf16 + CPU | 865 s | 299 s | 53 s | 504 s |
+| bf16 + CUDA | 858 s | 160 s | 20 s | 676 s |
+| int8 + CPU | 649 s | 327 s | 311 s | 2 s |
+| **int8 + CUDA** | **221 s** | **184 s** | **17 s** | **18 s** |
+
+On this 128 GB unified-memory machine, int8 was worth roughly **4× end to end**,
+not merely the 2× suggested by halving spine bytes: the 107 GB bf16 spine left
+almost no room for the expert page cache, while the roughly 53 GB int8 spine
+freed enough cache headroom for preload wait to collapse. That result is a good
+reminder that quantization can change the I/O regime, not just arithmetic cost.
 
 ### Recent exact-path improvements
 
@@ -304,34 +363,35 @@ re-read every token, and at the ~7 GB/s this access pattern sustains that is abo
 hold the spine without displacing the page cache the expert reads need) or a
 smaller spine.
 
-### Why newer Macs should be faster
+### Why newer hardware should be faster
 
-Every one of those lines is bound by hardware that changes across Apple Silicon.
-No path is hard-disabled by an M1 result, but several fallback values were
-measured here; a newer machine should retune them under its own capability,
-runtime, memory, and storage fingerprint:
+The maintainer numbers above come from an M1 Max, but the dominant costs vary
+with memory, storage, CPU SIMD and accelerator capability rather than a
+hard-coded chip name:
 
-- **Memory bandwidth.** The M1 Max has 400 GB/s. An M3/M4 Max is meaningfully
-  higher and an Ultra roughly doubles it — that lands directly on the spine load
-  and the expert matmuls.
-- **GPU.** More cores execute the same Metal kernels faster; the dequant shader
-  and the attention path both scale with it.
-- **SSD.** Expert reads are the single biggest slice, and they run at whatever
-  the internal drive delivers. Later Macs ship faster NVMe.
-- **RAM.** This matters most. The 53 GB spine does not fit alongside everything
-  else on a 64 GB machine, so it is re-read from disk every token — about half
-  the total time. On a 128 GB machine it can simply stay in the page cache, and
-  that cost largely disappears. Deltafin also pins more of the model there
-  automatically, with no flags.
+- **Memory bandwidth.** Faster unified or system memory lands directly on spine
+  loading and expert matmuls. Newer Apple Max/Ultra chips and high-bandwidth
+  Linux workstations should have more room than the M1 reference.
+- **Accelerator.** More capable Apple GPUs execute the MPS/Metal resident path
+  faster. CUDA accelerates the resident spine and attention on NVIDIA Linux;
+  routed MXFP4 MoE remains on the CPU until a native CUDA kernel lands.
+- **SSD.** Expert reads are one of the largest slices and run at the throughput
+  the local NVMe and filesystem can sustain.
+- **RAM.** This often matters most. The 53 GB int8 spine does not fit alongside
+  everything else on a 64 GB host, so much of it is re-read every token. With
+  more headroom it can remain in page cache, expert preload waits fall, and
+  Deltafin pins more layers automatically.
+- **CPU ISA and cores.** aarch64 uses NEON; supported x86-64 Linux hosts use the
+  SSSE3/FMA kernel and are preflighted for x86-64-v3 features before loading it.
 
-Runtime selection is based on Metal feature-family and operator capability
-checks rather than chip-name strings. That keeps newer families—including M5—
-eligible for paths an M1 cannot execute, while every optional native path retains
-an exact fallback.
+Runtime selection checks MPS/CUDA availability, native CPU capabilities, host
+and cgroup memory limits, and optional operator support rather than matching
+marketing names. That keeps newer Apple families—including M5—and new Linux
+hosts eligible while optional paths retain safe fallbacks.
 
-We have only benchmarked this on that M1 Max. **If you try it on an M3, M4 or
-M5, an Ultra, or a machine with 128 GB or more, we would genuinely like to see
-your numbers**—open an issue with the output of `K3_PROFILE=1` and your chip.
+**If you try Deltafin on a newer Mac, an NVIDIA Linux workstation, an Ultra, or
+a machine with 128 GB or more, we would genuinely like to see your
+numbers**—open an issue with the output of `K3_PROFILE=1`, your OS and hardware.
 
 When n-gram speculation accepts a draft, one forward pass emits two tokens, so
 repetitive text runs proportionally faster. Speculation is lossless: accepted
@@ -368,11 +428,12 @@ below to K3's particular shape.
 - **Raw-span disk cache.** Cache files are the shard bytes verbatim — no container
   format, no parsing.
 - **Parallel expert reads.** A layer's 16 selected experts are read together by a
-  thread pool using `pread` with `F_NOCACHE`, rather than being demand-faulted
-  page by page while the kernel computes. Measured cold: 0.87 GB/s faulting
-  versus 6.85 GB/s reading. This was worth 40 s → 4.3 s per token on the read
-  path alone, and `F_NOCACHE` keeps 25 GB/token of expert traffic from evicting
-  the page cache the spine needs.
+  thread pool using `pread`, rather than being demand-faulted page by page while
+  the kernel computes. On the measured Mac, Darwin's `F_NOCACHE` kept 25
+  GB/token of expert traffic from evicting the page cache the spine needed;
+  Linux uses its own best-effort cache-advice path when explicitly enabled.
+  The Mac cold-read comparison was 0.87 GB/s faulting versus 6.85 GB/s reading,
+  worth 40 s → 4.3 s per token on that read path.
 - **Double-buffered layer loading.** A worker thread reads the next layer's spine
   data while the current layer computes.
 - **Previous-token prefetch.** Consecutive tokens reuse about 31% of their expert
@@ -382,30 +443,31 @@ below to K3's particular shape.
 ### Compute
 
 - **Fused MXFP4 dequant+GEMV** ([`tools/fused_gemv.c`](tools/fused_gemv.c)) — a
-  NEON kernel that dequantizes and multiplies in one pass using a 16-entry table
-  lookup, with the e8m0 scale applied as integer arithmetic on the fp32 exponent.
-  It matches the reference implementation bit-for-bit and replaced a much slower
+  native kernel that dequantizes and multiplies in one pass using a 16-entry
+  table lookup, with the e8m0 scale applied as integer arithmetic on the fp32
+  exponent. It uses NEON on aarch64 and SSSE3/FMA on x86-64, matches the
+  reference implementation bit-for-bit, and replaced a much slower
   dequantize-then-matmul path. A Metal version exists as a validated prototype.
 - **Template-layer buffer reuse.** All 69 KDA layers share one set of tensor
-  shapes and all 24 MLA layers another, so two persistent GPU-resident "template"
+  shapes and all 24 MLA layers another, so two persistent device-resident "template"
   layers can receive each layer's weights via `copy_()`. This avoids the allocator
   churn that profiling showed was a large share of per-token time.
 - **int8 resident spine.** Halves the per-token resident I/O. In our checks the
   top-5 next-token candidates kept their order and the top logit moved by 0.07%.
-- **Custom Metal dequant kernel.** Loading the spine spent most of its time in a
+- **Custom Metal dequant kernel (Apple).** Loading the spine spent most of its time in a
   row-broadcast multiply that MPS runs at 43 GB/s, against 334 GB/s for a plain
   copy of the same bytes. A small `compile_shader` kernel fusing int8→fp32, the
   row scale, and the copy reaches 297 GB/s; with persistent staging buffers and
   transfers hoisted out from between dispatches, per-layer load went 118 ms →
   21 ms. Bit-exact: `max|diff| = 0` on every tensor.
-- **Packed int8 output head.** The built-in MPS weight-only matmul consumes the
+- **Packed int8 output head (Apple).** The built-in MPS weight-only matmul consumes the
   existing row-int8 checkpoint directly, avoiding a 4.7 GB fp32 head and its
   dequantization. Capability checks and a caught dense fallback preserve support
   across PyTorch releases and Apple GPU families.
-- **Packed int8 KDA projections.** The same native MPS operator consumes each
+- **Packed int8 KDA projections (Apple).** The same native MPS operator consumes each
   KDA layer's Q/K/V matrices directly from the row-int8 spine. The two reusable
   KDA templates share one 252 MiB packed arena, so those three large matrices
-  are neither dequantized nor retained as dense fp32 weights. This remains an
+  are neither dequantized nor retained as dense fp32 weights. This remains a
   sequence-parity-checked opt-in while its early A/B is repeated; capability
   and failure guards preserve the dense path.
 - **Pure-PyTorch KDA shim** ([`tools/fla/`](tools/fla)) — Kimi Delta Attention's
@@ -441,23 +503,30 @@ sequenceDiagram
 ### Scaling with RAM
 
 - At startup Deltafin reserves memory for the OS (`max(10 GB, 18%)`) and pins as
-  many resident layers as the remainder allows. A 128 GB machine pins several
-  times more than a 64 GB one without any configuration, and the expert cache
-  additionally benefits from whatever page cache is free.
+  many resident layers as the remainder allows, while respecting container
+  limits and accelerator headroom where available. A 128 GB machine can pin
+  several times more than a 64 GB one without configuration, and the expert
+  cache additionally benefits from whatever page cache is free.
 
 ## Where this could go
 
-Roughly in order: the Metal expert kernels (already prototyped), a proper quality
-harness — average NLL against the official API — so lossy speed/quality
-trade-offs can be measured rather than argued about, smarter expert prefetching,
-and eventually a native engine in the spirit of ds4, where most of the remaining
-overhead should disappear.
+Roughly in order: a native CUDA MXFP4 MoE kernel for an all-accelerator NVIDIA
+path, further Metal expert-kernel tuning, a proper quality harness — average NLL
+against the official API — so lossy speed/quality trade-offs can be measured
+rather than argued about, smarter expert prefetching, and eventually a native
+engine in the spirit of ds4, where most remaining overhead should disappear.
 
 ## Thanks
 
 Deltafin leans heavily on work that others published openly. In rough order of
 influence:
 
+- **[Maurice Brown (`trumb`)](https://github.com/trumb)** — contributed the
+  Linux x86-64/aarch64 and NVIDIA compatibility findings, native-kernel
+  correctness checks, platform-specific build settings and DGX Spark
+  measurements in
+  **[pull request #2](https://github.com/gavamedia/deltafin/pull/2)**. Those
+  findings informed Deltafin's guarded cross-platform implementation.
 - **[colibri](https://github.com/JustVugg/colibri)** (JustVugg, Apache-2.0) —
   showed that a 744B MoE can run in 25 GB of RAM, and is where we learned about
   router-lookahead prefetch, learned expert pinning, `F_NOCACHE` and `F_RDADVISE`

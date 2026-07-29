@@ -60,10 +60,11 @@ def _positive_int(value: Any) -> int | None:
 
 
 def _physical_memory_bytes() -> int | None:
-    value = _command_output(["sysctl", "-n", "hw.memsize"])
-    parsed = _positive_int(value)
-    if parsed is not None:
-        return parsed
+    if platform.system() == "Darwin":
+        value = _command_output(["sysctl", "-n", "hw.memsize"])
+        parsed = _positive_int(value)
+        if parsed is not None:
+            return parsed
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")

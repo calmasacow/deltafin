@@ -22,6 +22,11 @@
 #error "The MXFP4 kernel supports only arm64 and x86-64"
 #endif
 
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) \
+        && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "The MXFP4 SIMD table expansion currently requires little-endian byte order"
+#endif
+
 #include <pthread.h>
 #if defined(__APPLE__)
 #include <pthread/qos.h>
@@ -70,6 +75,26 @@ static inline void mxfp4_cpu_relax(void) {
 #endif
 }
 
+#if defined(MXFP4_TEST_PTHREAD_FAIL_AFTER)
+static _Atomic int mxfp4_test_pthread_create_calls = 0;
+
+void mxfp4_test_reset_pthread_create(void) {
+    atomic_store_explicit(
+        &mxfp4_test_pthread_create_calls, 0, memory_order_relaxed);
+}
+#endif
+
+static inline int mxfp4_pthread_create(
+        pthread_t *thread, const pthread_attr_t *attr,
+        void *(*start_routine)(void *), void *arg) {
+#if defined(MXFP4_TEST_PTHREAD_FAIL_AFTER)
+    int call = atomic_fetch_add_explicit(
+        &mxfp4_test_pthread_create_calls, 1, memory_order_relaxed);
+    if (call >= MXFP4_TEST_PTHREAD_FAIL_AFTER) return 1;
+#endif
+    return pthread_create(thread, attr, start_routine, arg);
+}
+
 static double now_s(void) {
     struct timespec ts;
 #if defined(CLOCK_MONOTONIC_RAW)
@@ -103,6 +128,13 @@ static const float e2m1_tab[16] = {
 };
 static inline float e8m0_to_f32(uint8_t s) {
     union { uint32_t u; float f; } v; v.u = (uint32_t)s << 23; return v.f;
+}
+
+// Multiplication is deliberate: left-shifting a negative signed value is
+// undefined in C. Conversion to uint16_t is defined modulo 2^16 and produces
+// the same exponent-field delta for scales below and above the 127 bias.
+static inline uint16_t e8m0_exp_delta_u16(uint8_t s) {
+    return (uint16_t)(((int)s - 127) * 128);
 }
 
 // identical accumulator reduction for ref and fused (bit-exact comparability)
@@ -159,7 +191,7 @@ void mxfp4_gemv_rows(const uint8_t *restrict p, const uint8_t *restrict s,
         float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0), a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
         float32x4_t a4 = vdupq_n_f32(0), a5 = vdupq_n_f32(0), a6 = vdupq_n_f32(0), a7 = vdupq_n_f32(0);
         for (int g = 0; g < groups; g++) {
-            uint16x8_t A = vdupq_n_u16((uint16_t)(((int)sp[g] - 127) << 7));
+            uint16x8_t A = vdupq_n_u16(e8m0_exp_delta_u16(sp[g]));
             uint8x16_t t0 = vreinterpretq_u8_u16(vaddq_u16(B0, vandq_u16(A, Z0)));
             uint8x16_t t1 = vreinterpretq_u8_u16(vaddq_u16(B1, vandq_u16(A, Z1)));
             uint8x16_t TABL = vuzp1q_u8(t0, t1);
@@ -217,7 +249,7 @@ void mxfp4_gemv_rows2(const uint8_t *restrict p, const uint8_t *restrict s,
             float32x4_t x6 = vld1q_f32(xp + 24), x7 = vld1q_f32(xp + 28);
 #define ROWGRP(pp, sp, c0, c1, c2, c3, c4, c5, c6, c7)                                              \
             {                                                                                        \
-                uint16x8_t AD = vdupq_n_u16((uint16_t)(((int)(sp)[g] - 127) << 7));                  \
+                uint16x8_t AD = vdupq_n_u16(e8m0_exp_delta_u16((sp)[g]));                           \
                 uint8x16_t t0 = vreinterpretq_u8_u16(vaddq_u16(B0, vandq_u16(AD, Z0)));              \
                 uint8x16_t t1 = vreinterpretq_u8_u16(vaddq_u16(B1, vandq_u16(AD, Z1)));              \
                 uint8x16_t TABL = vuzp1q_u8(t0, t1), TABH = vuzp2q_u8(t0, t1);                       \
@@ -325,7 +357,8 @@ static double run_gemv_mt_k(gemv_fn fn, const uint8_t *p, const uint8_t *s, cons
     for (int t = 0; t < nthreads; t++) {
         jobs[t] = (gjob_t){ fn, p, s, x, y, t * per,
                             (t + 1) * per > rows ? rows : (t + 1) * per, cols, iters };
-        if (pthread_create(&th[t], NULL, gworker, &jobs[t]) != 0) break;
+        if (mxfp4_pthread_create(
+                &th[t], NULL, gworker, &jobs[t]) != 0) break;
         made++;
     }
     for (int t = 0; t < made; t++) pthread_join(th[t], NULL);
@@ -414,7 +447,8 @@ double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
     for (int t = 0; t < nthreads; t++) {
         jobs[t] = (tjob_t){ p1, s1, p3, s3, p2, s2, x, h, y1, y3, y2,
                             t, nthreads, iters, &bar, &ctrA, &ctrB, &start };
-        if (pthread_create(&th[t], NULL, tworker, &jobs[t]) != 0) break;
+        if (mxfp4_pthread_create(
+                &th[t], NULL, tworker, &jobs[t]) != 0) break;
         made++;
     }
     // Workers wait on start, so a partial pthread_create can safely reduce the

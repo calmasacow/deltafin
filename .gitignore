@@ -60,6 +60,7 @@ tools/expert_index.npy
 tools/expert_index.meta.json
 tools/libmxfp4gemv.dylib
 *.dylib
+*.so
 *.o
 
 # --- environments & tooling ---------------------------------

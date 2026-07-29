@@ -1,4 +1,4 @@
-"""Low-level spine read primitives (fd cache, chunked preadv, Darwin I/O hints).
+"""Low-level spine read primitives (fd cache, chunked preadv, OS I/O hints).
 
 The int8 spine is 53 GB and is re-read from disk on every forward pass, so the
 read is the single largest term in a decode token.  tools/spine_fast.py's
@@ -27,29 +27,41 @@ module is not consulted at all and spine_fast keeps its original reader.
 Flags (all default to the pre-existing behaviour):
     K3_SPINE_FDCACHE=1     keep one fd per spine blob open for the process life
     K3_SPINE_CHUNK_MB=<n>  split reads into n-MiB work items (0 = per-file)
-    K3_SPINE_RDADVISE=1    F_RDADVISE the next layer's payloads while reading
-    K3_SPINE_IOPOL=1       setiopolicy_np(DISK, PROCESS, IMPORTANT) + reader
-                           threads at QOS_CLASS_USER_INITIATED
-    K3_SPINE_NOCACHE=1     F_NOCACHE on spine fds (DIAGNOSTIC -- defeats the
-                           page cache on purpose; expected to be a loss)
+    K3_SPINE_RDADVISE=1    prefetch the next layer (Darwin F_RDADVISE;
+                           Linux POSIX_FADV_WILLNEED)
+    K3_SPINE_IOPOL=1       Darwin: setiopolicy_np(DISK, PROCESS, IMPORTANT) +
+                           reader threads at QOS_CLASS_USER_INITIATED
+    K3_SPINE_NOCACHE=1     keep completed spine ranges out of cache (Darwin
+                           F_NOCACHE; Linux POSIX_FADV_DONTNEED; DIAGNOSTIC)
 """
 import ctypes
 import ctypes.util
 import fcntl
 import os
 import struct
+import sys
 import threading
 
+try:
+    from runtime_platform import darwin_file_hints_enabled
+except ImportError:  # imported as tools.spine_io instead of a top-level module
+    from .runtime_platform import darwin_file_hints_enabled
+
 # ---------------------------------------------------------------- flags -----
+_IS_DARWIN = sys.platform == "darwin"
+_IS_LINUX = sys.platform.startswith("linux")
 FDCACHE = os.environ.get("K3_SPINE_FDCACHE", "0") == "1"
 CHUNK_MB = float(os.environ.get("K3_SPINE_CHUNK_MB", "0") or 0)
 CHUNK = int(CHUNK_MB * (1 << 20))
 RDADVISE = os.environ.get("K3_SPINE_RDADVISE", "0") == "1"
-IOPOL = os.environ.get("K3_SPINE_IOPOL", "0") == "1"
+IOPOL = darwin_file_hints_enabled(
+    os.environ.get("K3_SPINE_IOPOL", "0") == "1"
+)
 NOCACHE = os.environ.get("K3_SPINE_NOCACHE", "0") == "1"
+STREAM_TIER = os.environ.get("K3_SPINE_STREAM_NOCACHE", "0") == "1"
 
 ENABLED = (FDCACHE or CHUNK > 0 or RDADVISE or NOCACHE
-           or os.environ.get("K3_SPINE_STREAM_NOCACHE", "0") == "1")
+           or STREAM_TIER)
 
 # ------------------------------------------------------- darwin constants ---
 F_NOCACHE = 48
@@ -112,8 +124,44 @@ _FDS_LOCK = threading.Lock()
 OPENS = 0
 
 
+def _use_nocache(requested=False):
+    """Whether a Darwin fd needs the persistent F_NOCACHE attribute."""
+    return _IS_DARWIN and (requested or NOCACHE)
+
+
+def _apply_nocache(fd, requested=False):
+    """Apply Darwin F_NOCACHE, never command number 48 on another kernel."""
+    if not _use_nocache(requested):
+        return False
+    fcntl.fcntl(fd, F_NOCACHE, 1)
+    return True
+
+
+def _linux_fadvise(fd, offset, count, advice):
+    """Best-effort Linux cache advice; unsupported libc/filesystems are safe."""
+    if not _IS_LINUX:
+        return False
+    advise = getattr(os, "posix_fadvise", None)
+    if advise is None or advice is None:
+        return False
+    try:
+        advise(fd, int(offset), int(count), advice)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _drop_read_cache(fd, offset, count, requested=False):
+    """Drop only a completed Linux read range when nocache was requested."""
+    if not (requested or NOCACHE):
+        return False
+    return _linux_fadvise(
+        fd, offset, count, getattr(os, "POSIX_FADV_DONTNEED", None)
+    )
+
+
 def fd_for(path, nocache=False):
-    nc = 1 if (nocache or NOCACHE) else 0
+    nc = 1 if _use_nocache(nocache) else 0
     tbl = _FDS[nc]
     fd = tbl.get(path)
     if fd is not None:
@@ -122,8 +170,12 @@ def fd_for(path, nocache=False):
         fd = tbl.get(path)
         if fd is None:
             fd = os.open(path, os.O_RDONLY)
-            if nc:
-                fcntl.fcntl(fd, F_NOCACHE, 1)
+            try:
+                if nc:
+                    _apply_nocache(fd, nocache)
+            except Exception:
+                os.close(fd)
+                raise
             tbl[path] = fd
             global OPENS
             OPENS += 1
@@ -132,8 +184,11 @@ def fd_for(path, nocache=False):
 
 def _open_transient(path, nocache=False):
     fd = os.open(path, os.O_RDONLY)
-    if nocache or NOCACHE:
-        fcntl.fcntl(fd, F_NOCACHE, 1)
+    try:
+        _apply_nocache(fd, nocache)
+    except Exception:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -150,10 +205,9 @@ def close_all():
 
 # ------------------------------------------------------------ readahead -----
 def rdadvise(path, offset=0, count=0):
-    """F_RDADVISE: tell the kernel to pull [offset, offset+count) of this file
-    into the page cache asynchronously.  Unlike a plain read it does not block
-    and does not need a destination buffer, so it can be issued for layer N+1
-    while layer N is still being copied out.  count=0 means 'to EOF'."""
+    """Ask the kernel to prefetch [offset, offset+count); 0 means to EOF."""
+    if not (_IS_DARWIN or _IS_LINUX):
+        return False
     try:
         fd = fd_for(path) if FDCACHE else _open_transient(path)
     except OSError:
@@ -163,9 +217,15 @@ def rdadvise(path, offset=0, count=0):
             count = os.fstat(fd).st_size - offset
         if count <= 0:
             return False
-        # struct radvisory is {off_t; int;} -> 8 + 4 + 4 pad on arm64.
-        fcntl.fcntl(fd, F_RDADVISE, struct.pack("qi4x", int(offset), int(count)))
-        return True
+        if _IS_DARWIN:
+            # struct radvisory is {off_t; int;} -> 8 + 4 + 4 pad on arm64.
+            fcntl.fcntl(
+                fd, F_RDADVISE, struct.pack("qi4x", int(offset), int(count))
+            )
+            return True
+        return _linux_fadvise(
+            fd, offset, count, getattr(os, "POSIX_FADV_WILLNEED", None)
+        )
     except OSError:
         return False
     finally:
@@ -193,7 +253,9 @@ def _pread_into(fd, mv, off):
 def read_one(path, mv, off=0, nocache=False):
     fd = fd_for(path, nocache) if FDCACHE else _open_transient(path, nocache)
     try:
-        return _pread_into(fd, mv, off)
+        got = _pread_into(fd, mv, off)
+        _drop_read_cache(fd, off, got, nocache)
+        return got
     finally:
         if not FDCACHE:
             os.close(fd)
@@ -261,7 +323,8 @@ def _drain(it, lock, nocache=False):
                 return
         fd = fd_for(path, nocache) if FDCACHE else _open_transient(path, nocache)
         try:
-            _pread_into(fd, mv, foff)
+            got = _pread_into(fd, mv, foff)
+            _drop_read_cache(fd, foff, got, nocache)
         finally:
             if not FDCACHE:
                 os.close(fd)
@@ -276,18 +339,16 @@ def _drain(it, lock, nocache=False):
 # machine, cold layer reads run at ~7.0 GB/s and page-cache-resident ones at
 # ~27-38 GB/s, so those misses are worth ~6 s of every token.
 #
-# The fix is not more cache, it is a FIXED SUBSET.  If layers 0..K are read
-# normally and layers K+1..91 are read with F_NOCACHE, the streaming tier stops
-# flooding the cache, the resident tier stays resident, and the hit rate becomes
-# (K+1)/92 instead of ~0.  F_NOCACHE reads still hit pages that happen to be
-# resident -- it controls what the read LEAVES BEHIND, not what it may use --
-# so the streaming tier degrades to exactly today's behaviour and never worse.
+# The fix is not more cache, it is a FIXED SUBSET. If layers 0..K are read
+# normally and layers K+1..91 use the host's no-cache advice, the streaming tier
+# stops flooding the cache, the resident tier stays resident, and the hit rate
+# becomes (K+1)/92 instead of ~0. Darwin uses F_NOCACHE; Linux discards each
+# completed range with POSIX_FADV_DONTNEED.
 #
 # This costs no anonymous memory, which is the whole point: the earlier explicit
 # 29.7 GB heap cache achieved the same fixed-subset effect but paid for it in
 # swappable pages and fell off an 8x cliff.  Clean file pages cannot be swapped;
 # under pressure the kernel just drops them and we are back to 7 GB/s.
-STREAM_TIER = os.environ.get("K3_SPINE_STREAM_NOCACHE", "0") == "1"
 _RESIDENT = set()          # layer prefixes deliberately kept in the page cache
 _RESIDENT_ACTIVE = False
 
@@ -302,7 +363,7 @@ def set_resident_tier(prefixes):
 
 
 def stream_tier(prefix):
-    """True if this layer should be read with F_NOCACHE."""
+    """True if this layer should use the host's streaming cache policy."""
     if not STREAM_TIER or not _RESIDENT_ACTIVE:
         return False
     return prefix not in _RESIDENT

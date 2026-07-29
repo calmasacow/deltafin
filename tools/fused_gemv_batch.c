@@ -198,7 +198,8 @@ int mxfp4_pool_init(int nthreads) {
         mxfp4_qos_attr(&at);
         int made = 0;
         for (int i = 0; i < nthreads; i++) {
-            if (pthread_create(&g_th[i], &at, k3_worker, NULL) != 0) break;
+            if (mxfp4_pthread_create(
+                    &g_th[i], &at, k3_worker, NULL) != 0) break;
             made++;
         }
         pthread_attr_destroy(&at);
@@ -329,14 +330,21 @@ void mxfp4_situ_batch(const float *gu, float *h, int n_ex, int d_ff, int nthread
 // NOT bit-exact vs the numpy SiTU path (libm vs numpy transcendentals); the GEMVs are.
 static float *g_scr = NULL;
 static size_t g_scr_n = 0;
+static pthread_mutex_t g_scr_mu = PTHREAD_MUTEX_INITIALIZER;
 
 void mxfp4_moe_expert_set(const uint8_t *const *p13, const uint8_t *const *s13,
                           const uint8_t *const *p2,  const uint8_t *const *s2,
                           const float *x, const float *wts,
                           int n_ex, int d_ff, int d_model,
                           float *scratch, float *out, int nthreads) {
-    if (n_ex <= 0) return;
-    size_t need = (size_t)n_ex * (3 * (size_t)d_ff + (size_t)d_model);
+    if (n_ex <= 0 || n_ex > K3_MAX_MATS / 2
+            || d_ff <= 0 || d_model <= 0) return;
+    size_t dff = (size_t)d_ff, dmodel = (size_t)d_model;
+    if (dff > (SIZE_MAX - dmodel) / 3) return;
+    size_t per_expert = 3 * dff + dmodel;
+    if ((size_t)n_ex > SIZE_MAX / per_expert / sizeof(float)) return;
+    size_t need = (size_t)n_ex * per_expert;
+    pthread_mutex_lock(&g_scr_mu);
     float *scr = scratch;
     if (!scr) {
         if (g_scr_n < need) {
@@ -345,7 +353,10 @@ void mxfp4_moe_expert_set(const uint8_t *const *p13, const uint8_t *const *s13,
             g_scr_n = g_scr ? need : 0;
         }
         scr = g_scr;
-        if (!scr) return;
+        if (!scr) {
+            pthread_mutex_unlock(&g_scr_mu);
+            return;
+        }
     }
     float *gu = scr;                                   // [n_ex][2][d_ff]
     float *h  = gu + (size_t)n_ex * 2 * d_ff;          // [n_ex][d_ff]
@@ -356,7 +367,6 @@ void mxfp4_moe_expert_set(const uint8_t *const *p13, const uint8_t *const *s13,
     const float *xs[K3_MAX_MATS]; float *ys[K3_MAX_MATS];
 
     int n13 = 2 * n_ex;
-    if (n13 > K3_MAX_MATS || n_ex > K3_MAX_MATS) return;
     for (int m = 0; m < n13; m++) { rows13[m] = d_ff; cols13[m] = d_model; xs[m] = x; ys[m] = gu + (size_t)m * d_ff; }
     mxfp4_gemv_batch(p13, s13, xs, ys, rows13, cols13, n13, nthreads);
 
@@ -374,4 +384,5 @@ void mxfp4_moe_expert_set(const uint8_t *const *p13, const uint8_t *const *s13,
         const float w = wts[e], *ye = yb + (size_t)e * d_model;
         for (int i = 0; i < d_model; i++) out[i] += w * ye[i];
     }
+    pthread_mutex_unlock(&g_scr_mu);
 }

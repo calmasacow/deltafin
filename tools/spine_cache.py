@@ -18,11 +18,11 @@ module implements both:
      to hold the expert payloads.
 
   2. GROWTH MUST BE WATCHED, NOT PREDICTED.  No static budget can know what else
-     the machine will do while we run.  Every admission re-reads the kernel's own
-     accounting (host_statistics64 + kern.memorystatus_vm_pressure_level); if the
-     compressor or the swapper starts moving, we stop growing and give memory
-     back layer by layer.  That is the difference between the 8x cliff and a
-     cache that just quietly becomes smaller.
+     the machine will do while we run. Every admission re-reads the kernel's own
+     accounting (Mach host_statistics64 on macOS; /proc on Linux); if the
+     compressor or swapper starts moving, we stop growing and give memory back
+     layer by layer. That is the difference between the 8x cliff and a cache
+     that just quietly becomes smaller.
 
 WHAT THE CACHE IS WORTH, MEASURED ON THIS MACHINE
 -------------------------------------------------
@@ -60,11 +60,22 @@ import ctypes
 import ctypes.util
 import os
 import struct
+import sys
 import threading
 
 import apple_silicon
 
-PAGE = 16384                      # Apple Silicon
+try:
+    import runtime_platform
+except ImportError:  # imported as tools.spine_cache instead of top-level
+    from . import runtime_platform
+
+_IS_DARWIN = sys.platform == "darwin"
+_IS_LINUX = sys.platform.startswith("linux")
+try:
+    PAGE = int(os.sysconf("SC_PAGE_SIZE"))
+except (OSError, ValueError):
+    PAGE = 16384 if _IS_DARWIN else 4096
 _libc = None
 
 
@@ -100,8 +111,8 @@ HOST_VM_INFO64 = 4
 HOST_VM_INFO64_COUNT = 38
 
 
-def vm_snapshot():
-    """Kernel page accounting, ~2 us.  Same source vm_stat(1) reads."""
+def _darwin_vm_snapshot():
+    """Darwin kernel page accounting, ~2 us; same source vm_stat(1) reads."""
     lc = _lc()
     lc.mach_host_self.restype = ctypes.c_uint
     buf = (ctypes.c_uint32 * 64)()
@@ -112,6 +123,80 @@ def vm_snapshot():
     return dict(zip(_VM_KEYS, struct.unpack_from(_VM_FMT, bytes(buf), 0)))
 
 
+def _proc_fields(path, colon=False):
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle
+            for line in lines:
+                if colon:
+                    name, sep, rest = line.partition(":")
+                    if not sep:
+                        continue
+                else:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    name, rest = parts[0], parts[1]
+                token = rest.strip().split()
+                try:
+                    out[name] = int(token[0]) if token else 0
+                except ValueError:
+                    continue
+    except OSError:
+        return {}
+    return out
+
+
+def _linux_vm_snapshot(
+    meminfo_path="/proc/meminfo",
+    vmstat_path="/proc/vmstat",
+    available_cap_bytes=None,
+):
+    """Linux page accounting normalized to the Darwin watchdog's key schema."""
+    mem = _proc_fields(meminfo_path, colon=True)
+    vm = _proc_fields(vmstat_path)
+    if not mem:
+        return None
+    out = dict.fromkeys(_VM_KEYS, 0)
+    free_bytes = max(0, mem.get("MemFree", 0)) * 1024
+    file_bytes = max(
+        0,
+        mem.get("Cached", 0)
+        + mem.get("SReclaimable", 0)
+        - mem.get("Shmem", 0),
+    ) * 1024
+    if available_cap_bytes is None:
+        limits = runtime_platform.linux_memory_limits(
+            meminfo_path=meminfo_path
+        )
+        available_cap_bytes = limits.effective_available_bytes
+    if available_cap_bytes is not None:
+        # Host page-cache totals may include memory outside this process's
+        # cgroup. Never treat more than our effective headroom as reclaimable.
+        available_cap_bytes = max(0, available_cap_bytes)
+        free_bytes = min(free_bytes, available_cap_bytes)
+        file_bytes = min(
+            file_bytes, max(0, available_cap_bytes - free_bytes)
+        )
+    out["free"] = free_bytes // PAGE
+    out["external"] = file_bytes // PAGE
+    out["swapouts"] = max(0, vm.get("pswpout", 0))
+    # Linux has no direct analogue of the macOS compressor. Swapout movement is
+    # the conservative, actionable signal; pressure_level() remains neutral.
+    out["compressions"] = 0
+    return out
+
+
+def vm_snapshot():
+    """Return compatible VM counters on Darwin and Linux."""
+    if _IS_DARWIN:
+        return _darwin_vm_snapshot()
+    if _IS_LINUX:
+        return _linux_vm_snapshot()
+    return None
+
+
 _PRESSURE_MIB = None
 
 
@@ -120,6 +205,8 @@ def pressure_level():
     This is the same signal DISPATCH_SOURCE_TYPE_MEMORYPRESSURE delivers, minus
     the dispatch queue -- and unlike a dispatch source it can be sampled from a
     worker thread with no runloop, which is where our admissions happen."""
+    if not _IS_DARWIN:
+        return 1
     global _PRESSURE_MIB
     lc = _lc()
     out = ctypes.c_int(0)
@@ -256,21 +343,51 @@ class SpineCache:
         gb = os.environ.get("K3_SPINE_CACHE_GB")
         self.auto = os.environ.get("K3_SPINE_CACHE_AUTO", "0") == "1"
         if gb is not None and gb != "":
-            self.ceiling = float(gb) * 1e9
-            self.capability_fingerprint = None
+            requested_ceiling = max(0.0, float(gb) * 1e9)
+            if _IS_LINUX:
+                memory = runtime_platform.linux_memory_limits()
+                safe_ceiling = runtime_platform.safe_linux_host_budget(
+                    memory, int(self.floor + self.file_reserve)
+                )
+                self.ceiling = min(requested_ceiling, safe_ceiling)
+                self.capability_fingerprint = (
+                    f"linux:{memory.effective_total_bytes}:"
+                    f"{memory.cgroup_limit_bytes or 0}"
+                )
+                if self.ceiling < requested_ceiling:
+                    self.log(
+                        f"[spine-cache] clamped requested "
+                        f"{requested_ceiling/1e9:.1f} GB to "
+                        f"{self.ceiling/1e9:.1f} GB for host/cgroup headroom"
+                    )
+            else:
+                self.ceiling = requested_ceiling
+                self.capability_fingerprint = None
         else:
             # AUTO is an explicit experiment opt-in, but its size still comes
             # from capabilities rather than a chip/RAM product-name table.
-            caps = apple_silicon.snapshot()
-            self.ceiling = (
-                caps.safe_unified_budget(
-                    host_reserve_bytes=int(self.floor + self.file_reserve),
-                    device_reserve_bytes=int(self.floor),
+            if self.auto and _IS_LINUX:
+                memory = runtime_platform.linux_memory_limits()
+                self.ceiling = runtime_platform.safe_linux_host_budget(
+                    memory, int(self.floor + self.file_reserve)
                 )
-                if self.auto
-                else 0.0
-            )
-            self.capability_fingerprint = caps.fingerprint() if self.auto else None
+                self.capability_fingerprint = (
+                    f"linux:{memory.effective_total_bytes}:"
+                    f"{memory.cgroup_limit_bytes or 0}"
+                )
+            else:
+                caps = apple_silicon.snapshot()
+                self.ceiling = (
+                    caps.safe_unified_budget(
+                        host_reserve_bytes=int(self.floor + self.file_reserve),
+                        device_reserve_bytes=int(self.floor),
+                    )
+                    if self.auto
+                    else 0.0
+                )
+                self.capability_fingerprint = (
+                    caps.fingerprint() if self.auto else None
+                )
         self.wd = (Watchdog(self.floor, self.tol, self.file_reserve)
                    if self.enabled else None)
         self.d = {}
@@ -325,7 +442,7 @@ class SpineCache:
                              f"{self.bytes/1e9:.1f} GB")
                 self.frozen = True          # a static ceiling never reopens
                 return False
-            if self.auto and not self.wd.room_for(nbytes):
+            if (self.auto or _IS_LINUX) and not self.wd.room_for(nbytes):
                 # NOT a latch. Headroom is a moving target -- `free` collapses
                 # while the page cache warms up and recovers as clean pages age
                 # out -- so a transient dip must not disable the cache for the
