@@ -81,8 +81,8 @@ def load_native_library(
         raise NativeLibraryError(
             "this Linux x86-64 CPU is missing native-kernel requirements "
             f"{', '.join(missing_features)}. The current library targets "
-            "x86-64-v3; use compatible hardware or rebuild a safe kernel for "
-            "this CPU"
+            "an AVX/FMA3/SSSE3 baseline and selects AVX2 only at runtime; "
+            "use compatible hardware or rebuild a safe kernel for this CPU"
         )
 
     factory = ctypes.CDLL if cdll_factory is None else cdll_factory
@@ -132,22 +132,40 @@ def import_when_enabled(
 _CUDA_SPEC = re.compile(r"cuda(?::(\d+))?\Z")
 
 
+def normalize_requested_device(requested: str | None) -> str | None:
+    """Validate device syntax before probing any accelerator runtime."""
+    if requested is None or not requested.strip():
+        return None
+    value = requested.strip().lower()
+    if value in ("cpu", "mps") or _CUDA_SPEC.fullmatch(value):
+        return value
+    raise ValueError(
+        "K3_DEV must be cpu, mps, cuda, or cuda:N"
+    )
+
+
 def choose_device_spec(
     requested: str | None,
     *,
     mps_available: bool,
     cuda_available: bool,
     cuda_device_count: int = 0,
+    auto_cuda_index: int = 0,
 ) -> str:
     """Resolve K3_DEV, validating explicit requests before torch sees them."""
-    if requested is None or not requested.strip():
+    value = normalize_requested_device(requested)
+    if value is None:
         if mps_available:
             return "mps"
         if cuda_available and cuda_device_count > 0:
-            return "cuda"
+            if not 0 <= auto_cuda_index < cuda_device_count:
+                raise ValueError(
+                    f"automatic CUDA index {auto_cuda_index} is outside "
+                    f"{cuda_device_count} visible device(s)"
+                )
+            return "cuda" if auto_cuda_index == 0 else f"cuda:{auto_cuda_index}"
         return "cpu"
 
-    value = requested.strip().lower()
     if value == "cpu":
         return value
     if value == "mps":
@@ -194,6 +212,184 @@ def choose_moe_backend(requested: str | None, device_type: str) -> str:
     return value
 
 
+def _path_ancestors(base: str, root: str) -> list[str]:
+    """Return base through root without permitting a cgroup-root escape."""
+    base = os.path.abspath(base)
+    root = os.path.abspath(root)
+    if base != root and not base.startswith(root + os.sep):
+        return []
+    out = []
+    current = base
+    while True:
+        out.append(current)
+        if current == root:
+            break
+        parent = os.path.dirname(current)
+        if parent == current or (
+            parent != root and not parent.startswith(root + os.sep)
+        ):
+            break
+        current = parent
+    return out
+
+
+def _cgroup_cpu_paths(
+    cgroup_text: str | None, cgroup_root: str
+) -> list[tuple[str, str | None]]:
+    """Return leaf-to-root cgroup-v2/v1 CPU quota file candidates."""
+    out: list[tuple[str, str | None]] = []
+    declared = False
+    for line in (cgroup_text or "").splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hierarchy, controllers, group = parts
+        if hierarchy == "0" and controllers == "":
+            declared = True
+            base = _safe_cgroup_path(cgroup_root, group)
+            if base is not None:
+                for candidate in _path_ancestors(base, cgroup_root):
+                    out.append((os.path.join(candidate, "cpu.max"), None))
+            continue
+
+        controller_names = controllers.split(",")
+        if "cpu" not in controller_names:
+            continue
+        declared = True
+        # The v1 CPU controller is commonly mounted as "cpu", but systemd and
+        # older distributions also expose combined cpu,cpuacct mount names.
+        mount_names = (
+            "cpu",
+            controllers,
+            ",".join(reversed(controller_names)),
+        )
+        for mount_name in dict.fromkeys(mount_names):
+            root = os.path.join(cgroup_root, mount_name)
+            base = _safe_cgroup_path(root, group)
+            if base is None:
+                continue
+            for candidate in _path_ancestors(base, root):
+                out.append((
+                    os.path.join(candidate, "cpu.cfs_quota_us"),
+                    os.path.join(candidate, "cpu.cfs_period_us"),
+                ))
+
+    if not declared:
+        # Useful in restricted cgroup namespaces whose /proc/self/cgroup is
+        # absent, while missing files remain equivalent to "no quota found".
+        out.extend((
+            (os.path.join(cgroup_root, "cpu.max"), None),
+            (
+                os.path.join(cgroup_root, "cpu", "cpu.cfs_quota_us"),
+                os.path.join(cgroup_root, "cpu", "cpu.cfs_period_us"),
+            ),
+        ))
+    return list(dict.fromkeys(out))
+
+
+def linux_cpu_quota_count(
+    *,
+    self_cgroup_path: str = "/proc/self/cgroup",
+    cgroup_root: str = "/sys/fs/cgroup",
+) -> int | None:
+    """Return the effective Linux cgroup CPU quota rounded up to workers.
+
+    Every finite leaf or ancestor quota is considered. A fractional quota such
+    as 1.5 CPUs permits two workers; affinity is applied separately by
+    :func:`available_cpu_count`.
+    """
+    cgroup_text = _read_text(self_cgroup_path)
+    limits = []
+    for quota_path, period_path in _cgroup_cpu_paths(
+        cgroup_text, cgroup_root
+    ):
+        raw_quota = _read_text(quota_path)
+        if raw_quota is None:
+            continue
+        if period_path is None:
+            fields = raw_quota.split()
+            if len(fields) != 2 or fields[0] == "max":
+                continue
+            quota = _positive_int(fields[0])
+            period = _positive_int(fields[1])
+        else:
+            quota = _positive_int(raw_quota)
+            period = _positive_int(_read_text(period_path))
+        if quota is None or period is None:
+            # cgroup v1 uses -1 for unlimited; malformed/unknown constraints
+            # must not silently force every non-container host to one worker.
+            continue
+        limits.append(max(1, (quota + period - 1) // period))
+    return min(limits) if limits else None
+
+
+def available_cpu_count(
+    *,
+    platform: str | None = None,
+    cpu_count: int | None = None,
+    affinity_getter: Callable[[int], Iterable[int]] | None = None,
+    self_cgroup_path: str = "/proc/self/cgroup",
+    cgroup_root: str = "/sys/fs/cgroup",
+) -> int:
+    """Return effective CPUs after affinity and Linux cgroup quota limits."""
+    platform = sys.platform if platform is None else platform
+    count = max(1, cpu_count if cpu_count is not None else (os.cpu_count() or 1))
+    get_affinity = (
+        getattr(os, "sched_getaffinity", None)
+        if affinity_getter is None else affinity_getter
+    )
+    if get_affinity is not None:
+        try:
+            affinity_count = len(get_affinity(0))
+            if affinity_count > 0:
+                count = min(count, affinity_count)
+        except (OSError, TypeError):
+            pass
+    if platform.startswith("linux"):
+        quota_count = linux_cpu_quota_count(
+            self_cgroup_path=self_cgroup_path,
+            cgroup_root=cgroup_root,
+        )
+        if quota_count is not None:
+            count = min(count, quota_count)
+    return max(1, count)
+
+
+def configured_cpu_workers(env_var: str, measured_default: int) -> int:
+    """Return an explicit override or an availability-bounded default.
+
+    This is a safety bound, not an assertion that CPU count determines the
+    optimal storage or compute worker width on every host.
+    """
+    if env_var in os.environ:
+        raw = os.environ[env_var]
+        try:
+            workers = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{env_var} must be a positive integer") from exc
+        if workers < 1:
+            raise ValueError(f"{env_var} must be a positive integer")
+        return workers
+    return min(max(1, int(measured_default)), available_cpu_count())
+
+
+def default_gemv_threads(
+    platform: str | None = None,
+    cpu_count: int | None = None,
+) -> int:
+    """Choose a conservative native-MXFP4 worker width.
+
+    Four remains the measured macOS default. Linux uses up to eight available
+    CPUs: the contributor's real EPYC sweep peaked at eight threads, while
+    larger widths were already memory-bandwidth limited. K3_GEMV_THREADS always
+    overrides this heuristic, and the native entry points retain hard bounds.
+    """
+    platform = sys.platform if platform is None else platform
+    cpus = available_cpu_count() if cpu_count is None else max(1, cpu_count)
+    target = 8 if platform.startswith("linux") else 4
+    return min(target, cpus)
+
+
 def darwin_file_hints_enabled(
     requested: bool, platform: str | None = None
 ) -> bool:
@@ -202,26 +398,14 @@ def darwin_file_hints_enabled(
     return bool(requested and platform == "darwin")
 
 
-# GCC/Clang's -march=x86-64-v3 contract. Linux calls SSE3 "pni" on many
-# kernels and exposes LZCNT as either "abm" or "lzcnt", so those two features
-# use aliases. AVX is only advertised when the OS has enabled the XSAVE state.
-_X86_64_V3_FEATURES = {
+# Exact instructions used by the 128-bit compatibility kernel. Linux calls
+# SSE3 "pni" on many kernels. AVX is only advertised when the OS has enabled
+# the extended register state, so it also serves as the OS-state gate.
+_X86_64_BASE_FEATURES = {
     "avx": frozenset(("avx",)),
-    "avx2": frozenset(("avx2",)),
-    "bmi1": frozenset(("bmi1",)),
-    "bmi2": frozenset(("bmi2",)),
-    "cx16": frozenset(("cx16",)),
-    "f16c": frozenset(("f16c",)),
     "fma": frozenset(("fma",)),
-    "lahf_lm": frozenset(("lahf_lm",)),
-    "lzcnt": frozenset(("abm", "lzcnt")),
-    "movbe": frozenset(("movbe",)),
-    "popcnt": frozenset(("popcnt",)),
     "sse3": frozenset(("pni", "sse3")),
-    "sse4_1": frozenset(("sse4_1",)),
-    "sse4_2": frozenset(("sse4_2",)),
     "ssse3": frozenset(("ssse3",)),
-    "xsave": frozenset(("xsave",)),
 }
 
 
@@ -247,7 +431,7 @@ def missing_native_cpu_features(
     machine: str | None = None,
     cpuinfo_path: str = "/proc/cpuinfo",
 ) -> tuple[str, ...]:
-    """Return required x86-64-v3 kernel features absent on this Linux host."""
+    """Return required x86 baseline features absent on this Linux host."""
     platform = sys.platform if platform is None else platform
     machine = host_platform.machine() if machine is None else machine
     if (not platform.startswith("linux")
@@ -255,7 +439,7 @@ def missing_native_cpu_features(
         return ()
     flags = linux_cpu_flags(cpuinfo_path)
     return tuple(sorted(
-        name for name, aliases in _X86_64_V3_FEATURES.items()
+        name for name, aliases in _X86_64_BASE_FEATURES.items()
         if flags.isdisjoint(aliases)
     ))
 

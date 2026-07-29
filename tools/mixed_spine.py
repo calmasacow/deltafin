@@ -26,11 +26,14 @@ import concurrent.futures as _cf
 import torch
 
 import spine_codec
+import runtime_platform
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIXED_DIR = os.environ.get("K3_MIXED_DIR") or os.path.join(ROOT, "k3-resident-mixed/tensors")
 _META_PATH = os.path.join(os.path.dirname(MIXED_DIR.rstrip("/")), "meta.json")
-READ_THREADS = int(os.environ.get("K3_SPINE_READ_THREADS", "4"))
+READ_THREADS = runtime_platform.configured_cpu_workers(
+    "K3_SPINE_READ_THREADS", 4
+)
 DEQ = os.environ.get("K3_SPINE_DEQ", "metal")        # metal | torch
 ALIGN = 256
 
@@ -267,6 +270,11 @@ def _stage_buf(slot, n, dev, dtype):
     return b[:n]
 
 
+def _cpu_direct_views(dev):
+    """CPU consumes packed read buffers synchronously; all else stages."""
+    return getattr(dev, "type", None) == "cpu"
+
+
 PHASE = {"read_s": 0.0, "read_bytes": 0, "h2d_s": 0.0, "h2d_bytes": 0,
          "deq_s": 0.0, "other_s": 0.0, "n_layers": 0,
          "bytes_by_codec": {"i4": 0, "i6": 0, "i8": 0}}
@@ -375,20 +383,31 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
     g = lay["g"]
     PHASE["n_layers"] += 1
     oplan = lay["oplan"]
+    direct_cpu = _cpu_direct_views(dev)
     t0 = _time.time()
     if items:
         qh = torch.frombuffer(pack["q"], dtype=torch.uint8)[:lay["qtotal"]]
         sh = torch.frombuffer(pack["sc"], dtype=torch.float16)[:lay["stotal"]]
-        qd = _stage_buf("q", lay["qtotal"], dev, torch.uint8)
-        sd = _stage_buf("sc", lay["stotal"], dev, torch.float16)
-        qd.copy_(qh)
-        sd.copy_(sh)
+        if direct_cpu:
+            qd, sd = qh, sh
+        else:
+            qd = _stage_buf("q", lay["qtotal"], dev, torch.uint8)
+            sd = _stage_buf("sc", lay["stotal"], dev, torch.float16)
+            qd.copy_(qh)
+            sd.copy_(sh)
     if oplan:
         oh = torch.frombuffer(pack["other"], dtype=torch.uint8)[:lay["ototal"]]
-        od = _stage_buf("other", lay["ototal"], dev, torch.uint8)
-        od.copy_(oh)
+        if direct_cpu:
+            od = oh
+        else:
+            od = _stage_buf("other", lay["ototal"], dev, torch.uint8)
+            od.copy_(oh)
     PHASE["h2d_s"] += _time.time() - t0
-    PHASE["h2d_bytes"] += lay["qtotal"] + lay["ototal"]
+    # Preserve this counter's established payload convention (q + bf16 tail,
+    # scales excluded), but direct CPU views perform no staging copy.
+    PHASE["h2d_bytes"] += (
+        0 if direct_cpu else lay["qtotal"] + lay["ototal"]
+    )
 
     t0 = _time.time()
     for name, full, codec, _base, shape, qoff, nb, soff, sb in items:

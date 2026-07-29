@@ -61,15 +61,22 @@ Three ways out; this file implements the first two.
 NUMERICS PARITY
 ---------------
 `fla/ops/kda/__init__.py` picks the CPU recurrence path only when
-`q.shape[1] <= 4 and K3_KDA_RECUR == "cpu"`.  Under the shipped default
-(K3_KDA_RECUR unset -> the shim's own default "mps") every T takes the same MPS
-path and there is nothing to reconcile.  But under K3_KDA_RECUR=cpu a T=1 or
+`q.shape[1] <= 4 and K3_KDA_RECUR == "cpu"`. Under the shipped default
+(K3_KDA_RECUR unset -> "device") every T stays on its selected device and there
+is nothing to reconcile. But under K3_KDA_RECUR=cpu an MPS T=1 or
 T=2 decode runs the recurrence on CPU while a T>=5 pass would silently switch
 to MPS -- different fp32 reduction order, so a near-tie token could flip and the
 "same tokens as K3_SPEC=0" guarantee would be lost.  K3_SPEC_RECUR_MATCH=1
 (default) therefore moves the recurrence inputs to CPU itself whenever that
 would have happened, reproducing the shim's CPU branch exactly (it also returns
 the state CPU-resident, as that branch does).
+
+The portable short-convolution path keeps cache state bit-identical and output
+inside a strict few-ulp gate for one T-position call versus T repeated
+one-position calls. It is automatic through T=9 on CPU and forceable elsewhere.
+Dense projections around it can also select shape-dependent floating-point
+reductions, so production gates compare emitted token IDs with fresh sequential
+controls rather than claiming every batched hidden tensor is byte-identical.
 
 FLAGS
 -----

@@ -6,12 +6,10 @@
 // token. This file keeps ONE persistent worker pool alive for the process lifetime and
 // exposes one dispatch per *phase* (2 per layer) instead of 48.
 //
-// Bit-exactness: this TU #includes fused_gemv.c verbatim (with NO_MAIN) and calls the
-// very same mxfp4_gemv_rows2() row loop. The TBL nibble expansion, the e8m0
-// exponent-add trick and the per-row fp32 accumulation order are therefore identical
-// by construction, not by reimplementation. Work is partitioned on 32-row boundaries,
-// so every row still takes the 2-row path exactly as run_gemv_mt() did; a row's value
-// does not depend on which thread or which chunk computed it.
+// Bit-exactness: this TU #includes fused_gemv.c verbatim (with NO_MAIN). ARM calls the
+// established mxfp4_gemv_rows2() loop. AVX2 builds call its exact 256-bit equivalent
+// after preparing each distinct activation once per whole dispatch. Work is partitioned
+// on 32-row boundaries, so a row's value does not depend on its worker or chunk.
 //
 // Build:
 //   clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4batch.dylib fused_gemv_batch.c -lpthread
@@ -48,9 +46,11 @@ typedef struct {
     const uint8_t *const *P;
     const uint8_t *const *S;
     const float   *const *X;
+    const float *XP[K3_MAX_MATS]; // AVX2-prepared activations, owned by batch scratch
     float        *const *Y;
     const int *rows, *cols;
     int n_mats;
+    int use_avx2;
     int cum[K3_MAX_MATS + 1];   // cum[m] = first unit index of matrix m
     // --- K3_JOB_SITU ---
     const float *gu;            // [n_ex][2][d_ff] interleaved gate,up
@@ -84,7 +84,74 @@ static pthread_cond_t  g_cv_work = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_cv_done = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_api     = PTHREAD_MUTEX_INITIALIZER;  // serializes dispatches
 
+#if MXFP4_CAN_BUILD_AVX2
+static float  *g_xscratch = NULL;
+static size_t  g_xscratch_n = 0;
+#endif
+static int g_last_x_permutations = 0;
+
 static inline void k3_pause(void) { mxfp4_cpu_relax(); }
+
+#if MXFP4_CAN_BUILD_AVX2
+// Prepare every distinct (pointer, length) only once.  Phase A normally maps 32
+// matrices to one x; phase B maps 16 matrices to 16 h vectors.  offsets are recorded
+// before a possible arena growth so no pointer into a replaced allocation can escape.
+static int k3_prepare_batch_x_avx2(
+        const float *const *xs, const int *cols, int n_mats) {
+    size_t offsets[K3_MAX_MATS];
+    size_t need = 0;
+    int unique = 0;
+    for (int m = 0; m < n_mats; m++) {
+        if (!xs[m] || cols[m] <= 0 || cols[m] % 32 != 0) return 0;
+        int prior = -1;
+        for (int k = 0; k < m; k++) {
+            if (xs[k] == xs[m] && cols[k] == cols[m]) {
+                prior = k;
+                break;
+            }
+        }
+        if (prior >= 0) {
+            offsets[m] = offsets[prior];
+            continue;
+        }
+        size_t width = (size_t)cols[m];
+        if (need > SIZE_MAX - width) return 0;
+        offsets[m] = need;
+        need += width;
+        unique++;
+    }
+    if (need > SIZE_MAX / sizeof(float)) return 0;
+    if (g_xscratch_n < need) {
+        size_t bytes = need * sizeof(float);
+        if (bytes > SIZE_MAX - 63) return 0;
+        size_t aligned_bytes = (bytes + 63) & ~(size_t)63;
+        float *grown = (float *)aligned_alloc(64, aligned_bytes);
+        if (!grown) return 0;
+        free(g_xscratch);
+        g_xscratch = grown;
+        g_xscratch_n = aligned_bytes / sizeof(float);
+    }
+    for (int m = 0; m < n_mats; m++) {
+        g_job.XP[m] = g_xscratch + offsets[m];
+        int prior = -1;
+        for (int k = 0; k < m; k++) {
+            if (offsets[k] == offsets[m]) {
+                prior = k;
+                break;
+            }
+        }
+        if (prior < 0
+                && !mxfp4_permute_x_avx2(xs[m], g_xscratch + offsets[m], cols[m]))
+            return 0;
+    }
+    g_last_x_permutations = unique;
+    return 1;
+}
+#endif
+
+int mxfp4_batch_last_x_permutations(void) {
+    return g_last_x_permutations;
+}
 
 // unit index -> (matrix, row range). n_mats is tiny (<=48 in practice) so a binary
 // search costs nothing next to 32 rows x 3584 cols of streaming work.
@@ -119,6 +186,14 @@ static void k3_run_units(void) {
         while ((u = atomic_fetch_add_explicit(&g_cursor, 1, memory_order_relaxed)) < n) {
             int m, r0, r1;
             k3_unit_gemv(j, u, &m, &r0, &r1);
+#if MXFP4_CAN_BUILD_AVX2
+            if (j->use_avx2) {
+                mxfp4_gemv_rows2_avx2_prepared(
+                    j->P[m], j->S[m], j->XP[m], j->Y[m],
+                    r0, r1, j->cols[m]);
+                continue;
+            }
+#endif
             mxfp4_gemv_rows2(j->P[m], j->S[m], j->X[m], j->Y[m], r0, r1, j->cols[m]);
         }
     } else {
@@ -215,6 +290,12 @@ int mxfp4_pool_init(int nthreads) {
 void mxfp4_pool_shutdown(void) {
     pthread_mutex_lock(&g_api);
     k3_pool_stop_locked();
+#if MXFP4_CAN_BUILD_AVX2
+    free(g_xscratch);
+    g_xscratch = NULL;
+    g_xscratch_n = 0;
+#endif
+    g_last_x_permutations = 0;
     pthread_mutex_unlock(&g_api);
 }
 
@@ -276,6 +357,12 @@ void mxfp4_gemv_batch(const uint8_t *const *packed, const uint8_t *const *scales
     g_job.kind = K3_JOB_GEMV;
     g_job.P = packed; g_job.S = scales; g_job.X = xs; g_job.Y = ys;
     g_job.rows = rows; g_job.cols = cols; g_job.n_mats = n_mats;
+    g_job.use_avx2 = 0;
+    g_last_x_permutations = 0;
+#if MXFP4_CAN_BUILD_AVX2
+    if (mxfp4_have_avx2())
+        g_job.use_avx2 = k3_prepare_batch_x_avx2(xs, cols, n_mats);
+#endif
     int c = 0;
     for (int m = 0; m < n_mats; m++) {
         g_job.cum[m] = c;

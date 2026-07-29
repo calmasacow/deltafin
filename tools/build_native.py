@@ -31,23 +31,11 @@ TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
 NATIVE_ABI_VERSION = 1
 METAL_SHAPES = (3584, 3072, 17_547_264)
-X86_64_V3_FEATURES = {
+X86_64_BASE_FEATURES = {
     "avx": frozenset(("avx",)),
-    "avx2": frozenset(("avx2",)),
-    "bmi1": frozenset(("bmi1",)),
-    "bmi2": frozenset(("bmi2",)),
-    "cx16": frozenset(("cx16",)),
-    "f16c": frozenset(("f16c",)),
     "fma": frozenset(("fma",)),
-    "lahf_lm": frozenset(("lahf_lm",)),
-    "lzcnt": frozenset(("abm", "lzcnt")),
-    "movbe": frozenset(("movbe",)),
-    "popcnt": frozenset(("popcnt",)),
     "sse3": frozenset(("pni", "sse3")),
-    "sse4_1": frozenset(("sse4_1",)),
-    "sse4_2": frozenset(("sse4_2",)),
     "ssse3": frozenset(("ssse3",)),
-    "xsave": frozenset(("xsave",)),
 }
 
 
@@ -78,13 +66,25 @@ class Artifact:
 GEMV_SYMBOLS = (
     "mxfp4_gemv",
     "mxfp4_gemv_mt",
+    "mxfp4_gemv_compat",
+    "mxfp4_gemv_mt_compat",
+    "mxfp4_have_avx2",
     "mxfp4_expert_triple",
+)
+
+X86_AVX2_SYMBOLS = (
+    "mxfp4_gemv_avx2",
+    "mxfp4_gemv_mt_avx2",
 )
 
 BATCH_SYMBOLS = (
     "mxfp4_gemv",
     "mxfp4_gemv_mt",
+    "mxfp4_gemv_compat",
+    "mxfp4_gemv_mt_compat",
+    "mxfp4_have_avx2",
     "mxfp4_gemv_batch",
+    "mxfp4_batch_last_x_permutations",
     "mxfp4_moe_layer",
     "mxfp4_situ_batch",
     "mxfp4_moe_expert_set",
@@ -128,7 +128,18 @@ def detect_target(
     if platform_name.startswith("linux"):
         if normalized in {"x86_64", "amd64"}:
             return Target(
-                "linux", "x86_64", ".so", ("-march=x86-64-v3",), False
+                "linux",
+                "x86_64",
+                ".so",
+                (
+                    "-march=x86-64",
+                    "-mtune=native",
+                    "-msse3",
+                    "-mssse3",
+                    "-mavx",
+                    "-mfma",
+                ),
+                False,
             )
         if normalized in {"arm64", "aarch64"}:
             return Target("linux", "aarch64", ".so", ("-mcpu=native",), False)
@@ -169,19 +180,20 @@ def preflight_target(
     *,
     cpu_flags: frozenset[str] | set[str] | None = None,
 ) -> None:
-    """Reject an x86 host that cannot execute the x86-64-v3 kernel."""
+    """Reject an x86 host that cannot execute the exact baseline kernel."""
     if target.platform != "linux" or target.machine != "x86_64":
         return
     observed = read_linux_cpu_flags() if cpu_flags is None else frozenset(cpu_flags)
     missing = sorted(
-        name for name, aliases in X86_64_V3_FEATURES.items()
+        name for name, aliases in X86_64_BASE_FEATURES.items()
         if observed.isdisjoint(aliases)
     )
     if missing:
         raise BuildError(
-            "this Linux x86-64 CPU cannot run Deltafin's x86-64-v3 kernel; "
+            "this Linux x86-64 CPU cannot run Deltafin's baseline "
+            "AVX/FMA3/SSSE3 kernel; "
             f"missing CPU flags: {', '.join(missing)} "
-            "(the binary is compiled with -march=x86-64-v3)"
+            "(AVX2 is optional and selected at runtime)"
         )
 
 
@@ -193,13 +205,14 @@ def artifacts_for(
 ) -> list[Artifact]:
     """Describe every output requested for one target."""
     tools_dir = tools_dir.resolve()
+    x86_symbols = X86_AVX2_SYMBOLS if target.machine == "x86_64" else ()
     artifacts = [
         Artifact(
             "MXFP4 GEMV",
             tools_dir / "fused_gemv.c",
             tools_dir / f"libmxfp4gemv{target.suffix}",
             "c",
-            GEMV_SYMBOLS,
+            (*GEMV_SYMBOLS, *x86_symbols),
             abi_version=NATIVE_ABI_VERSION,
         ),
         Artifact(
@@ -207,7 +220,7 @@ def artifacts_for(
             tools_dir / "fused_gemv_batch.c",
             tools_dir / f"libmxfp4batch{target.suffix}",
             "c",
-            BATCH_SYMBOLS,
+            (*BATCH_SYMBOLS, *x86_symbols),
             abi_version=NATIVE_ABI_VERSION,
         ),
     ]

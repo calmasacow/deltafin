@@ -18,15 +18,26 @@ Interface mirrors fast_moe: expert_ffn(raw, x), moe_infer_fast(x, ids, w, raw_ex
 """
 import ctypes
 import os
+import platform
 import threading
 
 import numpy as np
 import torch
 
 try:
-    from runtime_platform import load_native_library
+    import routing_record as routing_records
+    from runtime_platform import (
+        configured_cpu_workers,
+        default_gemv_threads,
+        load_native_library,
+    )
 except ImportError:  # imported as tools.fast_moe_batch instead of top-level
-    from .runtime_platform import load_native_library
+    from . import routing_record as routing_records
+    from .runtime_platform import (
+        configured_cpu_workers,
+        default_gemv_threads,
+        load_native_library,
+    )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REQUIRED_SYMBOLS = (
@@ -67,12 +78,28 @@ _LIB.mxfp4_pool_threads.argtypes = []
 _LIB.mxfp4_pool_threads.restype = ctypes.c_int
 _LIB.mxfp4_pool_shutdown.argtypes = []
 _LIB.mxfp4_pool_shutdown.restype = None
+_HAVE_AVX2 = getattr(_LIB, "mxfp4_have_avx2", None)
+if _HAVE_AVX2 is not None:
+    _HAVE_AVX2.argtypes = []
+    _HAVE_AVX2.restype = ctypes.c_int
 
-THREADS = int(os.environ.get("K3_GEMV_THREADS", "4"))
+THREADS = configured_cpu_workers("K3_GEMV_THREADS", default_gemv_threads())
 SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0
 
 _POOL_READY = False
 _CALL_LOCK = threading.RLock()
+
+
+def native_isa():
+    """Describe the selected native CPU kernel without requiring a new-library ABI."""
+    if _HAVE_AVX2 is not None and _HAVE_AVX2():
+        return "avx2/fma"
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "neon"
+    if machine in {"x86_64", "amd64"}:
+        return "ssse3/fma"
+    return machine or "unknown"
 
 
 def pool_init(nthreads=None):
@@ -158,6 +185,32 @@ def _situ(gate, up):
     return a * (SITU_LINEAR_BETA * np.tanh(up / SITU_LINEAR_BETA))
 
 
+def _situ_inplace(gate, up, scratch):
+    """Evaluate SiTU in place with the exact numpy expression order.
+
+    ``gate`` and ``up`` are disposable GEMV outputs.  ``scratch`` is equally
+    sized storage whose previous contents are disposable.  The returned array
+    aliases ``gate``; this removes the activation's full-size result and
+    transient arrays without changing the sequence of fp32 ufuncs.
+    """
+    # Form the numerator first, exactly like the historical expression, while
+    # retaining the original gate values for the denominator.
+    np.divide(gate, SITU_BETA, out=scratch)
+    np.tanh(scratch, out=scratch)
+    np.multiply(scratch, SITU_BETA, out=scratch)
+
+    np.negative(gate, out=gate)
+    np.exp(gate, out=gate)
+    np.add(gate, 1.0, out=gate)
+    np.divide(scratch, gate, out=gate)
+
+    np.divide(up, SITU_LINEAR_BETA, out=up)
+    np.tanh(up, out=up)
+    np.multiply(up, SITU_LINEAR_BETA, out=up)
+    np.multiply(gate, up, out=gate)
+    return gate
+
+
 # --------------------------------------------------------------- expert set (bit-exact)
 def expert_set_ffn(raws, x, nthreads=None):
     """raws: list of {w1|w2|w3: (packed, scale)}; x: fp32 [d_model] contiguous.
@@ -180,9 +233,18 @@ def expert_set_ffn(raws, x, nthreads=None):
         mats.append((p3, s3, x, gu[1, e]))
     gemv_batch(mats, nthreads)
 
-    h = np.ascontiguousarray(_situ(gu[0], gu[1]), dtype=np.float32)
-
+    # Allocate the phase-B destination before activation.  K3's d_model is
+    # wider than d_ff, so its unused prefix is a contiguous activation
+    # scratch arena.  Keep a shape-generic fallback for other checkpoints.
     yb = np.empty((ne, d_model), dtype=np.float32)
+    gate = gu[0]
+    scratch_elems = gate.size
+    if yb.size >= scratch_elems:
+        scratch = yb.reshape(-1)[:scratch_elems].reshape(gate.shape)
+    else:
+        scratch = np.empty_like(gate)
+    h = _situ_inplace(gate, gu[1], scratch)
+
     mats = []
     for e, r in enumerate(raws):
         p2, s2 = r["w2"]
@@ -196,34 +258,44 @@ def expert_ffn(raw, x, nthreads=None):
     return expert_set_ffn([raw], x, nthreads)[0]
 
 
-def moe_infer_fast(x, topk_ids, topk_weight, raw_experts, nthreads=None):
+def moe_infer_fast(
+        x, topk_ids, topk_weight, raw_experts, nthreads=None,
+        routing_record=None):
     """x: torch [N, d_model] fp32; returns torch [N, d_model] fp32.
-    Same contract and same numerics as fast_moe.moe_infer_fast."""
+    Same contract and same numerics as fast_moe.moe_infer_fast.
+    ``routing_record`` is optional and follows ``nthreads`` so existing
+    positional callers remain compatible."""
     xnp = np.ascontiguousarray(x.detach().to("cpu", torch.float32).numpy())
     N = xnp.shape[0]
     out = np.zeros((N, xnp.shape[1]), dtype=np.float32)
-    ids = topk_ids.tolist()
-    ws = topk_weight.to(torch.float32).tolist()
+    ids, ws = routing_records.resolve(
+        topk_ids, topk_weight, routing_record)
     for t in range(N):
         xt = np.ascontiguousarray(xnp[t])
         sel = ids[t]
         yb = expert_set_ffn([raw_experts[e] for e in sel], xt, nthreads)
         for i, w in enumerate(ws[t]):
-            out[t] += np.float32(w) * yb[i]
+            # ``yb`` is dead after this combine. Scale each row in place so
+            # top-k routing does not allocate one d_model temporary per expert.
+            np.multiply(yb[i], np.float32(w), out=yb[i])
+            np.add(out[t], yb[i], out=out[t])
     return torch.from_numpy(out).to(x.device, x.dtype)
 
 
 # --------------------------------------------------------------- one-call variant (opt-in)
-def moe_infer_fused(x, topk_ids, topk_weight, raw_experts, nthreads=None):
+def moe_infer_fused(
+        x, topk_ids, topk_weight, raw_experts, nthreads=None,
+        routing_record=None):
     """Same result, but SiTU and the weighted combine run inside C: ONE ctypes call
     per token per layer instead of two. NOT bit-exact vs numpy — libm tanhf/expf differ
     from numpy's vectorized transcendentals by ~1 ulp. Kept behind its own name so the
-    bit-exact path stays the default."""
+    bit-exact path stays the default. The optional shared route follows
+    ``nthreads`` to preserve legacy positional calls."""
     xnp = np.ascontiguousarray(x.detach().to("cpu", torch.float32).numpy())
     N, d_model = xnp.shape
     out = np.zeros((N, d_model), dtype=np.float32)
-    ids = topk_ids.tolist()
-    ws = topk_weight.to(torch.float32).tolist()
+    ids, ws = routing_records.resolve(
+        topk_ids, topk_weight, routing_record)
     nt = THREADS if nthreads is None else nthreads
     for t in range(N):
         xt = np.ascontiguousarray(xnp[t])

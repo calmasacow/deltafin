@@ -23,7 +23,7 @@ NL = config.num_hidden_layers
 
 import attn_fast                                   # noqa: E402
 attn_fast.install(ml)
-print("[attn_fast]", attn_fast.describe(), flush=True)
+print("[attn_fast]", attn_fast.describe(DEV), flush=True)
 
 
 def set_param(root, dotted, tensor):

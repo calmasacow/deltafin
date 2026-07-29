@@ -37,8 +37,10 @@ import numpy as np
 
 try:
     from cache_writer import AsyncCacheWriter, atomic_publish
+    import runtime_platform
 except ImportError:  # imported as tools.fetch_v2 instead of a top-level module
     from .cache_writer import AsyncCacheWriter, atomic_publish
+    from . import runtime_platform
 
 ROOT = os.environ.get("DELTAFIN_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INV_PATH = os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")
@@ -78,7 +80,9 @@ EXPERT_READ = os.environ.get("K3_EXPERT_READ", "pread")
 # Real F_NOCACHE grid on the 8 TB M1 Max SSD: 8 workers sustained 7.51
 # logical GB/s versus 6.91/6.69/6.91 for 4/6/12.  Keep the env override: newer
 # chips and different SSD widths must rerun tools/bench_expert_io_grid.py.
-PREAD_WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "8"))
+PREAD_WORKERS = runtime_platform.configured_cpu_workers(
+    "K3_PREAD_WORKERS", 8
+)
 _IS_DARWIN = sys.platform == "darwin"
 _IS_LINUX = sys.platform.startswith("linux")
 

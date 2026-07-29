@@ -9,8 +9,9 @@
 //   clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4gemv.dylib fused_gemv.c -lpthread
 // Linux aarch64:
 //   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
-// Linux x86-64 (SSSE3 + FMA3):
-//   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
+// Linux x86-64 (runtime AVX2 dispatch, exact AVX/FMA3/SSSE3 baseline):
+//   cc -O3 -march=x86-64 -mtune=native -msse3 -mssse3 -mavx -mfma \
+//      -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
 
 #if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -49,6 +50,19 @@
 #else
 #define MXFP4_HAVE_CBLAS 0
 #endif
+#endif
+
+// x86 builds deliberately keep AVX2 inside target-attributed functions.  The
+// rest of the shared object needs only the exact 128-bit compatibility ISA, so
+// one binary can run on pre-AVX2 FMA hosts and select AVX2 at runtime.  This
+// requires GCC/Clang, which are also the compilers supported by build_native.py.
+#if defined(MXFP4_ARCH_X86_64) \
+        && (defined(__GNUC__) || defined(__clang__))
+#define MXFP4_CAN_BUILD_AVX2 1
+#define MXFP4_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#else
+#define MXFP4_CAN_BUILD_AVX2 0
+#define MXFP4_TARGET_AVX2
 #endif
 
 // Keep Darwin's latency-sensitive scheduling policy.  These APIs do not exist on
@@ -111,9 +125,112 @@ uint32_t mxfp4_abi_version(void) {
 }
 
 // ---------------- shared tables ----------------
-// fp32 bit patterns of e2m1 values occupy only the top 16 bits; halfword tables.
-// Scale folds in as an integer add of (s-127)<<7 to the halfword (exponent field),
-// masked so +/-0 stay zero. Valid while fp32 exponent stays in [1,254] (real data 112..122).
+// fp32 bit patterns of E2M1 values occupy only the top 16 bits. Applying an
+// E8M0 scale is integer addition of (scale-127)<<7 to that halfword, masked so
+// +/-0 remain zero. The old hot loop synthesized the same 32 table bytes for
+// every weight group. The exact 8 KiB lookup below moves that work to .rodata.
+//
+// MXFP4_USE_SCALE_LUT=0 retains the original synthesis implementation as a
+// compile-time correctness oracle. It is deliberately not a runtime branch.
+#ifndef MXFP4_USE_SCALE_LUT
+#define MXFP4_USE_SCALE_LUT 1
+#endif
+
+#if MXFP4_USE_SCALE_LUT
+typedef struct __attribute__((aligned(32))) {
+    uint8_t lo[16];
+    uint8_t hi[16];
+} mxfp4_scale_lut_row_t;
+
+// Every expression is an integer constant expression. Conversion to uint16_t
+// is defined modulo 2^16, including scales below 127, and the final cast
+// reproduces vaddq_u16/_mm256_add_epi16 wraparound for all 256 input bytes.
+#define MXFP4_SCALE_DELTA_CONST(s) \
+    ((uint16_t)(((int)(s) - 127) * 128))
+#define MXFP4_SCALE_BITS_CONST(s, base, mask) \
+    ((uint16_t)((uint16_t)(base) \
+        + (uint16_t)(MXFP4_SCALE_DELTA_CONST(s) & (uint16_t)(mask))))
+#define MXFP4_SCALE_LO_CONST(s, base, mask) \
+    ((uint8_t)MXFP4_SCALE_BITS_CONST(s, base, mask))
+#define MXFP4_SCALE_HI_CONST(s, base, mask) \
+    ((uint8_t)(MXFP4_SCALE_BITS_CONST(s, base, mask) >> 8))
+#define MXFP4_SCALE_LUT_ROW(s) { \
+    { \
+        MXFP4_SCALE_LO_CONST(s, 0x0000, 0x0000), \
+        MXFP4_SCALE_LO_CONST(s, 0x3F00, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x3F80, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x3FC0, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x4000, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x4040, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x4080, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x40C0, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0x8000, 0x0000), \
+        MXFP4_SCALE_LO_CONST(s, 0xBF00, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0xBF80, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0xBFC0, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0xC000, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0xC040, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0xC080, 0xFFFF), \
+        MXFP4_SCALE_LO_CONST(s, 0xC0C0, 0xFFFF) \
+    }, { \
+        MXFP4_SCALE_HI_CONST(s, 0x0000, 0x0000), \
+        MXFP4_SCALE_HI_CONST(s, 0x3F00, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x3F80, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x3FC0, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x4000, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x4040, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x4080, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x40C0, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0x8000, 0x0000), \
+        MXFP4_SCALE_HI_CONST(s, 0xBF00, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0xBF80, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0xBFC0, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0xC000, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0xC040, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0xC080, 0xFFFF), \
+        MXFP4_SCALE_HI_CONST(s, 0xC0C0, 0xFFFF) \
+    } \
+}
+#define MXFP4_SCALE_LUT_ROWS_16(s) \
+    MXFP4_SCALE_LUT_ROW((s) + 0),  MXFP4_SCALE_LUT_ROW((s) + 1), \
+    MXFP4_SCALE_LUT_ROW((s) + 2),  MXFP4_SCALE_LUT_ROW((s) + 3), \
+    MXFP4_SCALE_LUT_ROW((s) + 4),  MXFP4_SCALE_LUT_ROW((s) + 5), \
+    MXFP4_SCALE_LUT_ROW((s) + 6),  MXFP4_SCALE_LUT_ROW((s) + 7), \
+    MXFP4_SCALE_LUT_ROW((s) + 8),  MXFP4_SCALE_LUT_ROW((s) + 9), \
+    MXFP4_SCALE_LUT_ROW((s) + 10), MXFP4_SCALE_LUT_ROW((s) + 11), \
+    MXFP4_SCALE_LUT_ROW((s) + 12), MXFP4_SCALE_LUT_ROW((s) + 13), \
+    MXFP4_SCALE_LUT_ROW((s) + 14), MXFP4_SCALE_LUT_ROW((s) + 15)
+
+static const mxfp4_scale_lut_row_t mxfp4_scale_lut[256]
+        __attribute__((aligned(64))) = {
+    MXFP4_SCALE_LUT_ROWS_16(0),
+    MXFP4_SCALE_LUT_ROWS_16(16),
+    MXFP4_SCALE_LUT_ROWS_16(32),
+    MXFP4_SCALE_LUT_ROWS_16(48),
+    MXFP4_SCALE_LUT_ROWS_16(64),
+    MXFP4_SCALE_LUT_ROWS_16(80),
+    MXFP4_SCALE_LUT_ROWS_16(96),
+    MXFP4_SCALE_LUT_ROWS_16(112),
+    MXFP4_SCALE_LUT_ROWS_16(128),
+    MXFP4_SCALE_LUT_ROWS_16(144),
+    MXFP4_SCALE_LUT_ROWS_16(160),
+    MXFP4_SCALE_LUT_ROWS_16(176),
+    MXFP4_SCALE_LUT_ROWS_16(192),
+    MXFP4_SCALE_LUT_ROWS_16(208),
+    MXFP4_SCALE_LUT_ROWS_16(224),
+    MXFP4_SCALE_LUT_ROWS_16(240),
+};
+
+_Static_assert(sizeof(mxfp4_scale_lut_row_t) == 32,
+               "E8M0 LUT rows must stay one aligned AVX2 load");
+
+#undef MXFP4_SCALE_LUT_ROWS_16
+#undef MXFP4_SCALE_LUT_ROW
+#undef MXFP4_SCALE_HI_CONST
+#undef MXFP4_SCALE_LO_CONST
+#undef MXFP4_SCALE_BITS_CONST
+#undef MXFP4_SCALE_DELTA_CONST
+#else
 static const uint16_t base16[16] = {
     0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
     0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0
@@ -122,6 +239,8 @@ static const uint16_t mask16[16] = {
     0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
     0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 };
+#endif
+
 static const float e2m1_tab[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -130,11 +249,34 @@ static inline float e8m0_to_f32(uint8_t s) {
     union { uint32_t u; float f; } v; v.u = (uint32_t)s << 23; return v.f;
 }
 
+#if !MXFP4_USE_SCALE_LUT
 // Multiplication is deliberate: left-shifting a negative signed value is
 // undefined in C. Conversion to uint16_t is defined modulo 2^16 and produces
 // the same exponent-field delta for scales below and above the 127 bias.
 static inline uint16_t e8m0_exp_delta_u16(uint8_t s) {
     return (uint16_t)(((int)s - 127) * 128);
+}
+#endif
+
+static inline void mxfp4_scale_tables(
+        uint8_t scale, uint8x16_t *lo, uint8x16_t *hi) {
+#if MXFP4_USE_SCALE_LUT
+    const mxfp4_scale_lut_row_t *row = &mxfp4_scale_lut[scale];
+    *lo = vld1q_u8(row->lo);
+    *hi = vld1q_u8(row->hi);
+#else
+    const uint16x8_t b0 = vld1q_u16(base16);
+    const uint16x8_t b1 = vld1q_u16(base16 + 8);
+    const uint16x8_t z0 = vld1q_u16(mask16);
+    const uint16x8_t z1 = vld1q_u16(mask16 + 8);
+    const uint16x8_t delta = vdupq_n_u16(e8m0_exp_delta_u16(scale));
+    const uint8x16_t t0 = vreinterpretq_u8_u16(
+        vaddq_u16(b0, vandq_u16(delta, z0)));
+    const uint8x16_t t1 = vreinterpretq_u8_u16(
+        vaddq_u16(b1, vandq_u16(delta, z1)));
+    *lo = vuzp1q_u8(t0, t1);
+    *hi = vuzp2q_u8(t0, t1);
+#endif
 }
 
 // identical accumulator reduction for ref and fused (bit-exact comparability)
@@ -182,8 +324,6 @@ void mxfp4_gemv_rows(const uint8_t *restrict p, const uint8_t *restrict s,
                      const float *restrict x, float *restrict y,
                      int row0, int row1, int cols) {
     const int cp = cols / 2, groups = cols / 32;
-    const uint16x8_t B0 = vld1q_u16(base16), B1 = vld1q_u16(base16 + 8);
-    const uint16x8_t Z0 = vld1q_u16(mask16), Z1 = vld1q_u16(mask16 + 8);
     const uint8x16_t M0F = vdupq_n_u8(0x0F);
     for (int r = row0; r < row1; r++) {
         const uint8_t *pp = p + (size_t)r * cp;
@@ -191,11 +331,8 @@ void mxfp4_gemv_rows(const uint8_t *restrict p, const uint8_t *restrict s,
         float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0), a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
         float32x4_t a4 = vdupq_n_f32(0), a5 = vdupq_n_f32(0), a6 = vdupq_n_f32(0), a7 = vdupq_n_f32(0);
         for (int g = 0; g < groups; g++) {
-            uint16x8_t A = vdupq_n_u16(e8m0_exp_delta_u16(sp[g]));
-            uint8x16_t t0 = vreinterpretq_u8_u16(vaddq_u16(B0, vandq_u16(A, Z0)));
-            uint8x16_t t1 = vreinterpretq_u8_u16(vaddq_u16(B1, vandq_u16(A, Z1)));
-            uint8x16_t TABL = vuzp1q_u8(t0, t1);
-            uint8x16_t TABH = vuzp2q_u8(t0, t1);
+            uint8x16_t TABL, TABH;
+            mxfp4_scale_tables(sp[g], &TABL, &TABH);
             uint8x16_t P  = vld1q_u8(pp + g * 16);
             uint8x16_t lo = vandq_u8(P, M0F);
             uint8x16_t hi = vshrq_n_u8(P, 4);
@@ -230,8 +367,6 @@ void mxfp4_gemv_rows2(const uint8_t *restrict p, const uint8_t *restrict s,
                       const float *restrict x, float *restrict y,
                       int row0, int row1, int cols) {
     const int cp = cols / 2, groups = cols / 32;
-    const uint16x8_t B0 = vld1q_u16(base16), B1 = vld1q_u16(base16 + 8);
-    const uint16x8_t Z0 = vld1q_u16(mask16), Z1 = vld1q_u16(mask16 + 8);
     const uint8x16_t M0F = vdupq_n_u8(0x0F);
     int r = row0;
     for (; r + 1 < row1; r += 2) {
@@ -249,10 +384,8 @@ void mxfp4_gemv_rows2(const uint8_t *restrict p, const uint8_t *restrict s,
             float32x4_t x6 = vld1q_f32(xp + 24), x7 = vld1q_f32(xp + 28);
 #define ROWGRP(pp, sp, c0, c1, c2, c3, c4, c5, c6, c7)                                              \
             {                                                                                        \
-                uint16x8_t AD = vdupq_n_u16(e8m0_exp_delta_u16((sp)[g]));                           \
-                uint8x16_t t0 = vreinterpretq_u8_u16(vaddq_u16(B0, vandq_u16(AD, Z0)));              \
-                uint8x16_t t1 = vreinterpretq_u8_u16(vaddq_u16(B1, vandq_u16(AD, Z1)));              \
-                uint8x16_t TABL = vuzp1q_u8(t0, t1), TABH = vuzp2q_u8(t0, t1);                       \
+                uint8x16_t TABL, TABH;                                                               \
+                mxfp4_scale_tables((sp)[g], &TABL, &TABH);                                           \
                 uint8x16_t P  = vld1q_u8((pp) + g * 16);                                             \
                 uint8x16_t lo = vandq_u8(P, M0F), hi = vshrq_n_u8(P, 4);                             \
                 uint8x16_t n0 = vzip1q_u8(lo, hi), n1 = vzip2q_u8(lo, hi);                           \
@@ -280,6 +413,175 @@ void mxfp4_gemv_rows2(const uint8_t *restrict p, const uint8_t *restrict s,
     }
     if (r < row1) mxfp4_gemv_rows(p, s, x, y, r, row1, cols);
 }
+
+#if MXFP4_CAN_BUILD_AVX2
+// ================= native 256-bit AVX2 kernel =================
+//
+// The exact compatibility path above maps each 128-bit NEON operation to SSSE3/FMA3.
+// This version performs the same arithmetic with four 256-bit accumulators.  AVX2
+// widening produces lanes in [0..3|16..19] order, so callers prepare x once in that
+// order and reuse it for every row.  In particular, fused_gemv_batch.c prepares each
+// distinct activation once per whole dispatch; there is no allocation or permutation
+// in a worker or 32-row work unit.
+#if !MXFP4_USE_SCALE_LUT
+static const uint8_t mxfp4_avx2_uzp_bytes[16] = {
+    0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15
+};
+#endif
+
+static int mxfp4_permute_x_avx2(
+        const float *restrict x, float *restrict xp, int cols) {
+    if (!x || !xp || cols <= 0 || cols % 32 != 0) return 0;
+    for (int g = 0; g < cols / 32; g++) {
+        const float *src = x + (size_t)g * 32;
+        float *dst = xp + (size_t)g * 32;
+        for (int q = 0; q < 4; q++) {
+            memcpy(dst + q * 8,     src + q * 4,      4 * sizeof(float));
+            memcpy(dst + q * 8 + 4, src + 16 + q * 4, 4 * sizeof(float));
+        }
+    }
+    return 1;
+}
+
+static float *mxfp4_prepare_x_avx2(const float *x, int cols) {
+    if (!x || cols <= 0 || cols % 32 != 0) return NULL;
+    size_t n = (size_t)cols;
+    if (n > SIZE_MAX / sizeof(float)) return NULL;
+    size_t bytes = n * sizeof(float);
+    if (bytes > SIZE_MAX - 63) return NULL;
+    size_t aligned_bytes = (bytes + 63) & ~(size_t)63;
+    float *xp = (float *)aligned_alloc(64, aligned_bytes);
+    if (!xp) return NULL;
+    if (!mxfp4_permute_x_avx2(x, xp, cols)) {
+        free(xp);
+        return NULL;
+    }
+    return xp;
+}
+
+// Load one interleaved 32-byte decode row and duplicate each 128-bit half into
+// both AVX2 lanes. MXFP4_USE_SCALE_LUT=0 retains the original synthesis oracle.
+#if MXFP4_USE_SCALE_LUT
+#define MXFP4_AVX2_TABLE(scale_byte, TL, TH)                                               \
+    do {                                                                                   \
+        const __m256i _row = _mm256_load_si256(                                            \
+            (const __m256i *)&mxfp4_scale_lut[(uint8_t)(scale_byte)]);                     \
+        (TL) = _mm256_permute4x64_epi64(_row, 0x44);                                       \
+        (TH) = _mm256_permute4x64_epi64(_row, 0xEE);                                       \
+    } while (0)
+#else
+#define MXFP4_AVX2_TABLE(scale_byte, TL, TH)                                               \
+    do {                                                                                   \
+        __m256i _a = _mm256_set1_epi16(                                                    \
+            (short)e8m0_exp_delta_u16((uint8_t)(scale_byte)));                             \
+        __m256i _t = _mm256_add_epi16(BZ, _mm256_and_si256(_a, ZZ));                       \
+        __m256i _u = _mm256_shuffle_epi8(_t, UZP);                                         \
+        (TL) = _mm256_permute4x64_epi64(_u, 0x88);                                         \
+        (TH) = _mm256_permute4x64_epi64(_u, 0xDD);                                         \
+    } while (0)
+#endif
+
+// Expand 32 packed values into four fp32 vectors in prepared-x order, preserving
+// the compatibility kernel's four independent FMA streams in each 128-bit lane.
+#define MXFP4_AVX2_GROUP(pp, TL, TH, xq, c0, c1, c2, c3)                                  \
+    do {                                                                                   \
+        __m128i _p = _mm_loadu_si128(                                                      \
+            (const __m128i *)((pp) + (size_t)g * 16));                                     \
+        __m128i _lo = _mm_and_si128(_p, M0F);                                              \
+        __m128i _hi = _mm_and_si128(_mm_srli_epi16(_p, 4), M0F);                           \
+        __m256i _ix = _mm256_set_m128i(                                                    \
+            _mm_unpackhi_epi8(_lo, _hi), _mm_unpacklo_epi8(_lo, _hi));                     \
+        __m256i _bl = _mm256_shuffle_epi8((TL), _ix);                                      \
+        __m256i _bh = _mm256_shuffle_epi8((TH), _ix);                                      \
+        __m256i _w0 = _mm256_unpacklo_epi8(_bl, _bh);                                      \
+        __m256i _w1 = _mm256_unpackhi_epi8(_bl, _bh);                                      \
+        (c0) = _mm256_fmadd_ps(                                                            \
+            _mm256_castsi256_ps(_mm256_unpacklo_epi16(ZR, _w0)), (xq)[0], (c0));            \
+        (c1) = _mm256_fmadd_ps(                                                            \
+            _mm256_castsi256_ps(_mm256_unpackhi_epi16(ZR, _w0)), (xq)[1], (c1));            \
+        (c2) = _mm256_fmadd_ps(                                                            \
+            _mm256_castsi256_ps(_mm256_unpacklo_epi16(ZR, _w1)), (xq)[2], (c2));            \
+        (c3) = _mm256_fmadd_ps(                                                            \
+            _mm256_castsi256_ps(_mm256_unpackhi_epi16(ZR, _w1)), (xq)[3], (c3));            \
+    } while (0)
+
+static MXFP4_TARGET_AVX2 inline float mxfp4_reduce4_avx2(
+        __m256 a0, __m256 a1, __m256 a2, __m256 a3) {
+    __m256 sum = _mm256_add_ps(
+        _mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    __m128 folded = _mm_add_ps(
+        _mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    return vaddvq_f32(folded);
+}
+
+// xp must already be in mxfp4_permute_x_avx2 order.  This function is internal
+// to the translation unit so callers cannot accidentally pass an ordinary x.
+static MXFP4_TARGET_AVX2 void mxfp4_gemv_rows2_avx2_prepared(
+        const uint8_t *restrict p, const uint8_t *restrict s,
+        const float *restrict xp, float *restrict y,
+        int row0, int row1, int cols) {
+    const int cp = cols / 2, groups = cols / 32;
+#if !MXFP4_USE_SCALE_LUT
+    const __m256i BZ = _mm256_loadu_si256((const __m256i *)base16);
+    const __m256i ZZ = _mm256_loadu_si256((const __m256i *)mask16);
+#endif
+    const __m256i ZR = _mm256_setzero_si256();
+    const __m128i M0F = _mm_set1_epi8(0x0F);
+#if !MXFP4_USE_SCALE_LUT
+    const __m256i UZP = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i *)mxfp4_avx2_uzp_bytes));
+#endif
+
+    int r = row0;
+    for (; r + 1 < row1; r += 2) {
+        const uint8_t *pp_a = p + (size_t)r * cp;
+        const uint8_t *sp_a = s + (size_t)r * groups;
+        const uint8_t *pp_b = p + (size_t)(r + 1) * cp;
+        const uint8_t *sp_b = s + (size_t)(r + 1) * groups;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+        __m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+        for (int g = 0; g < groups; g++) {
+            const float *xg = xp + (size_t)g * 32;
+            const __m256 xq[4] = {
+                _mm256_loadu_ps(xg), _mm256_loadu_ps(xg + 8),
+                _mm256_loadu_ps(xg + 16), _mm256_loadu_ps(xg + 24)
+            };
+            __m256i tla, tha, tlb, thb;
+            MXFP4_AVX2_TABLE(sp_a[g], tla, tha);
+            MXFP4_AVX2_GROUP(pp_a, tla, tha, xq, a0, a1, a2, a3);
+            MXFP4_AVX2_TABLE(sp_b[g], tlb, thb);
+            MXFP4_AVX2_GROUP(pp_b, tlb, thb, xq, b0, b1, b2, b3);
+        }
+        y[r] = mxfp4_reduce4_avx2(a0, a1, a2, a3);
+        y[r + 1] = mxfp4_reduce4_avx2(b0, b1, b2, b3);
+    }
+
+    // Keep odd-row jobs on AVX2 as well.  This matters for arbitrary synthetic
+    // shapes and avoids needing an unpermuted x pointer in persistent workers.
+    if (r < row1) {
+        const uint8_t *pp = p + (size_t)r * cp;
+        const uint8_t *sp = s + (size_t)r * groups;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        for (int g = 0; g < groups; g++) {
+            const float *xg = xp + (size_t)g * 32;
+            const __m256 xq[4] = {
+                _mm256_loadu_ps(xg), _mm256_loadu_ps(xg + 8),
+                _mm256_loadu_ps(xg + 16), _mm256_loadu_ps(xg + 24)
+            };
+            __m256i tl, th;
+            MXFP4_AVX2_TABLE(sp[g], tl, th);
+            MXFP4_AVX2_GROUP(pp, tl, th, xq, a0, a1, a2, a3);
+        }
+        y[r] = mxfp4_reduce4_avx2(a0, a1, a2, a3);
+    }
+}
+
+#undef MXFP4_AVX2_GROUP
+#undef MXFP4_AVX2_TABLE
+#endif
 
 // full-matrix NEON dequant (prior neon_a kernel) for the Accelerate baseline
 static const uint8_t thi_tab[16] = {
@@ -470,14 +772,90 @@ double mxfp4_expert_triple(const uint8_t *p1, const uint8_t *s1,
     return now_s() - t0;
 }
 
-// simple exported single-gemv for ctypes
-void mxfp4_gemv(const uint8_t *p, const uint8_t *s, const float *x, float *y,
-                int rows, int cols) {
+// Explicit exact compatibility exports make architecture tests able to compare
+// the selected path with the established 128-bit implementation.
+void mxfp4_gemv_compat(
+        const uint8_t *p, const uint8_t *s, const float *x, float *y,
+        int rows, int cols) {
     mxfp4_gemv_rows(p, s, x, y, 0, rows, cols);
 }
-void mxfp4_gemv_mt(const uint8_t *p, const uint8_t *s, const float *x, float *y,
-                   int rows, int cols, int nthreads) {
+void mxfp4_gemv_mt_compat(
+        const uint8_t *p, const uint8_t *s, const float *x, float *y,
+        int rows, int cols, int nthreads) {
     run_gemv_mt(p, s, x, y, rows, cols, nthreads, 1);
+}
+
+// The disable-only override makes dispatch tests deterministic and provides a
+// safe diagnostic fallback.  It can never force an unsupported instruction.
+#if MXFP4_CAN_BUILD_AVX2
+static pthread_once_t mxfp4_dispatch_once = PTHREAD_ONCE_INIT;
+static int mxfp4_dispatch_avx2 = 0;
+
+static void mxfp4_detect_dispatch(void) {
+    const char *disable = getenv("K3_MXFP4_DISABLE_AVX2");
+    if (disable && disable[0] && strcmp(disable, "0") != 0) return;
+    __builtin_cpu_init();
+    mxfp4_dispatch_avx2 = !!__builtin_cpu_supports("avx2");
+}
+
+int mxfp4_have_avx2(void) {
+    pthread_once(&mxfp4_dispatch_once, mxfp4_detect_dispatch);
+    return mxfp4_dispatch_avx2;
+}
+
+MXFP4_TARGET_AVX2 void mxfp4_gemv_avx2(
+        const uint8_t *p, const uint8_t *s, const float *x, float *y,
+        int rows, int cols) {
+    float *xp = mxfp4_prepare_x_avx2(x, cols);
+    if (!xp) {
+        mxfp4_gemv_compat(p, s, x, y, rows, cols);
+        return;
+    }
+    mxfp4_gemv_rows2_avx2_prepared(p, s, xp, y, 0, rows, cols);
+    free(xp);
+}
+
+MXFP4_TARGET_AVX2 void mxfp4_gemv_mt_avx2(
+        const uint8_t *p, const uint8_t *s, const float *x, float *y,
+        int rows, int cols, int nthreads) {
+    float *xp = mxfp4_prepare_x_avx2(x, cols);
+    if (!xp) {
+        mxfp4_gemv_mt_compat(p, s, x, y, rows, cols, nthreads);
+        return;
+    }
+    run_gemv_mt_k(
+        mxfp4_gemv_rows2_avx2_prepared,
+        p, s, xp, y, rows, cols, nthreads, 1);
+    free(xp);
+}
+#else
+int mxfp4_have_avx2(void) { return 0; }
+#endif
+
+// Stable ctypes entry points select the best runtime path. ARM and x86 hosts
+// without AVX2 retain the exact established implementation.
+void mxfp4_gemv(
+        const uint8_t *p, const uint8_t *s, const float *x, float *y,
+        int rows, int cols) {
+#if MXFP4_CAN_BUILD_AVX2
+    if (mxfp4_have_avx2()) {
+        mxfp4_gemv_avx2(p, s, x, y, rows, cols);
+        return;
+    }
+#endif
+    mxfp4_gemv_compat(p, s, x, y, rows, cols);
+}
+
+void mxfp4_gemv_mt(
+        const uint8_t *p, const uint8_t *s, const float *x, float *y,
+        int rows, int cols, int nthreads) {
+#if MXFP4_CAN_BUILD_AVX2
+    if (mxfp4_have_avx2()) {
+        mxfp4_gemv_mt_avx2(p, s, x, y, rows, cols, nthreads);
+        return;
+    }
+#endif
+    mxfp4_gemv_mt_compat(p, s, x, y, rows, cols, nthreads);
 }
 
 #ifndef NO_MAIN

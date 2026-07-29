@@ -16,20 +16,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))    # fla shim, k3loader, mxfp4
 # modeling files imported via tools/k3pkg package
 
+import runtime_platform  # noqa: E402
+import packed_q8  # noqa: E402
+import routing_record as routing_records  # noqa: E402
 import numpy as np
 import torch
 import torch.nn as nn
 
 torch.set_grad_enabled(False)
 # Eight is the measured M1 Max default, not a cross-chip conclusion. Keep it
-# stable there while exposing the value for per-machine CPU/power sweeps.
-TORCH_THREADS = int(os.environ.get("K3_TORCH_THREADS", "8"))
+# stable there when available, bound the automatic choice to this process's
+# effective CPUs, and retain the override for per-machine CPU/power sweeps.
+TORCH_THREADS = runtime_platform.configured_cpu_workers("K3_TORCH_THREADS", 8)
 torch.set_num_threads(TORCH_THREADS)
 
 import k3loader  # noqa: E402
 import importlib  # noqa: E402
 import apple_silicon  # noqa: E402
-import runtime_platform  # noqa: E402
 
 from k3pkg import modeling_kimi_linear as ml
 
@@ -68,10 +71,10 @@ def _cuda_available():
 
 def _resolve_device():
     requested = os.environ.get("K3_DEV")
-    normalized = (
-        requested.strip().lower()
-        if requested is not None and requested.strip() else None
-    )
+    # Reject typos before touching MPS/CUDA. In particular, a value such as
+    # "cudax" must not initialize the CUDA runtime merely because it shares a
+    # prefix with a valid device.
+    normalized = runtime_platform.normalize_requested_device(requested)
     mps_available = (
         _mps_available()
         if normalized is None or normalized == "mps" else False
@@ -83,15 +86,19 @@ def _resolve_device():
         and (normalized is None or normalized.startswith("cuda"))
     )
     cuda_available = _cuda_available() if need_cuda else False
+    cuda_count = torch.cuda.device_count() if cuda_available else 0
     spec = runtime_platform.choose_device_spec(
         requested,
         mps_available=mps_available,
         cuda_available=cuda_available,
-        cuda_device_count=torch.cuda.device_count() if cuda_available else 0,
+        cuda_device_count=cuda_count,
     )
-    if requested is None:
-        if spec == "cuda":
-            print("[config] MPS unavailable; auto-selected CUDA", flush=True)
+    if normalized is None:
+        if spec.startswith("cuda"):
+            print(
+                f"[config] MPS unavailable; auto-selected {spec}",
+                flush=True,
+            )
         elif spec == "cpu":
             print("[config] no MPS or CUDA GPU found — running on CPU (slow)",
                   flush=True)
@@ -144,39 +151,101 @@ APPROX = os.environ.get("K3_APPROX", "0") == "1"
 DT = torch.float16 if (APPROX or os.environ.get("K3_DTYPE", "fp32") == "fp16") else torch.float32
 
 
-def _native_int8_mps_available():
-    """Conservative capability gate for PyTorch's private MPS int8 operator."""
-    mode = os.environ.get("K3_NATIVE_INT8", "auto").lower()
-    if mode in ("0", "false", "off"):
-        return False
-    if DEV.type != "mps" or not hasattr(torch, "_weight_int8pack_mm"):
-        return False
-    if mode in ("1", "true", "on", "force"):
+def _mode_enabled(value, *, automatic):
+    normalized = str(value).strip().lower()
+    if normalized == "auto":
+        return automatic
+    if normalized in apple_silicon.TRUE_MODES:
         return True
-    probe = getattr(
-        getattr(torch, "_C", None),
-        "_dispatch_has_kernel_for_dispatch_key",
-        None,
-    )
-    if probe is None:
-        # Older builds lack the dispatcher query. The actual real-shape call
-        # remains exception-guarded, so symbol presence is a safe best effort.
-        return True
-    try:
-        return bool(probe("aten::_weight_int8pack_mm", "MPS"))
-    except Exception:
+    if normalized in apple_silicon.FALSE_MODES:
         return False
+    raise ValueError("mode must be auto, on/1/true, or off/0/false")
 
 
-NATIVE_INT8_MPS = _native_int8_mps_available()
-# PyTorch's native MPS weight-only kernel consumes our existing row-int8
-# checkpoint directly.  Keep the fp16 approximation path separate until it has
-# its own parity sweep; the exact/default fp32 path is the measured N1 target.
-INT8_LM_HEAD = (
-    os.environ.get("K3_INT8_LM_HEAD", "1") == "1"
-    and QUANT and DT == torch.float32
-    and NATIVE_INT8_MPS
+# The raw row-int8 operator is private and backend registrations differ between
+# PyTorch builds. Discover it by dispatcher + an analytically exact call at the
+# real KDA projection shape; never infer CUDA/MPS/CPU support from a chip name.
+_INT8_LM_HEAD_MODE = os.environ.get("K3_INT8_LM_HEAD", "auto")
+_INT8_KDA_QKV_REQUESTED_EARLY = _mode_enabled(
+    os.environ.get("K3_INT8_KDA_QKV", "0"),
+    automatic=False,
 )
+_INT8_KDA_STORAGE_MODE = os.environ.get(
+    "K3_INT8_KDA_STORAGE", "arena"
+).strip().lower()
+if _INT8_KDA_STORAGE_MODE not in {"arena", "stage"}:
+    raise ValueError("K3_INT8_KDA_STORAGE must be arena or stage")
+_INT8_KDA_STAGE_SYNC_MODE = os.environ.get(
+    "K3_INT8_KDA_STAGE_SYNC", "event"
+).strip().lower().replace("-", "_")
+if _INT8_KDA_STAGE_SYNC_MODE not in {"event", "mps_fifo"}:
+    raise ValueError(
+        "K3_INT8_KDA_STAGE_SYNC must be event or mps_fifo"
+    )
+_INT8_LM_HEAD_REQUESTED = _mode_enabled(
+    _INT8_LM_HEAD_MODE,
+    # Preserve the established, fully exercised MPS head default. CPU has
+    # decisive microbench evidence but remains opt-in until a full active-path
+    # Linux/CPU sequence gate lands.
+    automatic=DEV.type == "mps",
+)
+# Keep the existing MPS int8 pilot-router default independent from the head and
+# KDA switches.  The CPU path remains dense here until its variable-T router
+# workload has its own crossover gate; the new CPU head/KDA paths are opt-in.
+_PILOT_INT8_CAPABILITY_NEEDED = (
+    DEV.type == "mps"
+    and os.environ.get("K3_PILOT", "1") == "1"
+    and os.environ.get("K3_PILOT_GATE_DT", "int8") == "int8"
+)
+_PACKED_Q8_NEEDED = (
+    QUANT
+    and (
+        (
+            DT == torch.float32
+            and (
+                _INT8_LM_HEAD_REQUESTED
+                or _INT8_KDA_QKV_REQUESTED_EARLY
+            )
+        )
+        or _PILOT_INT8_CAPABILITY_NEEDED
+    )
+)
+_KDA_PROJECTION_SIZE = (
+    int(config.linear_attn_config["head_dim"])
+    * int(config.linear_attn_config["num_heads"])
+)
+_PACKED_Q8_BACKEND = packed_q8.discover(
+    torch,
+    DEV,
+    # Every current consumer supplies fp32 activations.  This is intentionally
+    # independent of the main model dtype because the pilot router calls
+    # ``h.float()`` even in approximate/fp16 runs.
+    torch.float32,
+    (_KDA_PROJECTION_SIZE, H),
+    mode=(
+        os.environ.get("K3_NATIVE_INT8", "auto")
+        if _PACKED_Q8_NEEDED else "off"
+    ),
+    max_tokens=os.environ.get("K3_PACKED_Q8_MAX_T", "auto"),
+    fusion_mode=os.environ.get("K3_INT8_QKV_FUSE", "auto"),
+)
+INT8_LM_HEAD = bool(
+    _INT8_LM_HEAD_REQUESTED
+    and QUANT
+    and DT == torch.float32
+    and _PACKED_Q8_BACKEND.available
+)
+if _INT8_LM_HEAD_REQUESTED and not INT8_LM_HEAD:
+    print(
+        "[lm-head] packed-int8 request unavailable: "
+        + (
+            _PACKED_Q8_BACKEND.reason
+            if QUANT and DT == torch.float32
+            else "requires K3_SPINE=int8 and fp32 activations"
+        )
+        + "; using dequantized dense weights",
+        flush=True,
+    )
 PREFILL_LAST_LOGIT = os.environ.get("K3_PREFILL_LAST_LOGIT", "1") == "1"
 
 
@@ -363,21 +432,55 @@ def _load_int8_packed(full):
 
 def _lm_head_forward(hidden):
     """Capability-gated native-int8 head with a one-time dense fallback."""
-    global _LM_Q, _LM_SC, _LM_W
-    T = hidden.shape[1]
+    global _LM_Q, _LM_SC, _LM_W, _LM_PACKED_CALLS, _LM_DENSE_CALLS
+    global _LM_DENSE_CROSSOVERS, _LM_DISABLE_REASON
+    flat = hidden.reshape(-1, H)
     if _LM_Q is not None:
-        try:
-            return torch._weight_int8pack_mm(
-                hidden.view(-1, H), _LM_Q, _LM_SC).view(1, T, -1)
-        except (NotImplementedError, RuntimeError) as exc:
-            # A newer/older PyTorch build may expose the schema without a
-            # working backend for this chip. Preserve support rather than
-            # making a chip-name assumption.
-            print(f"[lm-head] native int8 unavailable ({exc}); "
-                  "falling back to dequantized dense weights", flush=True)
-            _LM_W = _LM_Q.to(torch.float32) * _LM_SC[:, None]
-            _LM_Q = _LM_SC = None
+        if _PACKED_Q8_BACKEND.supports_tokens(flat.shape[0]):
+            try:
+                output = _PACKED_Q8_BACKEND.matmul(
+                    flat, _LM_Q, _LM_SC
+                )
+                _LM_PACKED_CALLS += 1
+                return output.view(*hidden.shape[:-1], -1)
+            except (NotImplementedError, RuntimeError, TypeError) as exc:
+                # A newer/older PyTorch build may expose the schema without a
+                # working backend for this device/shape. Preserve support
+                # rather than making a product-name assumption.
+                _LM_DISABLE_REASON = f"{type(exc).__name__}: {exc}"
+                print(f"[lm-head] native int8 unavailable ({exc}); "
+                      "falling back to dequantized dense weights", flush=True)
+        else:
+            _LM_DENSE_CROSSOVERS += 1
+            _LM_DISABLE_REASON = (
+                f"activation rows {flat.shape[0]} exceed measured packed-q8 "
+                f"limit {_PACKED_Q8_BACKEND.max_tokens}"
+            )
+            print(
+                f"[lm-head] {_LM_DISABLE_REASON}; materializing dense head",
+                flush=True,
+            )
+        # Materialize before dropping the owned packed tensors, so a failure
+        # cannot leave the head with neither representation.
+        dense = _LM_Q.to(torch.float32) * _LM_SC[:, None]
+        _LM_W = dense
+        _LM_Q = _LM_SC = None
+    _LM_DENSE_CALLS += 1
     return hidden @ _LM_W.T
+
+
+def _lm_head_runtime_status():
+    return {
+        "requested": _INT8_LM_HEAD_REQUESTED,
+        "eligible": INT8_LM_HEAD,
+        "packed_resident": _LM_Q is not None,
+        "dense_resident": _LM_W is not None,
+        "packed_calls": _LM_PACKED_CALLS,
+        "dense_calls": _LM_DENSE_CALLS,
+        "dense_crossovers": _LM_DENSE_CROSSOVERS,
+        "disable_reason": _LM_DISABLE_REASON,
+        "backend": _PACKED_Q8_BACKEND.status(),
+    }
 
 
 def materialize_resident(module, prefix):
@@ -477,30 +580,35 @@ if spine_fast.FAST or spine_fast.DEQ == "metal":
     spine_fast.metal_available()          # compile once, on the main thread
     print(f"[spine] fast path: {spine_fast.describe()}", flush=True)
 
-# N1: keep streamed KDA Q/K/V as row-int8 and call PyTorch's native MPS
-# weight-only matmul instead of dequantizing 3x12288x7168 into the shared fp32
-# template arena. Balanced full-sequence gates passed on the M1 reference;
-# capability and exception gates retain the dense path everywhere else.
-# Eligibility is based on runtime capabilities, never a Mac product name, so a
-# newer Apple GPU can take the path as soon as its PyTorch backend supports it.
-_INT8_KDA_QKV_REQUESTED = (
-    os.environ.get("K3_INT8_KDA_QKV", "0").strip().lower()
-    in apple_silicon.TRUE_MODES
-)
+# N1: keep every eligible same-input KDA first-stage projection as row-int8 and
+# call a capability-proven native weight-only matmul instead of dequantizing
+# Q/K/V/G/F-A/B into the shared fp32 template arena. The historical QKV
+# environment/API name is retained for compatibility. Capability and exception
+# gates retain the dense path everywhere else.
+# Eligibility is based on runtime capabilities, never an OS/product name.
+_INT8_KDA_QKV_REQUESTED = _INT8_KDA_QKV_REQUESTED_EARLY
 _INT8_KDA_QKV_REASONS = []
 if SPINE != "int8":
     _INT8_KDA_QKV_REASONS.append("requires K3_SPINE=int8")
 if DT != torch.float32:
     _INT8_KDA_QKV_REASONS.append("requires fp32 activations")
-if DEV.type != "mps":
-    _INT8_KDA_QKV_REASONS.append("requires MPS")
-if not NATIVE_INT8_MPS:
+if not _PACKED_Q8_BACKEND.available:
     _INT8_KDA_QKV_REASONS.append(
-        "aten::_weight_int8pack_mm has no usable MPS kernel")
+        _PACKED_Q8_BACKEND.reason
+        or "no usable packed row-int8 backend"
+    )
 if not TEMPLATES:
     _INT8_KDA_QKV_REASONS.append("requires shared templates")
 if not spine_fast.PACK:
     _INT8_KDA_QKV_REASONS.append("requires K3_SPINE_PACK=1")
+if _INT8_KDA_STORAGE_MODE == "stage":
+    _stage_capable, _stage_reason = spine_fast.stage_storage_capability(
+        DEV, _INT8_KDA_STAGE_SYNC_MODE
+    )
+    if not _stage_capable:
+        _INT8_KDA_QKV_REASONS.append(
+            _stage_reason or "direct staging lifetime cannot be ordered"
+        )
 INT8_KDA_QKV = _INT8_KDA_QKV_REQUESTED and not _INT8_KDA_QKV_REASONS
 
 
@@ -534,9 +642,15 @@ def _int8_kda_qkv_runtime_status():
         getattr(controller, "packed_project_calls", 0)
         for controller in controllers
     )
+    packed_operator_calls = sum(
+        getattr(controller, "packed_operator_calls", 0)
+        for controller in controllers
+    )
     return {
         "requested": _INT8_KDA_QKV_REQUESTED,
         "eligible": INT8_KDA_QKV,
+        "storage_mode": _INT8_KDA_STORAGE_MODE,
+        "stage_sync_mode": _INT8_KDA_STAGE_SYNC_MODE,
         "controllers_installed": len(controllers),
         "enabled_at_end": bool(
             INT8_KDA_QKV
@@ -545,6 +659,95 @@ def _int8_kda_qkv_runtime_status():
             and controllers
         ),
         "packed_project_calls": packed_project_calls,
+        "packed_operator_calls": packed_operator_calls,
+        "fused_operator_calls": sum(
+            getattr(controller, "fused_operator_calls", 0)
+            for controller in controllers
+        ),
+        "separate_operator_calls": sum(
+            getattr(controller, "separate_operator_calls", 0)
+            for controller in controllers
+        ),
+        "dense_crossover_project_calls": sum(
+            getattr(controller, "dense_crossover_project_calls", 0)
+            for controller in controllers
+        ),
+        "dense_crossover_materializations": sum(
+            getattr(controller, "dense_crossover_materializations", 0)
+            for controller in controllers
+        ),
+        "dense_crossover_releases": sum(
+            getattr(controller, "dense_crossover_releases", 0)
+            for controller in controllers
+        ),
+        "runtime_failures": sum(
+            getattr(controller, "runtime_failures", 0)
+            for controller in controllers
+        ),
+        "persistent_weight_bytes": sum(
+            getattr(controller, "persistent_weight_bytes", 0)
+            for controller in controllers
+        ),
+        "persistent_scale_bytes": sum(
+            getattr(controller, "persistent_scale_bytes", 0)
+            for controller in controllers
+        ),
+        "stage_bind_count": sum(
+            getattr(controller, "stage_bind_count", 0)
+            for controller in controllers
+        ),
+        "stage_bind_failures": sum(
+            getattr(controller, "stage_bind_failures", 0)
+            for controller in controllers
+        ),
+        "stage_stale_rejections": sum(
+            getattr(controller, "stage_stale_rejections", 0)
+            for controller in controllers
+        ),
+        "stage_weight_copy_bytes": sum(
+            getattr(controller, "stage_weight_copy_bytes", 0)
+            for controller in controllers
+        ),
+        "stage_scale_copy_bytes": sum(
+            getattr(controller, "stage_scale_copy_bytes", 0)
+            for controller in controllers
+        ),
+        "stage_fence_records": sum(
+            getattr(controller, "stage_fence_records", 0)
+            for controller in controllers
+        ),
+        "stage_fence_waits": sum(
+            getattr(controller, "stage_fence_waits", 0)
+            for controller in controllers
+        ),
+        "stage_fence_sync_fallbacks": sum(
+            getattr(controller, "stage_fence_sync_fallbacks", 0)
+            for controller in controllers
+        ),
+        "stage_fence_failures": sum(
+            getattr(controller, "stage_fence_failures", 0)
+            for controller in controllers
+        ),
+        "stage_fifo_records": sum(
+            getattr(controller, "stage_fifo_records", 0)
+            for controller in controllers
+        ),
+        "stage_fifo_reuses": sum(
+            getattr(controller, "stage_fifo_reuses", 0)
+            for controller in controllers
+        ),
+        "stage_full_shape_probes": sum(
+            getattr(controller, "stage_full_shape_probes", 0)
+            for controller in controllers
+        ),
+        "stage_full_shape_passes": sum(
+            getattr(controller, "stage_full_shape_passes", 0)
+            for controller in controllers
+        ),
+        "backend": _PACKED_Q8_BACKEND.status(),
+        "controllers": [
+            controller.status() for controller in controllers
+        ],
         "disable_reason": state.reason if state is not None else None,
     }
 
@@ -556,7 +759,7 @@ import attn_fast  # noqa: E402
 
 attn_fast.install(ml)
 if attn_fast.ACTIVE:
-    print(f"[attn] {attn_fast.describe()}", flush=True)
+    print(f"[attn] {attn_fast.describe(DEV)}", flush=True)
 
 
 def _ram_budget_layers():
@@ -724,7 +927,11 @@ if MOE_BACKEND == "metal":
               f"— falling back to cpu", flush=True)
 if MOE_BACKEND == "cpu" and CPU_BATCH_ACTIVE:
     print(f"[config] CPU MoE: persistent worker ring "
-          f"({fast_moe_batch.pool_threads()} threads)", flush=True)
+          f"({fast_moe_batch.pool_threads()} threads, "
+          f"{fast_moe_batch.native_isa()})", flush=True)
+elif MOE_BACKEND == "cpu" and fast_moe is not None:
+    print(f"[config] CPU MoE: legacy per-call worker pool "
+          f"({fast_moe.native_isa()})", flush=True)
 
 fetch_v2 = None
 if os.environ.get("K3_FETCH", "v2") == "v2":
@@ -803,12 +1010,16 @@ def _issue_next_expert_prefetch(li):
 def moe_infer_lazy(self, x, topk_ids, topk_weight):
     li = _step_ctx["layer"]
     rows = topk_ids.tolist()                    # [positions][top_k]
-    routing_record = None
-    if MOE_BACKEND == "metal":
-        routing_record = {
-            "ids": rows,
-            "weights": topk_weight.to(torch.float32).tolist(),
-        }
+    # Every fast raw-MXFP4 backend consumes the same ordered CPU route that
+    # fetch scheduling already needs. This extends X12 to CPU expert fallback
+    # on CPU/CUDA/ROCm accelerator-spine runs without any device/product branch.
+    # When fast MoE is disabled, do not materialize weights here: TRACE=off and
+    # the established slow expert path retain their prior zero-extra-work flow.
+    routing_record = (
+        routing_records.materialize(
+            topk_ids, topk_weight, ids=rows)
+        if FAST_MOE else None
+    )
     flat = [e for r in rows for e in r]
     ids = sorted(set(flat))
     EXPERT_SEL["layer_calls"] += 1
@@ -839,12 +1050,9 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
                  routing_record["weights"] if routing_record else topk_weight)
     if FAST_MOE:
         tk = time.time()
-        if routing_record is None:
-            out = _MOE_FN(x, topk_ids, topk_weight, raw)
-        else:
-            out = _MOE_FN(
-                x, topk_ids, topk_weight, raw,
-                routing_record=routing_record)
+        out = _MOE_FN(
+            x, topk_ids, topk_weight, raw,
+            routing_record=routing_record)
         TIMES["moe_kernel"] += time.time() - tk
         return out
     for e, w in raw.items():
@@ -986,31 +1194,42 @@ def build_layers():
         tpl_mla = ml.KimiDecoderLayer(config, 3).eval()   # MLA + MoE class
     if INT8_KDA_QKV and _INT8_KDA_QKV_STATE.enabled:
         installed = []
-        shared_qkv_arenas = None
         try:
-            for candidate in (l0, tpl_kda):
-                if candidate.is_linear_attn:
-                    controller = spine_fast.install_dynamic_q8_qkv(
-                        candidate,
+            # The reusable KDA template executes 68 layers per pass. Layer 0
+            # executes once and stays on the dense fallback: giving it another
+            # 337.7 MiB packed arena is a poor memory/I/O trade, while attempting
+            # to register one MPS arena on both modules caused the original
+            # full-model candidate to disable itself before its first call.
+            # A future backend with an explicitly supported shared-storage
+            # contract can reconsider layer 0 independently.
+            if tpl_kda.is_linear_attn:
+                installed.append(
+                    spine_fast.install_dynamic_q8_qkv(
+                        tpl_kda,
                         DEV,
                         _INT8_KDA_QKV_STATE,
-                        torch._weight_int8pack_mm,
-                        arenas=shared_qkv_arenas,
+                        _PACKED_Q8_BACKEND,
+                        storage_mode=_INT8_KDA_STORAGE_MODE,
+                        stage_sync_mode=_INT8_KDA_STAGE_SYNC_MODE,
                     )
-                    installed.append(controller)
-                    if shared_qkv_arenas is None:
-                        shared_qkv_arenas = controller.arenas()
+                )
         except (RuntimeError, ValueError, MemoryError) as exc:
             for controller in reversed(installed):
                 controller.uninstall()
             _INT8_KDA_QKV_STATE.disable(exc)
         else:
             _INT8_KDA_QKV_CONTROLLERS = installed
-            packed_bytes = installed[0].nbytes if installed else 0
+            packed_bytes = sum(
+                controller.nbytes for controller in installed
+            )
             print(
-                f"[kda-qkv] native packed-int8 active for "
+                f"[kda-bundle] native packed-int8 active for "
                 f"{len(installed)} KDA template(s), "
-                f"{packed_bytes/2**20:.1f} MiB shared persistent storage",
+                f"{packed_bytes/2**20:.1f} MiB persistent storage, "
+                f"device={DEV.type}, max_T={_PACKED_Q8_BACKEND.max_tokens}, "
+                f"fused_bundle={int(_PACKED_Q8_BACKEND.fuse_qkv)}, "
+                f"storage={_INT8_KDA_STORAGE_MODE}, "
+                f"stage_sync={_INT8_KDA_STAGE_SYNC_MODE}",
                 flush=True,
             )
     if TEMPLATE_ARENA:
@@ -1240,7 +1459,14 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
     if pilot.PILOT:
         pilot.init(config, DEV, _pilot_load, PFX,
                    load_packed=_load_int8_packed if QUANT else None,
-                   native_int8=NATIVE_INT8_MPS)
+                   native_int8=(
+                       _PACKED_Q8_BACKEND.matmul
+                       if (
+                           _PACKED_Q8_BACKEND.available
+                           and DEV.type == "mps"
+                       )
+                       else False
+                   ))
         pilot.begin_pass(fetch_v2)
         if PREAD:
             fetch_v2.drop_prefetch()    # nothing from the previous pass is valid
@@ -1333,16 +1559,7 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
                      tail.output_attn_res_proj, tail.output_attn_res_norm)
     hidden = tail.norm(flat.view(1, T, H))
     t0 = time.time()
-    global _LM_W, _LM_Q, _LM_SC
-    if INT8_LM_HEAD and _LM_Q is None:
-        packed = _load_int8_packed("language_model.lm_head.weight")
-        if packed is not None:
-            _LM_Q, _LM_SC = packed
-    if _LM_Q is None and _LM_W is None:
-        # Legacy path: resident across tokens, 2.35-4.7 GB on DEV.
-        _LM_W = _load_int8("language_model.lm_head.weight") if QUANT else None
-        if _LM_W is None:
-            _LM_W = k3loader.load_resident("language_model.lm_head.weight").to(DEV, DT)
+    _ensure_lm_head_loaded()
     TIMES["resident_io"] += time.time() - t0
     # Generation consumes only the final prompt logit. Speculative/decode
     # passes still need every position for verification.
@@ -1355,6 +1572,29 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
 _LM_W = None
 _LM_Q = None
 _LM_SC = None
+_LM_PACKED_CALLS = 0
+_LM_DENSE_CALLS = 0
+_LM_DENSE_CROSSOVERS = 0
+_LM_DISABLE_REASON = None
+
+
+def _ensure_lm_head_loaded():
+    """Load exactly one head representation and preserve one-time fallback."""
+    global _LM_W, _LM_Q, _LM_SC
+    if INT8_LM_HEAD and _LM_Q is None and _LM_W is None:
+        packed = _load_int8_packed("language_model.lm_head.weight")
+        if packed is not None:
+            _LM_Q, _LM_SC = packed
+    if _LM_Q is None and _LM_W is None:
+        # Legacy path: resident across tokens, 2.35-4.7 GB on DEV.
+        _LM_W = (
+            _load_int8("language_model.lm_head.weight")
+            if QUANT else None
+        )
+        if _LM_W is None:
+            _LM_W = k3loader.load_resident(
+                "language_model.lm_head.weight"
+            ).to(DEV, DT)
 
 
 # --- n-gram speculative 2-token decode ----------------------------------------
@@ -1443,8 +1683,14 @@ def _spec_step_deep(layers, cache, embed, ctx, pending, s):
     rerun = spec_decode.ROLLBACK == "rerun"
     snap = snapshot_states(cache) if rerun else None
     mla_len = spec_decode.snapshot_mla(cache, NL)
+    replay_armed = False
     try:
-        spec_decode.arm()      # record KDA recurrence inputs for the rollback
+        if not rerun:
+            # Replay consumes the captured KDA inputs. The reference rerun path
+            # restores the pre-pass tensor objects and re-executes instead, so
+            # arming there only pins hundreds of MiB without being read.
+            spec_decode.arm()
+            replay_armed = True
         logits = forward_pass(layers, cache, embed([pending] + drafts),
                               step=s, verbose=False)
         argm = logits[0].argmax(-1).tolist()      # one device sync, D+1 entries
@@ -1455,7 +1701,8 @@ def _spec_step_deep(layers, cache, embed, ctx, pending, s):
         if k < len(drafts) and not rerun:
             spec_decode.rollback_replay(cache, k + 1, mla_len)
     finally:
-        spec_decode.release()
+        if replay_armed:
+            spec_decode.release()
     if k < len(drafts) and rerun:
         # Reference path: back to the pre-pass state with the certified
         # whole-tensor restore, then re-feed exactly the accepted tokens.
@@ -1491,10 +1738,12 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
     """Greedy generation (+ certified-lossless n-gram speculation).
 
     Shared by the CLI and the OpenAI-compatible server. Calls on_token(token_id)
-    as each token is emitted. Returns the emitted token list; a speculative
-    accept may emit one token past EOS_ID — callers trim at EOS_ID."""
+    as each token is emitted. Returns at most ``max_new`` tokens and never
+    streams anything after EOS_ID, including inside a speculative burst."""
     if spec is None:
         spec = os.environ.get("K3_SPEC", "1") == "1"
+    if max_new <= 0:
+        return []
     generated = []
 
     def emit(t):
@@ -1504,7 +1753,10 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
 
     _step_ctx["step"] = 0
     logits = forward_pass(layers, cache, embed(ids), step=0, verbose=verbose_prefill)
-    emit(int(logits[0, -1].argmax()))
+    first = int(logits[0, -1].argmax())
+    emit(first)
+    if first == EOS_ID:
+        return generated
     for _k in EXPERT_SEL:      # the union factor that matters is the decode one
         EXPERT_SEL[_k] = 0
     s = 1
@@ -1540,6 +1792,10 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
                 logits = forward_pass(layers, cache, embed([generated[-1]]),
                                       step=s, verbose=False)
                 new = [int(logits[0, -1].argmax())]
+        # A verifier can accept several tokens in one pass. Bound the burst
+        # before invoking callbacks or structured logging so max_new remains a
+        # real API contract and throughput cannot be inflated by over-emission.
+        new = new[:max_new - len(generated)]
         for t in new:
             emit(t)
         log(s, tag, t0, list(generated))
@@ -1608,7 +1864,11 @@ def main():
                                       tokenize=True, add_generation_prompt=True)
     else:
         ids = tok.encode(args.prompt)
-    max_new = args.max_new or 1_000_000   # effectively: until EOS or Ctrl-C
+    if args.max_new is not None and args.max_new < 0:
+        ap.error("--max-new must be non-negative")
+    max_new = (
+        args.max_new if args.max_new is not None else 1_000_000
+    )  # effectively: until EOS or Ctrl-C
     run_started_ns = time.perf_counter_ns()
     events.emit(
         "run_start",
@@ -1626,6 +1886,12 @@ def main():
             "template_arena": bool(_TEMPLATE_ARENA_STORAGE is not None),
             "int8_kda_qkv_requested": _INT8_KDA_QKV_REQUESTED,
             "int8_kda_qkv_eligible": INT8_KDA_QKV,
+            "int8_kda_storage": _INT8_KDA_STORAGE_MODE,
+            "int8_kda_stage_sync": _INT8_KDA_STAGE_SYNC_MODE,
+            "int8_lm_head_requested": _INT8_LM_HEAD_REQUESTED,
+            "int8_lm_head_eligible": INT8_LM_HEAD,
+            "packed_q8_backend": _PACKED_Q8_BACKEND.status(),
+            "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
             "preload": PRELOAD,
             "pin_layers": PIN_N,
             "fast_moe": FAST_MOE,
@@ -1700,6 +1966,8 @@ def main():
                     emitted_token_ids=generated,
                     runtime={
                         "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
+                        "int8_lm_head": _lm_head_runtime_status(),
+                        "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
                     })
         events.close()
         raise
@@ -1731,6 +1999,8 @@ def main():
                 phase_seconds=TIMES,
                 runtime={
                     "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
+                    "int8_lm_head": _lm_head_runtime_status(),
+                    "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
                 })
     events.close()
     print(f"total {duration_ns/1e9:.6f}s | times {TIMES}")

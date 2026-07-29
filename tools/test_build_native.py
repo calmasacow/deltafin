@@ -15,9 +15,9 @@ sys.path.insert(0, str(HERE))
 
 import build_native as native
 
-V3_FLAGS = {
+BASE_FLAGS = {
     next(iter(aliases))
-    for aliases in native.X86_64_V3_FEATURES.values()
+    for aliases in native.X86_64_BASE_FEATURES.values()
 }
 
 
@@ -65,7 +65,17 @@ class TargetTests(unittest.TestCase):
         self.assertTrue(darwin.supports_metal)
 
         x86 = native.detect_target("linux", "x86_64")
-        self.assertEqual(x86.c_arch_flags, ("-march=x86-64-v3",))
+        self.assertEqual(
+            x86.c_arch_flags,
+            (
+                "-march=x86-64",
+                "-mtune=native",
+                "-msse3",
+                "-mssse3",
+                "-mavx",
+                "-mfma",
+            ),
+        )
         self.assertEqual(x86.suffix, ".so")
 
         arm = native.detect_target("linux", "aarch64")
@@ -82,9 +92,31 @@ class TargetTests(unittest.TestCase):
 
     def test_x86_cpu_preflight(self):
         target = native.detect_target("linux", "x86_64")
-        native.preflight_target(target, cpu_flags=V3_FLAGS)
-        with self.assertRaisesRegex(native.BuildError, "missing CPU flags: avx2"):
-            native.preflight_target(target, cpu_flags=V3_FLAGS - {"avx2"})
+        native.preflight_target(target, cpu_flags=BASE_FLAGS)
+        # AVX2 is an optional runtime-selected island, not a load-time contract.
+        native.preflight_target(target, cpu_flags=BASE_FLAGS | {"avx2"})
+        with self.assertRaisesRegex(native.BuildError, "missing CPU flags: fma"):
+            native.preflight_target(target, cpu_flags=BASE_FLAGS - {"fma"})
+
+    def test_x86_artifacts_require_both_dispatch_islands(self):
+        x86 = native.artifacts_for(
+            native.detect_target("linux", "x86_64"), skip_metal=True
+        )
+        arm = native.artifacts_for(
+            native.detect_target("linux", "aarch64"), skip_metal=True
+        )
+        for artifact in x86:
+            self.assertTrue(
+                set(native.X86_AVX2_SYMBOLS).issubset(
+                    artifact.required_symbols
+                )
+            )
+        for artifact in arm:
+            self.assertTrue(
+                set(native.X86_AVX2_SYMBOLS).isdisjoint(
+                    artifact.required_symbols
+                )
+            )
 
     def test_cpuinfo_parser(self):
         with tempfile.TemporaryDirectory() as td:
@@ -116,7 +148,12 @@ class CommandTests(unittest.TestCase):
             environ={"CC": f"{sys.executable} --compiler-wrapper"},
         )
         self.assertEqual(command[:2], [sys.executable, "--compiler-wrapper"])
-        self.assertIn("-march=x86-64-v3", command)
+        self.assertIn("-march=x86-64", command)
+        self.assertIn("-mtune=native", command)
+        self.assertIn("-mavx", command)
+        self.assertIn("-mfma", command)
+        self.assertNotIn("-mavx2", command)
+        self.assertNotIn("-march=x86-64-v3", command)
         self.assertIn("-fPIC", command)
         self.assertIn("-shared", command)
         self.assertNotIn("-dynamiclib", command)

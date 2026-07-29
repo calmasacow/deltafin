@@ -11,10 +11,20 @@ import os
 import torch
 import torch.nn.functional as F
 
-# K3_KDA_RECUR: where the T<=4 decode recurrence runs.  "cpu" (default) is the
-# historical behaviour documented in fused_recurrent_kda below; "mps" keeps it
-# on the GPU.  See tools/attn_fast.py for the measurement.
-RECUR = os.environ.get("K3_KDA_RECUR", "mps")
+# K3_KDA_RECUR: where the T<=4 decode recurrence runs. "device" keeps it on
+# whichever backend owns q (MPS, CUDA, or CPU); "cpu" preserves the historical
+# MPS-to-CPU hop. The old value "mps" remains a compatibility alias for
+# "device", because it never moved CUDA or CPU tensors to an MPS device.
+def normalize_recur_mode(value):
+    mode = str(value).strip().lower()
+    if mode == "mps":
+        return "device"
+    if mode not in ("device", "cpu"):
+        raise ValueError("K3_KDA_RECUR must be device or cpu (mps is an alias)")
+    return mode
+
+
+RECUR = normalize_recur_mode(os.environ.get("K3_KDA_RECUR", "device"))
 
 
 def _kda_gate(g, A_log, dt_bias, lower_bound):
@@ -77,14 +87,13 @@ def fused_recurrent_kda(q, k, v, g, beta, A_log=None, dt_bias=None, scale=None,
                         use_beta_sigmoid_in_kernel=False, lower_bound=None,
                         cu_seqlens=None, transpose_state_layout=False, **kw):
     assert cu_seqlens is None, "shim: cu_seqlens unsupported (batch=1 only)"
-    # Decode (T small): the state math is ~microseconds of FLOPs but ~25 MPS op
-    # launches; run it on CPU (240KB in / 48KB out per layer) and keep the
-    # recurrent state CPU-resident across tokens. Profiled: KDA was 1.23 s/layer
-    # on MPS at T=1 — over half of every decode token.
+    # Decode (T small): the optional historical CPU mode avoids ~25 MPS op
+    # launches by moving 240KB in / 48KB out per layer and retaining the
+    # recurrent state on CPU. It applies only when q is actually on MPS.
     #
-    # K3_KDA_RECUR=mps re-examines that call.  Re-measured at T=1 with the rest
-    # of the pipeline as it stands today (median of 15, each variant serialized
-    # with torch.mps.synchronize):
+    # K3_KDA_RECUR=device keeps the operation on q.device. Re-measured on MPS at
+    # T=1 with the rest of the pipeline as it stands today (median of 15, each
+    # variant serialized with torch.mps.synchronize):
     #     CPU hop, state CPU-resident   3.12 ms      <- this branch
     #     all-MPS                       1.17 ms
     #     CPU math alone, no transfers  1.29 ms

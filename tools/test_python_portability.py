@@ -17,9 +17,9 @@ import runtime_platform as rp  # noqa: E402
 import spine_cache  # noqa: E402
 import spine_io  # noqa: E402
 
-V3_FLAGS = {
+BASE_FLAGS = {
     next(iter(aliases))
-    for aliases in rp._X86_64_V3_FEATURES.values()
+    for aliases in rp._X86_64_BASE_FEATURES.values()
 }
 
 
@@ -87,8 +87,8 @@ def _native_loader_checks():
 
         cpuinfo = os.path.join(td, "cpuinfo")
         pathlib.Path(cpuinfo).write_text(
-            "processor: 0\nflags: " + " ".join(sorted(V3_FLAGS)) + "\n"
-            "processor: 1\nflags: " + " ".join(sorted(V3_FLAGS | {"sha_ni"})) + "\n",
+            "processor: 0\nflags: " + " ".join(sorted(BASE_FLAGS)) + "\n"
+            "processor: 1\nflags: " + " ".join(sorted(BASE_FLAGS | {"avx2"})) + "\n",
             encoding="utf-8",
         )
         assert rp.missing_native_cpu_features(
@@ -96,7 +96,7 @@ def _native_loader_checks():
         ) == ()
         pathlib.Path(cpuinfo).write_text(
             "processor: 0\nflags: "
-            + " ".join(sorted(V3_FLAGS - {"fma"})) + "\n",
+            + " ".join(sorted(BASE_FLAGS - {"fma"})) + "\n",
             encoding="utf-8",
         )
         assert rp.missing_native_cpu_features(
@@ -115,7 +115,7 @@ def _native_loader_checks():
                     cdll_factory=lambda _path: FakeLibrary(("run",)),
                 )
             except rp.NativeLibraryError as exc:
-                assert "x86-64-v3" in str(exc) and "fma" in str(exc)
+                assert "AVX/FMA3/SSSE3 baseline" in str(exc) and "fma" in str(exc)
             else:
                 raise AssertionError("unsafe x86 native library was loaded")
 
@@ -176,12 +176,23 @@ def _native_module_manifest_checks():
 
 
 def _device_checks():
+    assert rp.default_gemv_threads("darwin", 10) == 4
+    assert rp.default_gemv_threads("linux", 32) == 8
+    assert rp.default_gemv_threads("linux", 6) == 6
+    assert rp.default_gemv_threads("freebsd", 2) == 2
     assert rp.choose_device_spec(
         None, mps_available=True, cuda_available=True, cuda_device_count=2
     ) == "mps"
     assert rp.choose_device_spec(
         None, mps_available=False, cuda_available=True, cuda_device_count=2
     ) == "cuda"
+    assert rp.choose_device_spec(
+        None,
+        mps_available=False,
+        cuda_available=True,
+        cuda_device_count=2,
+        auto_cuda_index=1,
+    ) == "cuda:1"
     assert rp.choose_device_spec(
         None, mps_available=False, cuda_available=False
     ) == "cpu"
@@ -206,6 +217,31 @@ def _device_checks():
             pass
         else:
             raise AssertionError(f"invalid explicit device {requested} accepted")
+    try:
+        rp.choose_device_spec(
+            None,
+            mps_available=False,
+            cuda_available=True,
+            cuda_device_count=2,
+            auto_cuda_index=2,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("out-of-range automatic CUDA index was accepted")
+
+    assert rp.normalize_requested_device(None) is None
+    assert rp.normalize_requested_device("  ") is None
+    assert rp.normalize_requested_device(" CUDA:1 ") == "cuda:1"
+    for malformed in ("cudax", "cuda:", "cuda:-1", "cuda:1x", "metal"):
+        try:
+            rp.normalize_requested_device(malformed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"malformed device request {malformed!r} was accepted"
+            )
 
     calls = []
     fake_torch = SimpleNamespace(
@@ -231,6 +267,115 @@ def _device_checks():
         pass
     else:
         raise AssertionError("unsupported MoE backend was accepted")
+
+
+def _cpu_availability_checks():
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        proc = root / "proc"
+        cgroup = root / "cgroup"
+        (proc / "self").mkdir(parents=True)
+
+        # cgroup v2: a fractional leaf quota wins over host count and affinity.
+        leaf = cgroup / "team" / "job"
+        leaf.mkdir(parents=True)
+        cgroup_file = proc / "self" / "cgroup"
+        cgroup_file.write_text("0::/team/job\n", encoding="utf-8")
+        (leaf / "cpu.max").write_text("250000 100000\n", encoding="utf-8")
+        (cgroup / "team" / "cpu.max").write_text(
+            "600000 100000\n", encoding="utf-8"
+        )
+        assert rp.linux_cpu_quota_count(
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) == 3
+        assert rp.available_cpu_count(
+            platform="linux",
+            cpu_count=64,
+            affinity_getter=lambda _pid: range(12),
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) == 3
+
+        # An unlimited leaf does not hide a tighter ancestor. The quota rounds
+        # 1.5 CPUs up to two workers, then affinity can constrain it further.
+        (leaf / "cpu.max").write_text("max 100000\n", encoding="utf-8")
+        (cgroup / "team" / "cpu.max").write_text(
+            "150000 100000\n", encoding="utf-8"
+        )
+        assert rp.linux_cpu_quota_count(
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) == 2
+        assert rp.available_cpu_count(
+            platform="linux",
+            cpu_count=64,
+            affinity_getter=lambda _pid: range(1),
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) == 1
+
+        # v1 combined-controller declaration with the conventional cpu mount.
+        v1_leaf = cgroup / "cpu" / "batch" / "job"
+        v1_leaf.mkdir(parents=True)
+        cgroup_file.write_text(
+            "4:cpu,cpuacct:/batch/job\n", encoding="utf-8"
+        )
+        (v1_leaf / "cpu.cfs_quota_us").write_text(
+            "-1\n", encoding="utf-8"
+        )
+        (v1_leaf / "cpu.cfs_period_us").write_text(
+            "100000\n", encoding="utf-8"
+        )
+        v1_parent = cgroup / "cpu" / "batch"
+        (v1_parent / "cpu.cfs_quota_us").write_text(
+            "350000\n", encoding="utf-8"
+        )
+        (v1_parent / "cpu.cfs_period_us").write_text(
+            "100000\n", encoding="utf-8"
+        )
+        assert rp.linux_cpu_quota_count(
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) == 4
+
+        # A declared path cannot escape the injected cgroup root.
+        cgroup_file.write_text("0::/../../outside\n", encoding="utf-8")
+        assert rp.linux_cpu_quota_count(
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) is None
+
+        # Non-Linux hosts still honor process affinity but never inspect Linux
+        # quota files.
+        assert rp.available_cpu_count(
+            platform="darwin",
+            cpu_count=12,
+            affinity_getter=lambda _pid: range(6),
+            self_cgroup_path=str(cgroup_file),
+            cgroup_root=str(cgroup),
+        ) == 6
+
+    with mock.patch.object(rp, "available_cpu_count", return_value=3):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert rp.configured_cpu_workers("TEST_WORKERS", 8) == 3
+            assert rp.configured_cpu_workers("TEST_WORKERS", 2) == 2
+        with mock.patch.dict(
+            os.environ, {"TEST_WORKERS": "17"}, clear=True
+        ):
+            assert rp.configured_cpu_workers("TEST_WORKERS", 8) == 17
+        for invalid in ("0", "-2", "many"):
+            with mock.patch.dict(
+                os.environ, {"TEST_WORKERS": invalid}, clear=True
+            ):
+                try:
+                    rp.configured_cpu_workers("TEST_WORKERS", 8)
+                except ValueError as exc:
+                    assert "positive integer" in str(exc)
+                else:
+                    raise AssertionError(
+                        f"invalid worker override {invalid!r} was accepted"
+                    )
 
 
 def _memory_checks():
@@ -523,6 +668,7 @@ def main():
     _native_loader_checks()
     _native_module_manifest_checks()
     _device_checks()
+    _cpu_availability_checks()
     _memory_checks()
     _file_hint_checks()
     _spine_cache_linux_checks()

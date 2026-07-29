@@ -5,8 +5,9 @@
 // source on both architectures instead of maintaining a second, easily-divergent
 // implementation.
 //
-// Build x86-64 with SSSE3 and FMA3 enabled (for example, -march=native on an
-// AVX2/FMA3 machine, or explicitly -mssse3 -mfma).
+// Build x86-64 with AVX, SSSE3 and FMA3 enabled (for example, -march=native on
+// a compatible machine, or explicitly -mavx -mssse3 -mfma). AVX2 is isolated
+// in separately target-attributed functions in fused_gemv.c.
 
 #ifndef K3_NEON_COMPAT_X86_H
 #define K3_NEON_COMPAT_X86_H

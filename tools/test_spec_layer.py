@@ -4,7 +4,12 @@ tools/test_spec_replay.py proves the replay MATH is exact. This proves the
 PLUMBING: that `spec_decode.install()` actually intercepts a real
 KimiDeltaAttention forward, records the three short-conv inputs in q,k,v order
 and the recurrence kwargs, and that `rollback_replay` leaves KimiDynamicCache
-holding exactly the state a shorter pass would have produced.
+holding the numerically equivalent state a shorter pass would have produced.
+
+The replay of captured tensors is bit-exact (test_spec_replay.py). A separate
+shorter forward can differ by a few ulps because dense projection kernels are
+shape-dependent; that cross-shape numerical gate is deliberately explicit
+below and full generation must still emit the control token sequence.
 
 Runs on a miniature config with random weights — no spine, no experts, seconds.
 
@@ -46,6 +51,8 @@ H = small["hidden_size"]
 T = 5
 kr._step_ctx["layer"] = 0
 fail = 0
+REC_ATOL = 1e-6
+CONV_ATOL = 2e-6
 
 
 def fresh_cache(seed_len=3):
@@ -58,22 +65,14 @@ def fresh_cache(seed_len=3):
 
 x = torch.randn(1, T, H, device=DEV)
 
-# The shipped ShortConvolution has a T==1 fast path (K3_SHORTCONV=mulsum: a
-# 4-tap gather+mul+sum instead of F.conv1d).  It changes q/k/v by ~1e-8, so a
-# keep=1 reference taken through it can never match a batched pass bit-for-bit
-# — that gap is between the T=1 and T>1 conv kernels and is already present in
-# the shipped T=2 speculation, not something rollback introduces.  Pin the
-# reference to the same conv kernel the batched pass used, and report the
-# mulsum gap separately.
-import fla.modules as _flam  # noqa: E402
-
 for keep in range(1, T + 1):
-    # reference: only `keep` positions were ever fed
+    # Reference: only `keep` positions were ever fed. The portable mulsum
+    # short-convolution itself uses identical W-wide reductions for T=1 and
+    # T>1; the surrounding dense projections may still choose a different
+    # shape-dependent reduction.
     ref = fresh_cache()
     pre_rec, pre_conv = ref.recurrent_states[0], ref.conv_states[0]
-    _sc, _flam.SHORTCONV = _flam.SHORTCONV, "conv1d"
     attn(hidden_states=x[:, :keep], cache_params=ref)
-    _flam.SHORTCONV = _sc
 
     # speculative: feed all T, then roll back to `keep`
     got = kr.ml.KimiDynamicCache(cfg)
@@ -91,24 +90,41 @@ for keep in range(1, T + 1):
     d_conv = max((got.conv_states[0][i].float().cpu()
                   - ref.conv_states[0][i].float().cpu()).abs().max().item()
                  for i in range(3))
-    ok = (d_rec == 0.0 and d_conv == 0.0 and n_conv == 3 and has_kw)
+    ok = (
+        d_rec <= REC_ATOL
+        and d_conv <= CONV_ATOL
+        and n_conv == 3
+        and has_kw
+    )
     fail += not ok
     print(f"T={T} keep={keep}: captured {n_conv} convs kw={has_kw} | "
           f"recurrent maxdiff {d_rec:.3e} conv maxdiff {d_conv:.3e} "
           f"{'PASS' if ok else 'FAIL'}", flush=True)
 
-# informational: the size of the shipped T=1 conv fast-path gap, for scale
-alt = fresh_cache()
-pre_rec, pre_conv = alt.recurrent_states[0], alt.conv_states[0]
-attn(hidden_states=x[:, :1], cache_params=alt)          # mulsum (shipped T=1)
-ref1 = kr.ml.KimiDynamicCache(cfg)
-ref1.recurrent_states[0], ref1.conv_states[0] = pre_rec, pre_conv
-_sc, _flam.SHORTCONV = _flam.SHORTCONV, "conv1d"
-attn(hidden_states=x[:, :1], cache_params=ref1)
-_flam.SHORTCONV = _sc
-print(f"[info] shipped T=1 mulsum vs conv1d state gap: "
-      f"{(alt.recurrent_states[0] - ref1.recurrent_states[0]).abs().max():.3e} "
-      f"(pre-existing; also present in the shipped T=2 speculation)", flush=True)
+# A batched production call must remain numerically equivalent to T ordinary
+# decode calls without invoking rollback at all. The isolated short-conv test
+# is bit-exact; this full-layer comparison includes shape-dependent linears.
+batched = fresh_cache()
+sequential = fresh_cache()
+attn(hidden_states=x, cache_params=batched)
+for index in range(T):
+    attn(hidden_states=x[:, index:index + 1], cache_params=sequential)
+d_rec = (
+    batched.recurrent_states[0] - sequential.recurrent_states[0]
+).abs().max().item()
+d_conv = max(
+    (
+        batched.conv_states[0][index] - sequential.conv_states[0][index]
+    ).abs().max().item()
+    for index in range(3)
+)
+batch_ok = d_rec <= REC_ATOL and d_conv <= CONV_ATOL
+print(
+    f"batched versus sequential: recurrent maxdiff {d_rec:.3e} "
+    f"conv maxdiff {d_conv:.3e} {'PASS' if batch_ok else 'FAIL'}",
+    flush=True,
+)
+fail += not batch_ok
 
 # capture disarmed must leave the kernels byte-for-byte on the shipped path
 c1, c2 = fresh_cache(), fresh_cache()

@@ -4,9 +4,38 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# K3_SHORTCONV=mulsum swaps the T=1 depthwise conv for an explicit 4-tap
-# gather+multiply+sum. Default "conv1d" = the F.conv1d path this shipped with.
-SHORTCONV = os.environ.get("K3_SHORTCONV", "mulsum")
+# K3_SHORTCONV=mulsum swaps the tiny-width depthwise conv for explicit
+# sliding-window multiply+sum. It is the established one-token decode path on
+# every supported backend and the measured T<=9 CPU path; "auto" retains
+# conv1d elsewhere as a comparison/fallback until a backend gate passes.
+SHORTCONV = os.environ.get("K3_SHORTCONV", "auto").strip().lower()
+_SHORTCONV_AUTO_MAX_T = os.environ.get("K3_SHORTCONV_AUTO_MAX_T")
+
+
+def resolve_shortconv_mode(device, requested=None):
+    """Resolve auto against the tensor's real backend; overrides stay forceful."""
+    mode = SHORTCONV if requested is None else str(requested).strip().lower()
+    device_type = getattr(device, "type", str(device)).lower()
+    if mode == "auto":
+        return (
+            "mulsum"
+            if device_type in ("mps", "cuda", "cpu")
+            else "conv1d"
+        )
+    if mode not in ("mulsum", "conv1d"):
+        raise ValueError("K3_SHORTCONV must be auto, mulsum, or conv1d")
+    return mode
+
+
+def shortconv_auto_max_t(device):
+    """Return the evidence-bounded automatic sliding-window threshold."""
+    if _SHORTCONV_AUTO_MAX_T is not None:
+        return max(1, int(_SHORTCONV_AUTO_MAX_T))
+    device_type = getattr(device, "type", str(device)).lower()
+    # The real K3 CPU shape wins by hundreds of times through T=9. Accelerator
+    # T>1 crossovers are close and backend/runtime dependent, so preserve the
+    # established T=1 fast path until their active-path gate passes.
+    return 9 if device_type == "cpu" else 1
 
 
 class ShortConvolution(nn.Conv1d):
@@ -26,21 +55,53 @@ class ShortConvolution(nn.Conv1d):
         # x: [B, T, D]
         B, T, D = x.shape
         W = self.kernel_size[0]
-        if SHORTCONV == "mulsum" and T == 1 and cache is not None:
-            # Decode step. The causal window the conv would see is exactly
-            # [cache[1:], x], which is also exactly the next cache, so the
-            # separate cat+slice that builds new_cache below is redundant.
-            # 12,288 depthwise groups over a length-4 window is a grouped
-            # convolution only in name: 0.63 ms -> 0.38 ms for the three convs.
-            z = torch.cat([cache.to(torch.float32)[:, :, 1:],
-                           x.reshape(B, D, 1).to(torch.float32)], dim=-1)  # [B,D,W]
-            y = (z * self.weight.view(D, W).to(torch.float32)).sum(-1)     # [B,D]
+        mode = resolve_shortconv_mode(x.device)
+        use_mulsum = (
+            mode == "mulsum"
+            and cache is not None
+            and (SHORTCONV != "auto" or T <= shortconv_auto_max_t(x.device))
+        )
+        if use_mulsum:
+            # Decode and speculative verification.  The causal source is the
+            # last W-1 cached inputs followed by the T new inputs.  Unfolding
+            # that source produces exactly the same W-wide windows as T
+            # consecutive one-token calls, while retaining an explicit
+            # last-dimension reduction. Backends may still vary that reduction
+            # by a few ulps with outer shape, so the cache is exact while output
+            # is sequence-gated rather than advertised as byte-identical.
+            #
+            # 12,288 depthwise groups over width four are a grouped convolution
+            # only in name; the portable tensor path also avoids an especially
+            # poor CPU kernel choice.
+            xt = x.transpose(1, 2).to(torch.float32)       # [B,D,T]
+            source = torch.cat(
+                [cache.to(torch.float32)[:, :, 1:], xt], dim=-1
+            )                                             # [B,D,W-1+T]
+            windows = source.unfold(-1, W, 1)             # [B,D,T,W]
+            weight = self.weight.view(1, D, 1, W).to(torch.float32)
+            y = (windows * weight).sum(-1)                # [B,D,T]
             if self.act in ('silu', 'swish'):
                 y = F.silu(y)
-            y = y.view(B, 1, D).to(x.dtype)
+            y = y.transpose(1, 2).to(x.dtype)             # [B,T,D]
             if residual is not None:
                 y = y + residual
-            return y, (z if output_final_state else None)
+            new_cache = None
+            if output_final_state:
+                if torch.is_grad_enabled():
+                    # Preserve the historical autograd contract: callers may
+                    # mutate the returned cache before backward without
+                    # modifying ``source``, which this branch saves for the
+                    # output gradient. Production inference is functional and
+                    # can safely retain the source-tail alias below.
+                    full = torch.cat([cache.to(torch.float32), xt], dim=-1)
+                    new_cache = full[:, :, -W:].contiguous()
+                else:
+                    # ``source`` is already ``cache[..., 1:] + xt``. For every
+                    # non-empty call its last W positions are therefore exactly
+                    # the last W positions of ``cache + xt``. Reuse it instead
+                    # of allocating and copying the same values a second time.
+                    new_cache = source[:, :, -W:].contiguous()
+            return y, new_cache
         w = self.weight.view(D, W).to(torch.float32)  # [D, W]
         xt = x.transpose(1, 2).to(torch.float32)      # [B, D, T]
         if cache is None:
@@ -56,9 +117,20 @@ class ShortConvolution(nn.Conv1d):
             y = y + residual
         new_cache = None
         if output_final_state:
-            full = torch.cat([cache.to(torch.float32) if cache is not None
-                              else xt.new_zeros(B, D, W), xt], dim=-1)
-            new_cache = full[:, :, -W:].contiguous()
+            if torch.is_grad_enabled():
+                # Keep returned training state independent from ``z`` because
+                # conv1d backward retains ``z`` and checks its version.
+                full = torch.cat(
+                    [cache.to(torch.float32) if cache is not None
+                     else xt.new_zeros(B, D, W), xt],
+                    dim=-1,
+                )
+                new_cache = full[:, :, -W:].contiguous()
+            else:
+                # ``z`` and the historical ``full`` construction have
+                # identical W-wide tails for every T >= 1, including an empty
+                # initial cache.
+                new_cache = z[:, :, -W:].contiguous()
         return y, new_cache
 
 

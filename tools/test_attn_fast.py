@@ -75,6 +75,8 @@ def cmp(tag, a, b):
           f"{'  BIT-EXACT' if worst == 0 else ''}", flush=True)
 
 
+fm.SHORTCONV = "conv1d"
+fk.RECUR = "cpu"
 print("reference (conv1d, cpu recurrence)", flush=True)
 ref = run()
 print(f"  ref output scale = {float(ref[0].abs().max()):.4f}")
@@ -83,8 +85,8 @@ fm.SHORTCONV = "mulsum"
 cmp("K3_SHORTCONV=mulsum", ref, run())
 fm.SHORTCONV = "conv1d"
 
-fk.RECUR = "mps"
-cmp("K3_KDA_RECUR=mps", ref, run())
+fk.RECUR = "device"
+cmp("K3_KDA_RECUR=device", ref, run())
 
 fm.SHORTCONV = "mulsum"
 cmp("both", ref, run())

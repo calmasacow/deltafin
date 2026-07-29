@@ -75,6 +75,79 @@ def test_native_int8_capability_fallback():
     pilot._LN.clear()
     pilot._READY = False
     pilot._BROKEN = False
+    pilot._INT8_MATMUL = None
+    pilot._INT8_SUPPORTS_TOKENS = None
+
+
+def test_discovered_int8_backend_is_used_fail_closed():
+    """PILOT consumes the discovered callable instead of a top-level alias."""
+    print("discovered native-int8 backend")
+    import pilot
+
+    config = type("Config", (), {
+        "num_hidden_layers": 2,
+        "first_k_dense_replace": 1,
+        "moe_layer_freq": 1,
+        "num_experts_per_token": 2,
+        "rms_norm_eps": 1e-5,
+    })()
+    calls = []
+
+    class Backend:
+        available = True
+
+        @staticmethod
+        def supports_tokens(count):
+            return count <= 2
+
+        @staticmethod
+        def matmul(hidden, qweight, scale):
+            calls.append(hidden.shape[0])
+            return hidden @ (qweight.float() * scale[:, None]).T
+
+    def load(name):
+        if name.endswith("e_score_correction_bias"):
+            return torch.zeros(4)
+        if name.endswith("post_attention_layernorm.weight"):
+            return torch.ones(3)
+        raise KeyError(name)
+
+    def load_packed(name):
+        if not name.endswith("gate.weight"):
+            return None
+        return (
+            torch.arange(12, dtype=torch.int8).reshape(4, 3),
+            torch.full((4,), 0.125, dtype=torch.float32),
+        )
+
+    pilot.init(
+        config,
+        torch.device("cpu"),
+        load,
+        "model.",
+        load_packed=load_packed,
+        native_int8=Backend(),
+    )
+    got = pilot._route(1, torch.ones(1, 3), 2)[1]
+    check("discovered backend called", calls == [1], str(calls))
+    check("discovered backend route shape", tuple(got.shape) == (1, 2))
+
+    # A larger activation crosses over transiently without replacing the
+    # packed gate, so subsequent decode can still use the fast backend.
+    pilot._route(1, torch.ones(3, 3), 2)
+    check("large-T crossover retains packed gate",
+          pilot._W[1].dtype == torch.int8)
+    pilot._route(1, torch.ones(1, 3), 2)
+    check("decode re-enters packed backend", calls == [1, 1], str(calls))
+
+    pilot._W.clear()
+    pilot._S.clear()
+    pilot._B.clear()
+    pilot._LN.clear()
+    pilot._READY = False
+    pilot._BROKEN = False
+    pilot._INT8_MATMUL = None
+    pilot._INT8_SUPPORTS_TOKENS = None
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +290,7 @@ def test_pread_slots():
 
 if __name__ == "__main__":
     test_native_int8_capability_fallback()
+    test_discovered_int8_backend_is_used_fail_closed()
     test_router_mirror()
     test_npz_hook()
     if "--slots" in sys.argv:

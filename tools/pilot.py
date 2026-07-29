@@ -95,6 +95,8 @@ _CFG = {}        # top_k / eps / NL / first_moe
 _READY = False
 _BROKEN = False
 _INT8_WARNED = False
+_INT8_MATMUL = None
+_INT8_SUPPORTS_TOKENS = None
 
 _CAP = {"x": None}      # pre-MoE hidden captured from post_attention_layernorm
 _PRED = {}              # layer -> [[eid, ...], ...] per token position
@@ -120,7 +122,7 @@ def init(
         native_int8=None):
     """Load every MoE layer's router once.  `load(name)` must be the driver's own
     resident loader so the cached gate matches the one the model will run."""
-    global _READY, _BROKEN
+    global _READY, _BROKEN, _INT8_MATMUL, _INT8_SUPPORTS_TOKENS
     if _READY or _BROKEN:
         return
     t0 = time.time()
@@ -129,6 +131,21 @@ def init(
     freq = getattr(config, "moe_layer_freq", 1)
     effective_dt = GATE_DT
     if GATE_DT == "int8":
+        _INT8_MATMUL = None
+        _INT8_SUPPORTS_TOKENS = None
+        operator = None
+        supports_tokens = None
+        backend_available = getattr(native_int8, "available", None)
+        backend_matmul = getattr(native_int8, "matmul", None)
+        if backend_available is not False and callable(backend_matmul):
+            operator = backend_matmul
+            candidate_support = getattr(
+                native_int8, "supports_tokens", None
+            )
+            if callable(candidate_support):
+                supports_tokens = candidate_support
+        elif callable(native_int8):
+            operator = native_int8
         if native_int8 is None:
             probe = getattr(
                 getattr(torch, "_C", None),
@@ -144,10 +161,19 @@ def init(
                 )
             except Exception:
                 native_int8 = False
-        if not native_int8 or load_packed is None:
+        if operator is None and native_int8 is True:
+            operator = getattr(torch, "_weight_int8pack_mm", None)
+            if operator is None:
+                aten = getattr(getattr(torch, "ops", None), "aten", None)
+                packet = getattr(aten, "_weight_int8pack_mm", None)
+                operator = getattr(packet, "default", packet)
+        if operator is None or load_packed is None:
             effective_dt = "fp32"
             print("[pilot] native-int8 gate path unavailable; "
                   "falling back to fp32 gates", flush=True)
+        else:
+            _INT8_MATMUL = operator
+            _INT8_SUPPORTS_TOKENS = supports_tokens
     want = _DTS.get(effective_dt, torch.float32)
     nbytes = 0
     try:
@@ -221,8 +247,21 @@ def _route(li, h, k):
     w = _W[li]
     if w.dtype == torch.int8:
         try:
-            logits = torch._weight_int8pack_mm(h.float(), w, _S[li])
-        except (NotImplementedError, RuntimeError) as exc:
+            if (
+                _INT8_SUPPORTS_TOKENS is not None
+                and not _INT8_SUPPORTS_TOKENS(h.reshape(-1, h.shape[-1]).shape[0])
+            ):
+                # Keep the packed gate resident for decode. A large prompt can
+                # temporarily cross over without permanently retaining both
+                # packed and dense copies of all 92 router matrices.
+                dense = w.to(torch.float32) * _S[li][:, None]
+                logits = torch.nn.functional.linear(h.float(), dense)
+            else:
+                if _INT8_MATMUL is None:
+                    raise RuntimeError("packed-int8 PILOT operator is unavailable")
+                logits = _INT8_MATMUL(h.float(), w, _S[li])
+        except (AttributeError, NotImplementedError, RuntimeError,
+                TypeError, ValueError) as exc:
             # Capability fallback for PyTorch/chip combinations that expose
             # the op but lack a usable MPS kernel. Keep the optimization
             # selectable per chip rather than hard-coding Apple generations.

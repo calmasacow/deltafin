@@ -732,6 +732,200 @@ def compare_output(
     return ((not reasons) if checks else None), reasons
 
 
+def performance_contract_errors(
+    environment_delta: dict[str, str],
+    parsed: dict[str, Any],
+) -> list[str]:
+    """Reject requested accelerators that silently executed their fallback.
+
+    Exact output alone is insufficient for an optimization benchmark: a safe
+    fallback can emit the right sequence while measuring two copies of the
+    control. Keep this validation beside the generic runner parser so every
+    future K3_INT8_KDA_QKV campaign fails closed. The historical environment
+    name is retained for compatibility, but the optimized KDA unit now includes
+    every eligible same-input first-stage projection, not only Q/K/V.
+    """
+    enabled_values = {"1", "true", "yes", "on", "force"}
+    requested = (
+        environment_delta.get("K3_INT8_KDA_QKV", "").strip().lower()
+        in enabled_values
+    )
+    if not requested:
+        return []
+    runtime = parsed.get("runner_runtime")
+    status = (
+        runtime.get("int8_kda_qkv")
+        if isinstance(runtime, dict) else None
+    )
+    if not isinstance(status, dict):
+        return [
+            "K3_INT8_KDA_QKV was requested but no runtime status was captured"
+        ]
+    errors = []
+    if status.get("requested") is not True:
+        errors.append("packed KDA bundle runtime did not record requested=true")
+    if status.get("eligible") is not True:
+        errors.append("packed KDA bundle runtime was not eligible")
+    if type(status.get("controllers_installed")) is not int or (
+        status["controllers_installed"] < 1
+    ):
+        errors.append("packed KDA bundle installed no controller")
+    if status.get("enabled_at_end") is not True:
+        errors.append(
+            "packed KDA bundle was disabled or fell back before run end"
+        )
+    calls = status.get("packed_project_calls")
+    if type(calls) is not int or calls <= 0:
+        errors.append("packed KDA bundle executed no packed projection calls")
+    controllers = status.get("controllers")
+    if not isinstance(controllers, list) or not controllers:
+        errors.append("packed KDA bundle reported no controller telemetry")
+    else:
+        required_roles = {"q", "k", "v", "f_a", "b"}
+        for index, controller in enumerate(controllers):
+            roles = (
+                controller.get("packed_roles")
+                if isinstance(controller, dict) else None
+            )
+            role_set = set(roles) if isinstance(roles, list) else set()
+            missing = required_roles - role_set
+            gate_count = len(role_set & {"g", "g_a"})
+            if missing or gate_count != 1:
+                details = []
+                if missing:
+                    details.append("missing " + ",".join(sorted(missing)))
+                if gate_count != 1:
+                    details.append("requires exactly one of g/g_a")
+                errors.append(
+                    f"packed KDA controller {index} is not the complete "
+                    "same-input bundle (" + "; ".join(details) + ")"
+                )
+    if status.get("disable_reason") not in (None, ""):
+        errors.append(
+            "packed KDA bundle reported a disable reason: "
+            f"{status.get('disable_reason')}"
+        )
+    storage_mode = environment_delta.get(
+        "K3_INT8_KDA_STORAGE", "arena"
+    ).strip().lower()
+    stage_sync_mode = environment_delta.get(
+        "K3_INT8_KDA_STAGE_SYNC", "event"
+    ).strip().lower().replace("-", "_")
+    if storage_mode == "stage":
+        if status.get("storage_mode") != "stage":
+            errors.append(
+                "packed KDA stage run did not report storage_mode=stage"
+            )
+        if status.get("persistent_weight_bytes") != 0:
+            errors.append(
+                "packed KDA stage run retained a persistent int8 weight arena"
+            )
+        stage_bind_count = status.get("stage_bind_count")
+        if type(stage_bind_count) is not int or stage_bind_count <= 0:
+            errors.append("packed KDA stage run bound no upload-buffer generation")
+        if status.get("stage_weight_copy_bytes") != 0:
+            errors.append("packed KDA stage run copied int8 weights after upload")
+        for field, description in (
+            ("stage_bind_failures", "stage bind failures"),
+            ("stage_stale_rejections", "stale stage generations"),
+            ("stage_fence_failures", "stage fence failures"),
+            ("stage_fence_sync_fallbacks", "blocking fence fallbacks"),
+        ):
+            if status.get(field) != 0:
+                errors.append(
+                    f"packed KDA stage run reported {description}"
+                )
+        probes = status.get("stage_full_shape_probes")
+        passes = status.get("stage_full_shape_passes")
+        if type(probes) is not int or probes <= 0 or passes != probes:
+            errors.append(
+                "packed KDA stage full-shape capability probe did not pass"
+            )
+        config = parsed.get("runner_config")
+        device = (
+            str(config.get("device", ""))
+            if isinstance(config, dict) else ""
+        )
+        mps_fifo = (
+            device == "mps" and stage_sync_mode == "mps_fifo"
+        )
+        for index, controller in enumerate(
+            controllers if isinstance(controllers, list) else []
+        ):
+            if not isinstance(controller, dict):
+                continue
+            if controller.get("storage_mode") != "stage":
+                errors.append(
+                    f"packed KDA controller {index} did not use stage storage"
+                )
+            if controller.get("persistent_weight_bytes") != 0:
+                errors.append(
+                    f"packed KDA controller {index} retained int8 weights"
+                )
+            if controller.get("stage_bound") is not False:
+                errors.append(
+                    f"packed KDA controller {index} leaked a live stage binding"
+                )
+            expected_contract = (
+                "mps_fifo"
+                if (
+                    stage_sync_mode == "mps_fifo"
+                    and device == "mps"
+                )
+                else "event"
+            )
+            contract = controller.get("stage_sync_contract")
+            if (
+                (mps_fifo and contract != expected_contract)
+                or (
+                    not mps_fifo
+                    and contract is not None
+                    and contract != expected_contract
+                )
+            ):
+                errors.append(
+                    f"packed KDA controller {index} used "
+                    f"stage_sync_contract={contract}, expected "
+                    f"{expected_contract}"
+                )
+        if mps_fifo:
+            if status.get("stage_sync_mode") != "mps_fifo":
+                errors.append(
+                    "packed KDA MPS FIFO run did not report "
+                    "stage_sync_mode=mps_fifo"
+                )
+            records = status.get("stage_fifo_records")
+            reuses = status.get("stage_fifo_reuses")
+            if type(records) is not int or records <= 0:
+                errors.append(
+                    "packed KDA MPS FIFO run recorded no stream lease"
+                )
+            if type(reuses) is not int or reuses <= 0:
+                errors.append(
+                    "packed KDA MPS FIFO run reused no stream lease"
+                )
+            if status.get("stage_fence_records") != 0:
+                errors.append(
+                    "packed KDA MPS FIFO run unexpectedly recorded events"
+                )
+            if status.get("stage_fence_waits") != 0:
+                errors.append(
+                    "packed KDA MPS FIFO run unexpectedly waited on events"
+                )
+        elif device == "mps" or device.startswith("cuda"):
+            records = status.get("stage_fence_records")
+            waits = status.get("stage_fence_waits")
+            if type(records) is not int or records <= 0:
+                errors.append(
+                    "packed KDA stage GPU run recorded no reuse fence"
+                )
+            if type(waits) is not int or waits <= 0:
+                errors.append(
+                    "packed KDA stage GPU run waited on no reuse fence"
+                )
+    return errors
+
+
 def run_once(
     *,
     run_number: int,
@@ -826,6 +1020,7 @@ def run_once(
     hard_errors.extend(parsed.get("parse_errors", []))
     if output_match is False:
         hard_errors.extend(mismatch_reasons)
+    hard_errors.extend(performance_contract_errors(delta, parsed))
 
     record = {
         "schema": SCHEMA,

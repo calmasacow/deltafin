@@ -62,9 +62,9 @@ CUDA runtime.
 
 | Host | Resident model / attention | Routed-expert MoE |
 |---|---|---|
-| Apple Silicon macOS | MPS | Metal, with native CPU fallback |
+| Apple Silicon macOS | MPS | Metal, with a native CPU alternative |
 | NVIDIA Linux, x86-64 or aarch64 | CUDA | native CPU MXFP4 |
-| Linux x86-64-v3 (including AVX2/FMA3) | CPU | native SSSE3/FMA MXFP4 |
+| Linux x86-64 (AVX/FMA3/SSSE3 baseline) | CPU | runtime AVX2/FMA or exact 128-bit compatibility MXFP4 |
 | Linux aarch64 | CPU | native NEON MXFP4 |
 
 The NVIDIA path is deliberately described as hybrid: CUDA accelerates the
@@ -72,6 +72,18 @@ resident spine and attention, while routed MXFP4 experts still execute in the
 native CPU kernel. There is not yet a native CUDA MXFP4 MoE kernel.
 `build_native.py` selects `.dylib` or `.so`, applies the appropriate host ISA
 flags, validates required symbols and ABI, and only then installs the artifacts.
+The x86 build is one fat binary: it requires the instructions used by the exact
+AVX/FMA3/SSSE3 baseline, detects AVX2 once at runtime, and calls the
+target-attributed 256-bit kernel only when the CPU and OS support it.
+
+Validation is intentionally separated from platform support:
+
+| Configuration | Current evidence |
+|---|---|
+| Apple Silicon / MPS + Metal | maintainer-run end-to-end benchmarks and exact-token gates |
+| Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
+| Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
+| Discrete NVIDIA Linux | device and portability paths exist; a maintainer-replicated end-to-end run is still wanted |
 
 ### The two modes
 
@@ -193,21 +205,24 @@ Please read these caveats before pointing anything automated at it:
 
 ## Configuration
 
-Everything works with no configuration: Deltafin picks the best available
+Everything works with no configuration: Deltafin picks a preferred available
 device and the int8 spine when it has been built, and says what it chose at
 startup. These variables exist for overriding that:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `K3_DEV` | auto | `mps` when available, then `cuda`, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
+| `K3_DEV` | auto | `mps` when available, then the first CUDA device visible to the process, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
 | `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
-| `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |
-| `K3_INT8_KDA_QKV` | `0` | experimental packed-int8 KDA Q/K/V path for supported MPS systems; sequence-parity-checked, capability-gated, with dense fallback |
+| `K3_INT8_LM_HEAD` | `auto` | packed row-int8 output head when a native operator passes its real-shape canary; automatic on MPS, forceable elsewhere, with an exact dense fallback |
+| `K3_INT8_KDA_QKV` | `0` | experimental packed row-int8 bundle for KDA Q/K/V/G/F-A/B; one real MPS streamed-weight sequence has passed exactly, while every backend remains capability-gated with a dense fallback |
+| `K3_KDA_RECUR` | `device` | keep the KDA recurrence on the selected CPU, CUDA or MPS device; `cpu` preserves the historical MPS-to-CPU experiment and legacy `mps` is accepted as an alias for `device` |
+| `K3_SHORTCONV` | `auto` | use the portable decode-time four-tap multiply/sum kernel on MPS, CUDA and CPU; `conv1d` remains forceable for backend retesting |
 | `K3_SPEC` | `1` | n-gram speculation (lossless) |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |
 | `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
+| `K3_GEMV_THREADS` | auto | native CPU MXFP4 workers: up to 4 effective CPUs on macOS and 8 on Linux, respecting affinity and cgroup quota; override to retune a specific host |
 | `K3_METAL_POSITION_BATCH` | `0` | MPS/Metal-specific exact opt-in T>1 position-major MoE; measured +2.0% on accepted speculative passes and should be retuned per Mac |
 | `K3_MOE_TOP_K` | `16` | explicit quality/speed dial; fewer routed experts reduce expert bytes and can change output |
 | `K3_CPU_MOE_BATCH` | `auto` | exact persistent CPU MXFP4 worker ring; padded counters measured +3.6% at eight threads |
@@ -223,8 +238,8 @@ startup. These variables exist for overriding that:
 
 ## Requirements
 
-- Apple Silicon macOS, or x86-64/aarch64 Linux. Linux x86-64 requires the
-  x86-64-v3 instruction-set level (including AVX2 and FMA3).
+- Apple Silicon macOS, or x86-64/aarch64 Linux. Linux x86-64 requires
+  AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected at runtime.
 - A C/C++ compiler: Xcode Command Line Tools on macOS, or GCC/Clang on Linux.
 - Python 3.12 or newer.
 - PyTorch for the selected device. NVIDIA acceleration requires a CUDA-enabled
@@ -232,9 +247,11 @@ startup. These variables exist for overriding that:
 - Disk: ~1.7 TB for the full install, ~215 GB for streaming (see [Install](#install)).
 - Network access to Hugging Face.
 
-RAM, accelerator memory and container/cgroup limits are budgeted
-automatically. More memory lets Deltafin retain more of the resident spine and
-expert page cache. See
+Host RAM and container/cgroup limits are budgeted automatically. Accelerator
+headroom is also checked when private resident-layer pinning is enabled. CUDA
+auto-selection uses the first device visible to the process; `K3_DEV=cuda:N`
+remains authoritative. More memory lets Deltafin retain more of the resident
+spine and expert page cache. See
 [Why newer hardware should be faster](#why-newer-hardware-should-be-faster).
 
 ## How it works
@@ -341,7 +358,6 @@ oracles were checked for every full-model run.
 | Change | Measured result | Shipping behavior |
 |---|---|---|
 | Packed MPS int8 output head | **+17.3%** median steady decode, **+23.1%** prefill, and **+26.8%** wall throughput; resident head storage fell from 4.7 GB to 1.17 GB | enabled when the operator and int8 weights are available, with an exception-guarded dense fallback |
-| Packed MPS int8 KDA Q/K/V | An initial balanced two-pair full-model A/B measured **+2.8%** median steady decode and **−4.7%** prefill; the run ranges overlap, so more repetitions are welcome | sequence-parity-checked opt-in via `K3_INT8_KDA_QKV=1`; capability-gated, with dense fallback on setup or backend failure |
 | Reference-only speculative snapshots | 0.001 ms instead of 3.56 ms and no ~475 MB state clone | enabled by default; replay and partial-accept tests preserve the exact future sequence |
 | Position-major Metal MoE for accepted drafts | **+4.7%** on a real T=2 layer and **+2.0%** pooled full-model throughput | exact opt-in via `K3_METAL_POSITION_BATCH=1`, pending per-Mac tuning |
 | 128-byte-aligned CPU worker counters | **+0.2%** at four threads and **+3.6%** at eight threads | automatic in the persistent CPU fallback |
@@ -381,8 +397,9 @@ hard-coded chip name:
   everything else on a 64 GB host, so much of it is re-read every token. With
   more headroom it can remain in page cache, expert preload waits fall, and
   Deltafin pins more layers automatically.
-- **CPU ISA and cores.** aarch64 uses NEON; supported x86-64 Linux hosts use the
-  SSSE3/FMA kernel and are preflighted for x86-64-v3 features before loading it.
+- **CPU ISA and cores.** aarch64 uses NEON. The x86-64 fat binary preflights
+  its AVX/FMA3/SSSE3 baseline and selects its bit-exact AVX2/FMA kernel at
+  runtime when available.
 
 Runtime selection checks MPS/CUDA availability, native CPU capabilities, host
 and cgroup memory limits, and optional operator support rather than matching
@@ -415,9 +432,10 @@ streaming-inference techniques.
 
 ## Techniques
 
-Each technique below was measured on real weights before it was retained. Little
-of this is novel on its own; most of it adapts ideas from the projects credited
-below to K3's particular shape.
+Performance claims below were measured on real weights before they were
+retained. Compatibility-only paths are labelled separately and do not borrow a
+speed percentage from another machine. Little of this is novel on its own; most
+of it adapts ideas from the projects credited below to K3's particular shape.
 
 ### I/O and streaming
 
@@ -443,11 +461,19 @@ below to K3's particular shape.
 ### Compute
 
 - **Fused MXFP4 dequant+GEMV** ([`tools/fused_gemv.c`](tools/fused_gemv.c)) — a
-  native kernel that dequantizes and multiplies in one pass using a 16-entry
-  table lookup, with the e8m0 scale applied as integer arithmetic on the fp32
-  exponent. It uses NEON on aarch64 and SSSE3/FMA on x86-64, matches the
-  reference implementation bit-for-bit, and replaced a much slower
-  dequantize-then-matmul path. A Metal version exists as a validated prototype.
+  native kernel that dequantizes and multiplies in one pass. An immutable 8 KiB
+  lookup covers the complete E8M0 scale domain, so the kernel no longer rebuilds
+  the same exponent table for every 32 weights. It uses NEON on aarch64 and
+  runtime-selected AVX2/FMA on x86-64, with an exact AVX/FMA3/SSSE3
+  compatibility implementation for hosts without AVX2.
+  The persistent x86 batch path permutes each distinct activation once for the
+  whole dispatch rather than once per expert or row chunk. The lookup and the
+  retained synthesis oracle are bit-identical for all 16 E2M1 codes, all 256
+  E8M0 bytes, odd shapes, multithreading and persistent batching on both
+  supported CPU architectures. Selected and compatibility implementations also
+  agree with the independent float64 reference within its stated numerical
+  bound. They replaced a much slower dequantize-then-matmul path. A Metal
+  version exists as a validated prototype.
 - **Template-layer buffer reuse.** All 69 KDA layers share one set of tensor
   shapes and all 24 MLA layers another, so two persistent device-resident "template"
   layers can receive each layer's weights via `copy_()`. This avoids the allocator
@@ -463,17 +489,19 @@ below to K3's particular shape.
 - **Packed int8 output head (Apple).** The built-in MPS weight-only matmul consumes the
   existing row-int8 checkpoint directly, avoiding a 4.7 GB fp32 head and its
   dequantization. Capability checks and a caught dense fallback preserve support
-  across PyTorch releases and Apple GPU families.
-- **Packed int8 KDA projections (Apple).** The same native MPS operator consumes each
-  KDA layer's Q/K/V matrices directly from the row-int8 spine. The two reusable
-  KDA templates share one 252 MiB packed arena, so those three large matrices
-  are neither dequantized nor retained as dense fp32 weights. This remains a
-  sequence-parity-checked opt-in while its early A/B is repeated; capability
-  and failure guards preserve the dense path.
+  across PyTorch releases and accelerator generations.
+- **Packed int8 KDA projection bundle.** An opt-in controller keeps
+  Q/K/V/G/F-A/B in one row-int8 arena and collapses the six same-input
+  projections into one native call when the backend passes real-shape and
+  unequal-row canaries. A real streamed-weight MPS run executed 816 projections
+  as 136 calls with exact emitted tokens and no fallback. Unsupported CPU,
+  CUDA, MPS, shape or ABI combinations stay on the dense path; broader
+  backend timing is still required before this becomes automatic.
 - **Pure-PyTorch KDA shim** ([`tools/fla/`](tools/fla)) — Kimi Delta Attention's
   recurrence, short convolution, and gated norm, ported from fla-core's semantics.
   Chunked and step-by-step execution agree to about 1e-9. At decode the recurrence
-  runs on CPU, where its small state fits better than a series of GPU dispatches.
+  stays on the selected device by default; an explicit CPU mode remains
+  available for backend-specific retesting.
 
 ### Decoding
 
@@ -503,10 +531,11 @@ sequenceDiagram
 ### Scaling with RAM
 
 - At startup Deltafin reserves memory for the OS (`max(10 GB, 18%)`) and pins as
-  many resident layers as the remainder allows, while respecting container
-  limits and accelerator headroom where available. A 128 GB machine can pin
-  several times more than a 64 GB one without configuration, and the expert
-  cache additionally benefits from whatever page cache is free.
+  many private resident layers as the selected mode allows, while respecting
+  host and container limits and accelerator headroom when that pinning path is
+  active. The default shared templates instead minimize live device storage.
+  A 128 GB machine also gives the expert and spine page caches substantially
+  more room.
 
 ## Where this could go
 
@@ -522,9 +551,9 @@ Deltafin leans heavily on work that others published openly. In rough order of
 influence:
 
 - **[Maurice Brown (`trumb`)](https://github.com/trumb)** — contributed the
-  Linux x86-64/aarch64 and NVIDIA compatibility findings, native-kernel
-  correctness checks, platform-specific build settings and DGX Spark
-  measurements in
+  Linux x86-64/aarch64 and NVIDIA compatibility findings, AVX2 kernel design,
+  native-kernel correctness checks, platform-specific build settings and DGX
+  Spark measurements in
   **[pull request #2](https://github.com/gavamedia/deltafin/pull/2)**. Those
   findings informed Deltafin's guarded cross-platform implementation.
 - **[colibri](https://github.com/JustVugg/colibri)** (JustVugg, Apache-2.0) —

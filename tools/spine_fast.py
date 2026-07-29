@@ -42,13 +42,16 @@ import types
 import torch
 
 import spine_io
+import runtime_platform
 
 # ---------------------------------------------------------------- flags -----
 FAST = os.environ.get("K3_FAST_SPINE", "1") == "1"
 # fine-grained overrides so the orchestrator can bisect the three changes
 DEQ = os.environ.get("K3_SPINE_DEQ", "metal" if FAST else "torch")   # metal|mulout|torch
 PACK = os.environ.get("K3_SPINE_PACK", "1" if FAST else "0") == "1"  # packed read + 1 H2D
-READ_THREADS = int(os.environ.get("K3_SPINE_READ_THREADS", "4" if FAST else "1"))
+READ_THREADS = runtime_platform.configured_cpu_workers(
+    "K3_SPINE_READ_THREADS", 4 if FAST else 1
+)
 ALIGN = 256          # byte alignment of every slot inside the packed buffer
 
 spine_io.set_process_io_policy()
@@ -176,10 +179,291 @@ def _release(buf):
 # Persistent device staging buffers: without these every layer would allocate
 # and free a fresh ~634 MB MPS buffer for the packed int8 payload.
 _stage = {}
+_stage_generations = {}
+_stage_fences = {}
+
+
+class _StageLease:
+    """Identity/generation proof for a direct view into a recycled upload buffer."""
+
+    __slots__ = (
+        "key",
+        "generation",
+        "data_ptr",
+        "sync_contract",
+        "stream_signature",
+    )
+
+    def __init__(
+        self,
+        key,
+        generation,
+        data_ptr,
+        sync_contract="event",
+        stream_signature=None,
+    ):
+        self.key = key
+        self.generation = generation
+        self.data_ptr = data_ptr
+        self.sync_contract = sync_contract
+        self.stream_signature = stream_signature
+
+
+class _FailedStageFence:
+    """Poison a staging buffer whose prior GPU use could not be ordered."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error):
+        self.error = error
+
+
+class _FifoStageFence:
+    """Proof that prior use and the next overwrite share one FIFO stream."""
+
+    __slots__ = ("stream_signature", "controller")
+
+    def __init__(self, stream_signature, controller):
+        self.stream_signature = stream_signature
+        self.controller = controller
+
+
+def _stage_key(dev, dtype):
+    index = dev.index
+    if dev.type == "cuda" and index is None:
+        # ``torch.device("cuda")`` follows the mutable process current device.
+        # Resolve it before indexing global staging state so two GPUs can never
+        # alias one upload buffer/fence/generation record.
+        index = torch.cuda.current_device()
+    return (dev.type, index, dtype)
+
+
+def _normalize_stage_sync_mode(mode):
+    normalized = str(mode).strip().lower().replace("-", "_")
+    if normalized not in {"event", "mps_fifo"}:
+        raise ValueError(
+            "packed KDA stage sync mode must be event or mps_fifo"
+        )
+    return normalized
+
+
+def _effective_stage_sync_mode(dev, mode):
+    """MPS may opt into FIFO reuse; every other async backend keeps events."""
+    normalized = _normalize_stage_sync_mode(mode)
+    if normalized == "mps_fifo" and dev.type == "mps":
+        return normalized
+    return "event"
+
+
+def _stage_stream_signature(dev):
+    """Return the public current-stream identity without creating a stream."""
+    accelerator = getattr(torch, "accelerator", None)
+    current_stream = getattr(accelerator, "current_stream", None)
+    if not callable(current_stream):
+        raise RuntimeError(
+            "torch.accelerator.current_stream is unavailable"
+        )
+    stream = current_stream(dev)
+    stream_id = getattr(stream, "stream_id", None)
+    device_index = getattr(stream, "device_index", None)
+    if type(stream_id) is not int or type(device_index) is not int:
+        raise RuntimeError("current stream has no stable public identity")
+    return (dev.type, device_index, stream_id)
+
+
+def _mps_fifo_stream_signature(dev):
+    signature = _stage_stream_signature(dev)
+    if signature[0] != "mps" or signature[2] != 0:
+        raise RuntimeError(
+            "MPS FIFO staging requires the default stream (stream_id=0)"
+        )
+    return signature
+
+
+def stage_storage_capability(dev, sync_mode="event"):
+    """Return whether direct staged weights can be reused without a race."""
+    try:
+        effective_sync = _effective_stage_sync_mode(dev, sync_mode)
+    except ValueError as exc:
+        return False, str(exc)
+    if dev.type == "cpu":
+        return True, None
+    if dev.type == "mps":
+        if effective_sync == "mps_fifo":
+            if not callable(getattr(getattr(torch, "mps", None),
+                                    "synchronize", None)):
+                return False, "torch.mps.synchronize is unavailable"
+            try:
+                _mps_fifo_stream_signature(dev)
+            except Exception as exc:
+                return False, str(exc)
+            return True, None
+        event = getattr(getattr(torch, "mps", None), "Event", None)
+        if event is None:
+            return False, "torch.mps.Event is unavailable"
+        if not callable(getattr(event, "record", None)):
+            return False, "torch.mps.Event.record is unavailable"
+        if not callable(getattr(event, "wait", None)):
+            return False, "torch.mps.Event.wait is unavailable"
+        return True, None
+    if dev.type == "cuda":
+        cuda = getattr(torch, "cuda", None)
+        if (
+            cuda is None
+            or not callable(getattr(cuda, "Event", None))
+            or not callable(getattr(cuda, "current_stream", None))
+        ):
+            return False, "CUDA event/stream ordering primitives are unavailable"
+        return True, None
+    return False, f"direct staged weights do not support device type {dev.type}"
+
+
+def _wait_stage_fence(key, dev):
+    pending = _stage_fences.pop(key, None)
+    if pending is None:
+        return
+    if isinstance(pending, _FailedStageFence):
+        _stage_fences[key] = pending
+        raise RuntimeError(
+            "packed KDA staging buffer is poisoned after a fence failure"
+        ) from pending.error
+    if isinstance(pending, _FifoStageFence):
+        controller = pending.controller
+        try:
+            current = _mps_fifo_stream_signature(dev)
+            if current != pending.stream_signature:
+                raise RuntimeError(
+                    "MPS staging stream identity changed before reuse"
+                )
+            controller.stage_fifo_reuses += 1
+            return
+        except Exception as stream_error:
+            # A stream mismatch invalidates the cheap FIFO proof. A device-wide
+            # barrier is conservative but still makes this one reuse safe.
+            try:
+                torch.mps.synchronize()
+                controller.stage_fence_sync_fallbacks += 1
+                return
+            except Exception as sync_error:
+                controller.stage_fence_failures += 1
+                poisoned = RuntimeError(
+                    "cannot order MPS FIFO staging-buffer reuse"
+                )
+                poisoned.add_note(
+                    f"stream contract failed: {stream_error}"
+                )
+                poisoned.add_note(
+                    f"device synchronize failed: {sync_error}"
+                )
+                _stage_fences[key] = _FailedStageFence(poisoned)
+                controller.state.disable(poisoned)
+                raise poisoned from sync_error
+    event, controller = pending
+    try:
+        if dev.type == "mps":
+            event.wait()
+        elif dev.type == "cuda":
+            torch.cuda.current_stream(dev).wait_event(event)
+        else:
+            raise RuntimeError(
+                f"unexpected asynchronous staging device {dev.type}"
+            )
+        controller.stage_fence_waits += 1
+    except Exception as wait_error:
+        # Blocking on the recorded event is slower but still proves that reuse
+        # is safe. If even that fails, preserve a permanent poison marker so no
+        # future upload can silently overwrite live GPU weights.
+        try:
+            event.synchronize()
+            controller.stage_fence_sync_fallbacks += 1
+        except Exception as sync_error:
+            controller.stage_fence_failures += 1
+            poisoned = RuntimeError(
+                "cannot order packed KDA staging-buffer reuse"
+            )
+            poisoned.add_note(f"event wait failed: {wait_error}")
+            poisoned.add_note(f"event synchronize failed: {sync_error}")
+            _stage_fences[key] = _FailedStageFence(poisoned)
+            controller.state.disable(poisoned)
+            raise poisoned from sync_error
+
+
+def _record_stage_fence(lease, dev, controller):
+    if dev.type == "cpu":
+        return
+    if lease.sync_contract == "mps_fifo":
+        try:
+            current = _mps_fifo_stream_signature(dev)
+            if current != lease.stream_signature:
+                raise RuntimeError(
+                    "MPS staging stream identity changed after use"
+                )
+            _stage_fences[lease.key] = _FifoStageFence(
+                current, controller
+            )
+            controller.stage_fifo_records += 1
+            return
+        except Exception as stream_error:
+            # The operator was admitted only on the lease's default stream.
+            # If that contract changed before release, finish all MPS work now
+            # rather than leaving an unprovable marker for the next overwrite.
+            try:
+                torch.mps.synchronize()
+                controller.stage_fence_sync_fallbacks += 1
+                return
+            except Exception as sync_error:
+                controller.stage_fence_failures += 1
+                poisoned = RuntimeError(
+                    "cannot fence MPS FIFO staging-buffer lifetime"
+                )
+                poisoned.add_note(
+                    f"stream contract failed: {stream_error}"
+                )
+                poisoned.add_note(
+                    f"device synchronize failed: {sync_error}"
+                )
+                _stage_fences[lease.key] = _FailedStageFence(poisoned)
+                controller.state.disable(poisoned)
+                raise poisoned from sync_error
+    try:
+        if dev.type == "mps":
+            event = torch.mps.Event()
+            event.record()
+        elif dev.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(dev))
+        else:
+            raise RuntimeError(
+                f"unexpected asynchronous staging device {dev.type}"
+            )
+        _stage_fences[lease.key] = (event, controller)
+        controller.stage_fence_records += 1
+    except Exception as record_error:
+        # A device-wide synchronization is conservative, but it keeps the
+        # experimental path correct on runtimes whose event implementation is
+        # present yet broken. Failure of both mechanisms poisons the buffer.
+        try:
+            if dev.type == "mps":
+                torch.mps.synchronize()
+            elif dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            else:
+                raise
+            controller.stage_fence_sync_fallbacks += 1
+        except Exception as sync_error:
+            controller.stage_fence_failures += 1
+            poisoned = RuntimeError(
+                "cannot fence packed KDA staging-buffer lifetime"
+            )
+            poisoned.add_note(f"event record failed: {record_error}")
+            poisoned.add_note(f"device synchronize failed: {sync_error}")
+            _stage_fences[lease.key] = _FailedStageFence(poisoned)
+            controller.state.disable(poisoned)
+            raise poisoned from sync_error
 
 
 def _stage_buf(n, dev, dtype):
-    key = (dev.type, dtype)
+    key = _stage_key(dev, dtype)
     b = _stage.get(key)
     if b is None or b.numel() < n:
         b = torch.empty(n, dtype=dtype, device=dev)
@@ -187,20 +471,90 @@ def _stage_buf(n, dev, dtype):
     return b[:n]
 
 
-# ------------------------------------------------ dynamic packed-q8 Q/K/V ---
-_QKV_NAMES = {
-    "self_attn.q_proj.weight": "q",
-    "self_attn.k_proj.weight": "k",
-    "self_attn.v_proj.weight": "v",
-}
-_QKV_ROLES = tuple(_QKV_NAMES.values())
+_CPU_DIRECT_ALL = (True, True, True)
+_CPU_DIRECT_SCALE_OTHER = (False, True, True)
+_CPU_DIRECT_NONE = (False, False, False)
+
+
+def _cpu_direct_view_flags(dev, packed_qkv=None):
+    """Return direct-view eligibility for (q, scales, bf16 tail).
+
+    CPU kernels consume ordinary dense/arena inputs synchronously, so the
+    completed read buffers are already their final packed source and a second
+    CPU staging copy is redundant.  The opt-in packed ``stage`` controller is
+    the one exception: it retains q beyond ``apply_pack`` and therefore keeps
+    an owned q staging copy.  It copies scales into its arena during apply and
+    never retains the bf16 tail, so those two inputs remain direct.
+
+    Every accelerator or unknown device type fails closed to the established
+    staging path.  PyTorch exposes ROCm devices through ``type == "cuda"``.
+    """
+    if getattr(dev, "type", None) != "cpu":
+        return _CPU_DIRECT_NONE
+    if (
+        packed_qkv is not None
+        and getattr(packed_qkv, "storage_mode", None) == "stage"
+    ):
+        return _CPU_DIRECT_SCALE_OTHER
+    return _CPU_DIRECT_ALL
+
+
+def _stage_weight_buf(n, dev, sync_mode="event"):
+    """Acquire the int8 upload buffer only after its prior direct use is safe."""
+    key = _stage_key(dev, torch.int8)
+    _wait_stage_fence(key, dev)
+    b = _stage.get(key)
+    if b is None or b.numel() < n:
+        b = torch.empty(n, dtype=torch.int8, device=dev)
+        _stage[key] = b
+    generation = _stage_generations.get(key, 0) + 1
+    _stage_generations[key] = generation
+    sync_contract = _effective_stage_sync_mode(dev, sync_mode)
+    stream_signature = (
+        _mps_fifo_stream_signature(dev)
+        if sync_contract == "mps_fifo" else None
+    )
+    lease = _StageLease(
+        key,
+        generation,
+        b.data_ptr(),
+        sync_contract,
+        stream_signature,
+    )
+    return b[:n], lease
+
+
+def _stage_lease_is_current(lease):
+    if lease is None:
+        return False
+    current = _stage.get(lease.key)
+    return bool(
+        current is not None
+        and _stage_generations.get(lease.key) == lease.generation
+        and current.data_ptr() == lease.data_ptr
+    )
+
+
+# ----------------------------------------- dynamic packed-q8 KDA projections ---
+# Every role below consumes the same, unchanged ``hidden_states`` tensor inside
+# KimiDeltaAttention.forward.  The second-stage f_b/g_b projections and o_proj
+# deliberately stay dense because their inputs differ.
+_CORE_PROJECTION_SPECS = (
+    ("q", "q_proj"),
+    ("k", "k_proj"),
+    ("v", "v_proj"),
+)
+_OPTIONAL_PROJECTION_SPECS = (
+    ("f_a", "f_a_proj"),
+    ("b", "b_proj"),
+)
 
 
 class DynamicQ8State:
-    """Shared kill switch for the packed Q/K/V projections on both templates.
+    """Shared kill switch for a packed KDA projection group.
 
-    A backend failure in either template disables the experiment process-wide.
-    The failing template first reconstructs its current dense weights, while
+    A backend failure disables every controller in the group process-wide. The
+    failing controller first reconstructs its current dense weights, while
     subsequent layers take the ordinary dequant/copy branch in ``apply_pack``.
     """
 
@@ -219,36 +573,100 @@ class DynamicQ8State:
 
 
 class DynamicPackedQ8QKV:
-    """Persistent, template-owned row-int8 storage for KDA Q/K/V.
+    """Capability-gated row-int8 storage for KDA projections.
 
-    ``apply_pack`` copies the current layer out of its recycled whole-layer
-    staging buffers into these arenas. Patched ``nn.Linear.forward`` methods
-    then consume stable views with ``aten::_weight_int8pack_mm``. Dense
-    parameters remain available as a cold fallback; they are reconstructed
-    from the owned packed weights before a runtime backend error is exposed to
-    the caller.
+    The default ``arena`` mode copies each current layer out of its recycled
+    upload buffer into template-owned storage. Experimental ``stage`` mode
+    instead consumes an ordered, generation-checked view of that upload buffer
+    directly and fences asynchronous reuse at the end of attention. Dense
+    parameters remain available as a cold fallback in either mode.
     """
 
     _QBUF = "_k3_q8_qkv_weight_arena"
     _SBUF = "_k3_q8_qkv_scale_arena"
     _CTRL = "_k3_q8_qkv_controller"
 
-    def __init__(self, module, dev, state, matmul, arenas=None):
+    def __init__(
+        self,
+        module,
+        dev,
+        state,
+        backend,
+        arenas=None,
+        fuse_qkv=None,
+        storage_mode="arena",
+        stage_sync_mode="event",
+    ):
+        dev = torch.device(dev)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
         attention = getattr(module, "self_attn", None)
         if attention is None:
-            raise ValueError("dynamic q8 Q/K/V requires module.self_attn")
+            raise ValueError("dynamic q8 KDA bundle requires module.self_attn")
         if getattr(attention, self._CTRL, None) is not None:
-            raise ValueError("dynamic q8 Q/K/V is already installed")
+            raise ValueError("dynamic q8 KDA bundle is already installed")
+        if hasattr(attention, self._QBUF) or hasattr(attention, self._SBUF):
+            raise ValueError("dynamic q8 KDA arena names are already in use")
+        backend_matmul = getattr(backend, "matmul", None)
+        resolved_backend = (
+            backend
+            if callable(backend_matmul)
+            and callable(getattr(backend, "supports_tokens", None))
+            else None
+        )
+        resolved_matmul = (
+            backend_matmul if resolved_backend is not None else backend
+        )
+        # Validate before allocating or mutating the module. A failed
+        # installation must not leave hundreds of MiB of arenas and a half-built
+        # controller attached to a reusable template.
+        if not callable(resolved_matmul):
+            raise ValueError("packed KDA backend has no callable matmul")
+        storage_mode = str(storage_mode).strip().lower()
+        if storage_mode not in {"arena", "stage"}:
+            raise ValueError(
+                "packed KDA storage mode must be arena or stage"
+            )
+        stage_sync_mode = _normalize_stage_sync_mode(stage_sync_mode)
+        stage_sync_contract = _effective_stage_sync_mode(
+            dev, stage_sync_mode
+        )
+        if storage_mode == "stage":
+            if arenas is not None:
+                raise ValueError(
+                    "direct staged KDA storage cannot use persistent arenas"
+                )
+            capable, reason = stage_storage_capability(
+                dev, stage_sync_mode
+            )
+            if not capable:
+                raise ValueError(reason)
 
         projections = {}
+        role_names = {}
+        projection_specs = list(_CORE_PROJECTION_SPECS)
+        # K3 uses full-rank g_proj. Retain support for the low-rank model
+        # variant by packing only its first-stage g_a_proj.
+        if getattr(attention, "g_proj", None) is not None:
+            projection_specs.append(("g", "g_proj"))
+        elif getattr(attention, "g_a_proj", None) is not None:
+            projection_specs.append(("g_a", "g_a_proj"))
+        projection_specs.extend(_OPTIONAL_PROJECTION_SPECS)
         q_cursor = 0
         scale_cursor = 0
         slots = {}
-        for role in _QKV_ROLES:
-            projection = getattr(attention, f"{role}_proj", None)
+        for role, attribute in projection_specs:
+            projection = getattr(attention, attribute, None)
+            required = role in {"q", "k", "v"}
             if projection is None or not hasattr(projection, "weight"):
+                if not required:
+                    continue
                 raise ValueError(f"KDA attention has no {role}_proj.weight")
             if projection.bias is not None:
+                if not required:
+                    # A packed weight-only call cannot reproduce an optional
+                    # biased projection. Leave it on the ordinary dense path.
+                    continue
                 raise ValueError(f"{role}_proj must be bias-free")
             shape = tuple(projection.weight.shape)
             if len(shape) != 2:
@@ -260,10 +678,23 @@ class DynamicPackedQ8QKV:
             q_cursor += rows * cols
             scale_cursor += rows
             projections[role] = projection
+            role_names[role] = f"self_attn.{attribute}.weight"
+
+        roles = tuple(projections)
+        names_to_roles = {
+            name: role for role, name in role_names.items()
+        }
 
         q_size = _align(q_cursor)
         scale_size = _align(scale_cursor * 4) // 4
-        if arenas is None:
+        if storage_mode == "stage":
+            q_arena = None
+            scale_arena = torch.empty(
+                scale_size,
+                dtype=torch.float32,
+                device=dev,
+            )
+        elif arenas is None:
             q_arena = torch.empty(q_size, dtype=torch.int8, device=dev)
             scale_arena = torch.empty(
                 scale_size,
@@ -288,24 +719,87 @@ class DynamicPackedQ8QKV:
             )
             if (q_arena.dtype != torch.int8 or q_arena.numel() < q_size
                     or q_device_mismatch):
-                raise ValueError("shared packed Q/K/V weight arena is incompatible")
+                raise ValueError("shared packed KDA weight arena is incompatible")
             if (scale_arena.dtype != torch.float32
                     or scale_arena.numel() < scale_size
                     or scale_device_mismatch):
-                raise ValueError("shared packed Q/K/V scale arena is incompatible")
-        attention.register_buffer(self._QBUF, q_arena, persistent=False)
+                raise ValueError("shared packed KDA scale arena is incompatible")
+        if q_arena is not None:
+            attention.register_buffer(self._QBUF, q_arena, persistent=False)
         attention.register_buffer(self._SBUF, scale_arena, persistent=False)
         setattr(attention, self._CTRL, self)
 
+        self.dev = dev
+        self.storage_mode = storage_mode
+        self.stage_sync_mode = stage_sync_mode
+        self.stage_sync_contract = stage_sync_contract
+        self.backend = resolved_backend
         self.module = module
         self.attention = attention
         self.state = state
-        self.matmul = matmul
+        self.matmul = resolved_matmul
         self.projections = projections
+        self.roles = roles
+        self.role_names = role_names
+        self.names_to_roles = names_to_roles
+        self.trigger_role = roles[0]
+        self._cold_weights = {
+            role: projection.weight
+            for role, projection in projections.items()
+        }
         self.slots = slots
         self.loaded = set()
         self.dense_loaded = set()
+        self._dense_materialized = False
+        self._fused_hidden = None
+        self._fused_hidden_version = None
+        self._fused_outputs = {}
+        self._stage_q_arena = None
+        self._stage_lease = None
+        self._stage_records = {}
+        self.stage_bind_count = 0
+        self.stage_bind_failures = 0
+        self.stage_stale_rejections = 0
+        self.stage_weight_copy_bytes = 0
+        self.stage_scale_copy_bytes = 0
+        self.stage_fence_records = 0
+        self.stage_fence_waits = 0
+        self.stage_fence_sync_fallbacks = 0
+        self.stage_fence_failures = 0
+        self.stage_fifo_records = 0
+        self.stage_fifo_reuses = 0
+        self.stage_full_shape_probes = 0
+        self.stage_full_shape_passes = 0
+        self.stage_release_count = 0
+        self.last_stage_generation = None
+        self._stage_full_shape_validated = False
         self.packed_project_calls = 0
+        self.packed_operator_calls = 0
+        self.fused_operator_calls = 0
+        self.separate_operator_calls = 0
+        self.dense_crossover_project_calls = 0
+        self.dense_crossover_materializations = 0
+        self.dense_crossover_releases = 0
+        self.runtime_failures = 0
+        requested_fusion = (
+            bool(getattr(backend, "fuse_qkv", False))
+            if fuse_qkv is None else bool(fuse_qkv)
+        )
+        self.fusion_eligible, self.fusion_reason = (
+            self._fusion_layout_status()
+        )
+        self.fuse_qkv = requested_fusion and self.fusion_eligible
+        if not requested_fusion:
+            self.fusion_reason = (
+                getattr(backend, "fusion_reason", None)
+                or "fusion not requested"
+            )
+        self._fusion_scope_active = False
+        self._fusion_scope_hidden = None
+        self._prior_attention_instance_forward = attention.__dict__.get(
+            "forward", None
+        )
+        self._original_attention_forward = attention.forward
         self._prior_instance_forwards = {}
         self._original_forwards = {}
         for role, projection in projections.items():
@@ -319,49 +813,361 @@ class DynamicPackedQ8QKV:
 
             projection.forward = types.MethodType(packed_forward, projection)
 
+        def scoped_attention_forward(
+            this_attention, *args, _controller=self, **kwargs
+        ):
+            _controller._clear_fused_outputs()
+            _controller._fusion_scope_active = True
+            _controller._fusion_scope_hidden = None
+            try:
+                return _controller._original_attention_forward(
+                    *args, **kwargs
+                )
+            finally:
+                # Cached projection values are valid only inside this audited
+                # Kimi attention call, whose eligible roles all consume the
+                # same unchanged hidden_states tensor. Inference tensors expose
+                # no version counter, so never let the cache escape that scope.
+                _controller._fusion_scope_active = False
+                _controller._fusion_scope_hidden = None
+                _controller._clear_fused_outputs()
+                _controller.release_dense_crossover()
+                _controller.release_stage_binding()
+
+        attention.forward = types.MethodType(
+            scoped_attention_forward, attention
+        )
+
     @property
     def enabled(self):
         return self.state.enabled
 
     @property
     def nbytes(self):
-        q_arena = getattr(self.attention, self._QBUF)
+        q_arena = getattr(self.attention, self._QBUF, None)
         scale_arena = getattr(self.attention, self._SBUF)
         return (
-            q_arena.numel() * q_arena.element_size()
+            (
+                q_arena.numel() * q_arena.element_size()
+                if q_arena is not None else 0
+            )
             + scale_arena.numel() * scale_arena.element_size()
         )
 
+    @property
+    def persistent_weight_bytes(self):
+        q_arena = getattr(self.attention, self._QBUF, None)
+        if q_arena is None:
+            return 0
+        return q_arena.numel() * q_arena.element_size()
+
+    @property
+    def persistent_scale_bytes(self):
+        scale_arena = getattr(self.attention, self._SBUF)
+        return scale_arena.numel() * scale_arena.element_size()
+
+    def _require_stage_current(self):
+        if self.storage_mode != "stage":
+            return
+        if (
+            self._stage_q_arena is None
+            or self._stage_lease is None
+            or not _stage_lease_is_current(self._stage_lease)
+        ):
+            self.stage_stale_rejections += 1
+            error = RuntimeError(
+                "packed KDA staging lease is stale or unbound"
+            )
+            self.state.disable(error)
+            raise error
+        if self.stage_sync_contract == "mps_fifo":
+            try:
+                current = _mps_fifo_stream_signature(self.dev)
+                if current != self._stage_lease.stream_signature:
+                    raise RuntimeError(
+                        "MPS staging stream identity changed before use"
+                    )
+            except Exception as exc:
+                self.stage_stale_rejections += 1
+                error = RuntimeError(
+                    "packed KDA MPS FIFO stream contract is stale"
+                )
+                error.add_note(str(exc))
+                self.state.disable(error)
+                raise error from exc
+
     def _views(self, role):
-        qoff, qn, soff, rows, cols = self.slots[role]
-        q_arena = getattr(self.attention, self._QBUF)
+        _owned_qoff, qn, soff, rows, cols = self.slots[role]
+        if self.storage_mode == "stage":
+            self._require_stage_current()
+            qoff = self._stage_records[role][0]
+            q_arena = self._stage_q_arena
+        else:
+            qoff = self.slots[role][0]
+            q_arena = getattr(self.attention, self._QBUF)
         scale_arena = getattr(self.attention, self._SBUF)
         return (
             q_arena[qoff:qoff + qn].view(rows, cols),
             scale_arena[soff:soff + rows],
         )
 
+    def _fusion_layout_status(self):
+        records = [self.slots[role] for role in self.roles]
+        columns = {record[4] for record in records}
+        if len(columns) != 1:
+            return False, "packed projection input widths differ"
+        prior = records[0]
+        for record in records[1:]:
+            if record[0] != prior[0] + prior[1]:
+                return False, "packed weight arena has alignment gaps"
+            if record[2] != prior[2] + prior[3]:
+                return False, "packed scale arena has alignment gaps"
+            prior = record
+        return True, None
+
+    def _fused_views(self):
+        first = self.slots[self.roles[0]]
+        last = self.slots[self.roles[-1]]
+        _owned_qoff, _qn, soff, _rows, cols = first
+        if self.storage_mode == "stage":
+            self._require_stage_current()
+            qoff = self._stage_records[self.roles[0]][0]
+            last_record = self._stage_records[self.roles[-1]]
+            q_end = last_record[0] + last_record[1]
+            q_arena = self._stage_q_arena
+        else:
+            qoff = first[0]
+            q_end = last[0] + last[1]
+            q_arena = getattr(self.attention, self._QBUF)
+        scale_end = last[2] + last[3]
+        scale_arena = getattr(self.attention, self._SBUF)
+        split_rows = tuple(self.slots[role][3] for role in self.roles)
+        total_rows = sum(split_rows)
+        return (
+            q_arena[qoff:q_end].view(total_rows, cols),
+            scale_arena[soff:scale_end],
+            split_rows,
+        )
+
+    def _clear_fused_outputs(self):
+        self._fused_hidden = None
+        self._fused_hidden_version = None
+        self._fused_outputs.clear()
+
+    @staticmethod
+    def _tensor_version(tensor):
+        try:
+            return tensor._version
+        except RuntimeError:
+            return None
+
+    def _take_fused_output(self, role, hidden):
+        if (
+            self._fused_hidden is not hidden
+            or self._fused_hidden_version != self._tensor_version(hidden)
+        ):
+            self._clear_fused_outputs()
+            return None
+        output = self._fused_outputs.pop(role, None)
+        if output is not None:
+            self.packed_project_calls += 1
+        if not self._fused_outputs:
+            self._clear_fused_outputs()
+        return output
+
     def arenas(self):
         return (
-            getattr(self.attention, self._QBUF),
+            getattr(self.attention, self._QBUF, None),
             getattr(self.attention, self._SBUF),
         )
 
-    @staticmethod
-    def consumes(name):
-        return name in _QKV_NAMES
+    def consumes(self, name):
+        return name in self.names_to_roles
 
-    def begin_load(self):
+    def stage_descriptor(self, items):
+        """Validate and describe one ordered direct-view KDA upload slice."""
+        if self.storage_mode != "stage":
+            raise ValueError("stage descriptor requested for arena storage")
+        consumed = [
+            item for item in items if item[0] in self.names_to_roles
+        ]
+        expected_names = [self.role_names[role] for role in self.roles]
+        actual_names = [item[0] for item in consumed]
+        if actual_names != expected_names:
+            raise ValueError(
+                "packed KDA stage order/coverage mismatch: "
+                f"{actual_names!r} != {expected_names!r}"
+            )
+        records = {}
+        previous_end = None
+        for item, role in zip(consumed, self.roles):
+            name, _full, shape, qoff, qbytes, scoff, scale_rows = item
+            _owned_qoff, expected_bytes, _soff, rows, cols = self.slots[role]
+            if name != self.role_names[role]:
+                raise ValueError(f"packed KDA stage role mismatch for {role}")
+            if tuple(shape) != (rows, cols) or qbytes != expected_bytes:
+                raise ValueError(
+                    f"packed KDA stage shape changed for {role}: "
+                    f"{tuple(shape)}"
+                )
+            if scale_rows != rows:
+                raise ValueError(
+                    f"packed KDA stage scale count changed for {role}"
+                )
+            if previous_end is not None and qoff != previous_end:
+                raise ValueError(
+                    "packed KDA stage weight slice has alignment gaps"
+                )
+            records[role] = (
+                qoff, qbytes, scoff, rows, cols
+            )
+            previous_end = qoff + qbytes
+        first = records[self.roles[0]]
+        return {
+            "roles": tuple(self.roles),
+            "records": records,
+            "q_start": first[0],
+            "q_end": previous_end,
+        }
+
+    def reject_stage_layout(self, error):
+        """Atomically reject direct views so apply_pack densifies every role."""
+        if self.storage_mode != "stage":
+            raise ValueError("stage rejection requested for arena storage")
+        self.stage_bind_failures += 1
+        self._stage_q_arena = None
+        self._stage_lease = None
+        self._stage_records = {}
         self.loaded.clear()
-        self.dense_loaded.clear()
+        self.state.disable(error)
 
-    def load(self, name, qweight, scale):
-        """Copy one Q/K/V role into owned storage; return True if consumed."""
+    def bind_stage(self, qweight_stage, scale_stage, descriptor, lease):
+        """Bind all roles without copying int8 weights out of the upload arena."""
+        if self.storage_mode != "stage":
+            raise ValueError("direct staging is disabled for this controller")
         if not self.enabled:
             return False
-        role = _QKV_NAMES.get(name)
+        try:
+            if not isinstance(descriptor, dict):
+                raise ValueError("packed KDA stage descriptor is missing")
+            if tuple(descriptor.get("roles", ())) != self.roles:
+                raise ValueError("packed KDA stage descriptor roles changed")
+            records = descriptor.get("records")
+            if not isinstance(records, dict) or set(records) != set(self.roles):
+                raise ValueError("packed KDA stage descriptor is incomplete")
+            if qweight_stage.dtype != torch.int8:
+                raise TypeError("packed KDA stage weight dtype is not int8")
+            if scale_stage.dtype != torch.float16:
+                raise TypeError("packed KDA stage scale dtype is not float16")
+            if not qweight_stage.is_contiguous():
+                raise ValueError("packed KDA stage weight buffer is not contiguous")
+            if qweight_stage.device != scale_stage.device:
+                raise ValueError("packed KDA stage buffers use different devices")
+            if qweight_stage.device.type != self.dev.type or (
+                self.dev.index is not None
+                and qweight_stage.device.index != self.dev.index
+            ):
+                raise ValueError("packed KDA stage buffer device changed")
+            if lease is None or lease.key != _stage_key(
+                self.dev, torch.int8
+            ):
+                raise ValueError("packed KDA stage lease identity changed")
+            if lease.sync_contract != self.stage_sync_contract:
+                raise ValueError("packed KDA stage sync contract changed")
+            if (
+                qweight_stage.data_ptr() != lease.data_ptr
+                or not _stage_lease_is_current(lease)
+            ):
+                raise RuntimeError("packed KDA stage lease is already stale")
+            if self.stage_sync_contract == "mps_fifo":
+                current = _mps_fifo_stream_signature(self.dev)
+                if current != lease.stream_signature:
+                    raise RuntimeError(
+                        "packed KDA MPS FIFO upload stream changed"
+                    )
+            q_start = descriptor.get("q_start")
+            q_end = descriptor.get("q_end")
+            if (
+                type(q_start) is not int
+                or type(q_end) is not int
+                or q_start < 0
+                or q_end <= q_start
+                or q_end > qweight_stage.numel()
+            ):
+                raise ValueError("packed KDA stage weight bounds are invalid")
+            scale_arena = getattr(self.attention, self._SBUF)
+            expected_qoff = q_start
+            for role in self.roles:
+                qoff, qbytes, scoff, rows, cols = records[role]
+                expected = self.slots[role]
+                if (
+                    qoff != expected_qoff
+                    or qoff + qbytes > q_end
+                    or qbytes != expected[1]
+                    or rows != expected[3]
+                    or cols != expected[4]
+                    or scoff < 0
+                    or scoff + rows > scale_stage.numel()
+                ):
+                    raise ValueError(
+                        f"packed KDA stage record is invalid for {role}"
+                    )
+                expected_qoff = qoff + qbytes
+                scale_offset = expected[2]
+                scale_arena[
+                    scale_offset:scale_offset + rows
+                ].copy_(scale_stage[scoff:scoff + rows])
+            if expected_qoff != q_end:
+                raise ValueError(
+                    "packed KDA stage descriptor has trailing weight bytes"
+                )
+        except Exception as exc:
+            self.reject_stage_layout(exc)
+            return False
+        self._stage_q_arena = qweight_stage
+        self._stage_lease = lease
+        self._stage_records = records
+        self.loaded.update(self.roles)
+        self.stage_bind_count += 1
+        self.stage_scale_copy_bytes += sum(
+            self.slots[role][3] * 2
+            for role in self.roles
+        )
+        self.last_stage_generation = lease.generation
+        return True
+
+    def release_stage_binding(self):
+        """Fence GPU use, then drop all aliases to the recyclable upload arena."""
+        if self.storage_mode != "stage" or self._stage_lease is None:
+            return
+        lease = self._stage_lease
+        try:
+            _record_stage_fence(lease, self.dev, self)
+        finally:
+            self._stage_q_arena = None
+            self._stage_lease = None
+            self._stage_records = {}
+            self.stage_release_count += 1
+
+    def begin_load(self):
+        self.release_dense_crossover()
+        self.release_stage_binding()
+        self.loaded.clear()
+        self.dense_loaded.clear()
+        self._dense_materialized = False
+        self._clear_fused_outputs()
+
+    def load(self, name, qweight, scale):
+        """Copy one eligible KDA role into owned storage; return True if consumed."""
+        if not self.enabled:
+            return False
+        role = self.names_to_roles.get(name)
         if role is None:
             return False
+        if self.storage_mode == "stage":
+            # bind_stage validates and installs the entire six-role bundle
+            # atomically before this per-item loop begins.
+            return role in self.loaded
         try:
             destination_q, destination_scale = self._views(role)
             if destination_q.shape != qweight.shape:
@@ -389,12 +1195,12 @@ class DynamicPackedQ8QKV:
 
     def mark_dense(self, name):
         """Record that apply_pack installed this layer's dense projection."""
-        role = _QKV_NAMES.get(name)
+        role = self.names_to_roles.get(name)
         if role is not None:
             self.dense_loaded.add(role)
 
     def _materialize_dense(self, roles=None):
-        selected = _QKV_ROLES if roles is None else roles
+        selected = self.roles if roles is None else roles
         for role in selected:
             if role not in self.loaded:
                 continue
@@ -414,9 +1220,46 @@ class DynamicPackedQ8QKV:
                     out=weight.data,
                 )
 
+    def _ensure_dense_current_layer(self):
+        if self._dense_materialized:
+            return
+        self._materialize_dense()
+        self._dense_materialized = True
+        self.dense_crossover_materializations += 1
+        self._clear_fused_outputs()
+
+    def release_dense_crossover(self):
+        """Drop transient fallback projections after the layer finishes.
+
+        Production templates start with meta packed-role Parameters. A prompt
+        wider than the packed-GEMV crossover temporarily materializes about
+        1.32 GiB for K3's Q/K/V/G/F-A/B bundle; retaining those beside the
+        packed arenas would erase much of the residency benefit during decode.
+        """
+        if not self._dense_materialized or not self.enabled:
+            return
+        released = False
+        for role, projection in self.projections.items():
+            cold_weight = self._cold_weights[role]
+            if (
+                cold_weight.device.type == "meta"
+                and projection.weight is not cold_weight
+            ):
+                projection.weight = cold_weight
+                released = True
+        self._dense_materialized = False
+        if released:
+            self.dense_crossover_releases += 1
+        self._clear_fused_outputs()
+
+    def _supports_tokens(self, token_count):
+        if self.backend is None:
+            return True
+        return bool(self.backend.supports_tokens(token_count))
+
     def finish_load(self):
         """Finish one layer, accepting all-packed or safely densifying hybrids."""
-        missing = set(_QKV_ROLES) - self.loaded - self.dense_loaded
+        missing = set(self.roles) - self.loaded - self.dense_loaded
         if not missing:
             if self.enabled and self.dense_loaded:
                 # A partial int8 spine is valid: apply_pack has already installed
@@ -424,14 +1267,14 @@ class DynamicPackedQ8QKV:
                 # current layer can take nn.Linear after the shared kill switch.
                 self._materialize_dense()
                 error = RuntimeError(
-                    "packed KDA Q/K/V layer includes dense projection(s): "
+                    "packed KDA layer includes dense projection(s): "
                     + ", ".join(sorted(self.dense_loaded))
                 )
                 self.state.disable(error)
             return
         self._materialize_dense(self.loaded)
         error = RuntimeError(
-            "KDA Q/K/V layer is incomplete; no packed or dense value for "
+            "KDA packed bundle is incomplete; no packed or dense value for "
             + ", ".join(sorted(missing))
         )
         self.state.disable(error)
@@ -442,20 +1285,139 @@ class DynamicPackedQ8QKV:
     def project(self, role, hidden):
         if not self.enabled or role not in self.loaded:
             return self._original_forwards[role](hidden)
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        if not self._supports_tokens(flat.shape[0]):
+            # The raw weight-only kernel is a GEMV win, not a universal GEMM
+            # replacement. Rebuild the current layer once and keep the backend
+            # enabled for later decode-sized calls/layers.
+            self._ensure_dense_current_layer()
+            self.dense_crossover_project_calls += 1
+            return self._original_forwards[role](hidden)
+        scoped = self._fusion_scope_active
+        if scoped and self._fusion_scope_hidden is None:
+            if role == self.trigger_role:
+                # Establish the scope from the tensor actually passed to
+                # q_proj. This remains correct when Kimi first unpads and
+                # replaces its original hidden_states object.
+                self._fusion_scope_hidden = hidden
+            else:
+                scoped = False
+        else:
+            scoped = scoped and self._fusion_scope_hidden is hidden
+        if scoped and role != self.trigger_role:
+            cached = self._take_fused_output(role, hidden)
+            if cached is not None:
+                return cached
         qweight, scale = self._views(role)
         try:
-            flat = hidden.reshape(-1, hidden.shape[-1])
+            if scoped and role == self.trigger_role:
+                probing_stage_shape = (
+                    self.storage_mode == "stage"
+                    and not self._stage_full_shape_validated
+                )
+                if probing_stage_shape:
+                    self.stage_full_shape_probes += 1
+                if self.fuse_qkv:
+                    fused_qweight, fused_scale, split_rows = (
+                        self._fused_views()
+                    )
+                    output = self.matmul(
+                        flat, fused_qweight, fused_scale
+                    )
+                    output = output.view(
+                        *hidden.shape[:-1],
+                        sum(split_rows),
+                    )
+                    projected = output.split(split_rows, dim=-1)
+                    operator_calls = 1
+                    self.fused_operator_calls += 1
+                else:
+                    projected = tuple(
+                        self.matmul(flat, *self._views(projected_role)).view(
+                            *hidden.shape[:-1],
+                            self._views(projected_role)[0].shape[0],
+                        )
+                        for projected_role in self.roles
+                    )
+                    operator_calls = len(self.roles)
+                    self.separate_operator_calls += operator_calls
+                if probing_stage_shape:
+                    self._stage_full_shape_validated = True
+                    self.stage_full_shape_passes += 1
+                self._clear_fused_outputs()
+                self._fused_hidden = hidden
+                self._fused_hidden_version = self._tensor_version(hidden)
+                self._fused_outputs = {
+                    fused_role: fused_output
+                    for fused_role, fused_output in zip(
+                        self.roles[1:], projected[1:]
+                    )
+                }
+                self.packed_project_calls += 1
+                self.packed_operator_calls += operator_calls
+                return projected[0]
             output = self.matmul(flat, qweight, scale)
             output = output.view(*hidden.shape[:-1], qweight.shape[0])
             self.packed_project_calls += 1
+            self.packed_operator_calls += 1
+            self.separate_operator_calls += 1
             return output
         except (NotImplementedError, RuntimeError, TypeError) as exc:
             # The packed operator may be present in the dispatcher yet reject
-            # a future MPS generation, shape, or PyTorch ABI. Rebuild all three
-            # current weights before switching every template to dense mode.
+            # a future device generation, shape, or PyTorch ABI. Rebuild every
+            # current bundled weight before switching the template to dense.
+            self.runtime_failures += 1
+            self._clear_fused_outputs()
             self._materialize_dense()
             self.state.disable(exc)
             return self._original_forwards[role](hidden)
+
+    def status(self):
+        return {
+            "enabled": self.enabled,
+            "storage_mode": self.storage_mode,
+            "stage_sync_mode": self.stage_sync_mode,
+            "stage_sync_contract": self.stage_sync_contract,
+            "persistent_weight_bytes": self.persistent_weight_bytes,
+            "persistent_scale_bytes": self.persistent_scale_bytes,
+            "stage_bound": self._stage_lease is not None,
+            "stage_bind_count": self.stage_bind_count,
+            "stage_bind_failures": self.stage_bind_failures,
+            "stage_stale_rejections": self.stage_stale_rejections,
+            "stage_weight_copy_bytes": self.stage_weight_copy_bytes,
+            "stage_scale_copy_bytes": self.stage_scale_copy_bytes,
+            "stage_fence_records": self.stage_fence_records,
+            "stage_fence_waits": self.stage_fence_waits,
+            "stage_fence_sync_fallbacks": (
+                self.stage_fence_sync_fallbacks
+            ),
+            "stage_fence_failures": self.stage_fence_failures,
+            "stage_fifo_records": self.stage_fifo_records,
+            "stage_fifo_reuses": self.stage_fifo_reuses,
+            "stage_full_shape_probes": self.stage_full_shape_probes,
+            "stage_full_shape_passes": self.stage_full_shape_passes,
+            "stage_release_count": self.stage_release_count,
+            "last_stage_generation": self.last_stage_generation,
+            "packed_project_calls": self.packed_project_calls,
+            "packed_operator_calls": self.packed_operator_calls,
+            "fused_operator_calls": self.fused_operator_calls,
+            "separate_operator_calls": self.separate_operator_calls,
+            "dense_crossover_project_calls": (
+                self.dense_crossover_project_calls
+            ),
+            "dense_crossover_materializations": (
+                self.dense_crossover_materializations
+            ),
+            "dense_crossover_releases": self.dense_crossover_releases,
+            "runtime_failures": self.runtime_failures,
+            "fuse_qkv": self.fuse_qkv,
+            "fusion_eligible": self.fusion_eligible,
+            "fusion_reason": self.fusion_reason,
+            "packed_roles": list(self.roles),
+            "backend": (
+                self.backend.status() if self.backend is not None else None
+            ),
+        }
 
     def uninstall(self):
         """Restore the original modules after a transactional setup failure."""
@@ -465,6 +1427,11 @@ class DynamicPackedQ8QKV:
                 projection.__dict__.pop("forward", None)
             else:
                 projection.forward = previous
+        previous_attention = self._prior_attention_instance_forward
+        if previous_attention is None:
+            self.attention.__dict__.pop("forward", None)
+        else:
+            self.attention.forward = previous_attention
         if getattr(self.attention, self._CTRL, None) is self:
             delattr(self.attention, self._CTRL)
         for name in (self._QBUF, self._SBUF):
@@ -472,8 +1439,26 @@ class DynamicPackedQ8QKV:
                 del self.attention._buffers[name]
 
 
-def install_dynamic_q8_qkv(module, dev, state, matmul, arenas=None):
-    return DynamicPackedQ8QKV(module, dev, state, matmul, arenas=arenas)
+def install_dynamic_q8_qkv(
+    module,
+    dev,
+    state,
+    backend,
+    arenas=None,
+    fuse_qkv=None,
+    storage_mode="arena",
+    stage_sync_mode="event",
+):
+    return DynamicPackedQ8QKV(
+        module,
+        dev,
+        state,
+        backend,
+        arenas=arenas,
+        fuse_qkv=fuse_qkv,
+        storage_mode=storage_mode,
+        stage_sync_mode=stage_sync_mode,
+    )
 
 
 def dynamic_q8_qkv(module):
@@ -521,7 +1506,33 @@ def plan_layout(module, prefix, int8_dir, res_dir, inv, spine):
     items, other = [], []
     qoff = 0
     scoff = 0                     # in fp16 elements
-    for name, _ in module.named_parameters():
+    packed_qkv = dynamic_q8_qkv(module)
+    if (
+        packed_qkv is not None
+        and packed_qkv.storage_mode == "stage"
+    ):
+        # Direct-view fusion requires Q/K/V/G/F-A/B to occupy one gap-free
+        # int8 slice in exactly the controller's role order. This changes only
+        # the in-memory/read plan; checkpoint files remain untouched.
+        parameters = list(module.named_parameters())
+        by_name = dict(parameters)
+        consumed_names = [
+            packed_qkv.role_names[role] for role in packed_qkv.roles
+        ]
+        consumed_set = set(consumed_names)
+        parameter_iter = [
+            (name, by_name[name])
+            for name in consumed_names if name in by_name
+        ]
+        parameter_iter.extend(
+            (name, parameter)
+            for name, parameter in parameters
+            if name not in consumed_set
+        )
+    else:
+        # Preserve the established arena-mode layout and iteration order.
+        parameter_iter = module.named_parameters()
+    for name, _ in parameter_iter:
         if ".experts." in name:
             continue
         full = prefix + name
@@ -550,6 +1561,16 @@ def plan_layout(module, prefix, int8_dir, res_dir, inv, spine):
         ooff = _align(ooff + nb)
     lay = {"items": items, "qtotal": qoff, "sctotal": scoff, "other": other,
            "oplan": oplan, "ototal": ooff, "int8_dir": int8_dir}
+    if (
+        packed_qkv is not None
+        and packed_qkv.storage_mode == "stage"
+    ):
+        try:
+            lay["packed_qkv_stage"] = packed_qkv.stage_descriptor(items)
+        except (TypeError, ValueError) as exc:
+            lay["packed_qkv_stage_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
     with _layout_lock:
         _layouts[key] = lay
     return lay
@@ -669,6 +1690,10 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
     packed_qkv = dynamic_q8_qkv(module)
     if packed_qkv is not None:
         packed_qkv.begin_load()
+    stage_lease = None
+    direct_q, direct_scales, direct_other = _cpu_direct_view_flags(
+        dev, packed_qkv
+    )
     use_metal = DEQ == "metal" and dev.type == "mps" and metal_available()
     PHASE["n_layers"] += 1
     oplan = lay["oplan"]
@@ -680,17 +1705,64 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
     if items:
         qh = torch.frombuffer(pack["q"], dtype=torch.int8)[:lay["qtotal"]]
         sch = torch.frombuffer(pack["sc"], dtype=torch.float16)[:lay["sctotal"]]
-        qd = _stage_buf(lay["qtotal"], dev, torch.int8)
-        scd = _stage_buf(lay["sctotal"], dev, torch.float16)
-        qd.copy_(qh)
-        scd.copy_(sch)
+        stage_sync_mode = (
+            packed_qkv.stage_sync_mode
+            if (
+                packed_qkv is not None
+                and packed_qkv.storage_mode == "stage"
+            )
+            else "event"
+        )
+        if direct_q:
+            qd = qh
+        else:
+            qd, stage_lease = _stage_weight_buf(
+                lay["qtotal"], dev, stage_sync_mode
+            )
+            qd.copy_(qh)
+        if direct_scales:
+            scd = sch
+        else:
+            scd = _stage_buf(lay["sctotal"], dev, torch.float16)
+            scd.copy_(sch)
     if oplan:
         oh = torch.frombuffer(pack["other"], dtype=torch.uint8)[:lay["ototal"]]
-        od = _stage_buf(lay["ototal"], dev, torch.uint8)
-        od.copy_(oh)
+        if direct_other:
+            od = oh
+        else:
+            od = _stage_buf(lay["ototal"], dev, torch.uint8)
+            od.copy_(oh)
     PHASE["h2d_s"] += _time.time() - t0
-    PHASE["h2d_bytes"] += lay["qtotal"] + lay["ototal"]
+    # Preserve this counter's established payload convention (q + bf16 tail,
+    # scales excluded), but count only bytes actually copied into staging.
+    PHASE["h2d_bytes"] += (
+        (0 if direct_q else lay["qtotal"])
+        + (0 if direct_other else lay["ototal"])
+    )
     t0 = _time.time()
+    if (
+        packed_qkv is not None
+        and packed_qkv.storage_mode == "stage"
+    ):
+        stage_error = lay.get("packed_qkv_stage_error")
+        if stage_error is not None:
+            packed_qkv.reject_stage_layout(RuntimeError(stage_error))
+        elif not items:
+            packed_qkv.reject_stage_layout(
+                RuntimeError("packed KDA stage has no int8 payload")
+            )
+        else:
+            descriptor = lay.get("packed_qkv_stage")
+            if descriptor is None:
+                try:
+                    descriptor = packed_qkv.stage_descriptor(items)
+                    lay["packed_qkv_stage"] = descriptor
+                except (TypeError, ValueError) as exc:
+                    packed_qkv.reject_stage_layout(exc)
+            if packed_qkv.enabled and descriptor is not None:
+                packed_qkv.bind_stage(
+                    qd, scd, descriptor, stage_lease
+                )
     for name, full, shape, qoff, nb, scoff, rows in items:
         q = qd[qoff:qoff + nb].view(shape)
         sc = scd[scoff:scoff + rows]
