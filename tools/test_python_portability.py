@@ -7,6 +7,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -14,6 +15,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import runtime_platform as rp  # noqa: E402
+import pilot  # noqa: E402
 import spine_cache  # noqa: E402
 import spine_io  # noqa: E402
 
@@ -172,7 +174,148 @@ def _native_module_manifest_checks():
     assert not direct
     assert 'import_when_enabled(FAST_MOE, "fast_moe")' in source
     assert "torch.mps.synchronize" not in source
-    assert source.count("_device_synchronize()") == 3  # definition + two gates
+    assert 'if MOE_BACKEND == "cuda":' in source
+    assert "cuda_moe.available(DEV)" in source
+    assert "DT != torch.float32" in source
+    assert "layer_index=li" in source
+    assert "model_key=_CUDA_MODEL_KEY" in source
+    # Definition + two CUDA-MoE profile gates + two whole-pass profile gates.
+    # Normal decode must not add an unconditional accelerator synchronization.
+    assert source.count("_device_synchronize()") == 5
+
+
+def _cuda_dequant_checks():
+    """Exercise the lazy CUDA seam without importing the heavyweight module."""
+    source_path = HERE / "spine_fast.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "_cuda_dequant_requested_for_config",
+            "cuda_dequant_into",
+            "cuda_dequant_error",
+        }
+    ]
+    calls = []
+
+    class FakeCuda:
+        def available(self, device):
+            calls.append(("available", device.type, device.index))
+            return True
+
+        def describe(self, device):
+            return f"fake cuda:{device.index}"
+
+        def dequant_int8_into(self, dst, q, sc):
+            calls.append(("dequant", dst, q, sc))
+            return True
+
+        def disable(self, device, reason):
+            calls.append(("disable", device.index, reason))
+
+    namespace = {
+        "_cuda_deq_module": FakeCuda(),
+        "_cuda_deq_devices": set(),
+        "_cuda_deq_errors": {},
+        "_cuda_deq_lock": threading.Lock(),
+        "_cuda_deq_requested": True,
+    }
+    isolated = ast.Module(body=functions, type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    exec(compile(isolated, str(source_path), "exec"), namespace)
+    requested = namespace["_cuda_dequant_requested_for_config"]
+    assert requested(False, "torch", False, "auto", False) is False
+    assert requested(False, "torch", False, "1", True) is True
+    assert requested(False, "cuda", True, "auto", False) is True
+    assert requested(True, "torch", True, "1", True) is False
+    assert requested(True, "cuda", True, "off", True) is False
+    dequant = namespace["cuda_dequant_into"]
+
+    cpu = SimpleNamespace(device=SimpleNamespace(type="cpu", index=None))
+    assert dequant(cpu, object(), object()) is False
+    assert calls == []  # CPU/MPS never qualify or touch the CUDA bridge.
+
+    cuda_device = SimpleNamespace(type="cuda", index=1)
+    dst = SimpleNamespace(device=cuda_device)
+    q, sc = object(), object()
+    assert dequant(dst, q, sc) is True
+    assert dequant(dst, q, sc) is True
+    assert [call[0] for call in calls].count("available") == 1
+    assert [call[0] for call in calls].count("dequant") == 2
+
+    failure_calls = []
+
+    def fail(_dst, _q, _sc):
+        failure_calls.append("failure")
+        raise RuntimeError("synthetic launch failure")
+
+    namespace["_cuda_deq_module"].dequant_int8_into = fail
+    assert dequant(dst, q, sc) is False
+    assert "synthetic launch failure" in (
+        namespace["cuda_dequant_error"](cuda_device)
+    )
+    prior = list(calls)
+    assert dequant(dst, q, sc) is False
+    assert calls == prior
+    assert failure_calls == ["failure"]
+
+    rejected_device = SimpleNamespace(type="cuda", index=2)
+    rejected = SimpleNamespace(device=rejected_device)
+    reject_calls = []
+
+    def reject(_dst, _q, _sc):
+        reject_calls.append("reject")
+        return False
+
+    namespace["_cuda_deq_module"].dequant_int8_into = reject
+    assert dequant(rejected, q, sc) is False
+    assert dequant(rejected, q, sc) is False
+    assert reject_calls == ["reject"]  # one rejection opens the local circuit.
+    assert not any(call[0] == "disable" for call in calls)
+
+
+def _prefetch_residency_filter_checks():
+    """A GPU-resident expert must not be read speculatively from disk."""
+    saved_pref = dict(pilot._PREF)
+    saved_bin, saved_npz = pilot.BIN, pilot.NPZ
+    saved_counts = {
+        key: pilot.STATS[key]
+        for key in ("issued_layers", "issued_bin", "issued_npz")
+    }
+    issued = []
+    fetch = SimpleNamespace(
+        _has_bin=lambda _layer, _eid: True,
+        prefetch_layer=lambda layer, ids: issued.append((layer, list(ids))),
+    )
+    try:
+        pilot.BIN, pilot.NPZ = True, False
+        pilot._PREF.clear()
+        pilot._PREF[12] = [2, 4, 6, 8]
+        pilot.issue_prefetch(
+            12,
+            fetch,
+            pread=True,
+            filter_ids=lambda layer, ids: (
+                [expert for expert in ids if expert >= 6]
+                if layer == 12 else ids
+            ),
+        )
+        assert issued == [(12, [6, 8])]
+        assert pilot.STATS["issued_bin"] == saved_counts["issued_bin"] + 2
+
+        pilot._PREF[13] = [1, 3]
+        before_layers = pilot.STATS["issued_layers"]
+        pilot.issue_prefetch(
+            13, fetch, pread=True, filter_ids=lambda _layer, _ids: [])
+        assert pilot.STATS["issued_layers"] == before_layers
+        assert issued == [(12, [6, 8])]
+    finally:
+        pilot._PREF.clear()
+        pilot._PREF.update(saved_pref)
+        pilot.BIN, pilot.NPZ = saved_bin, saved_npz
+        for key, value in saved_counts.items():
+            pilot.STATS[key] = value
 
 
 def _device_checks():
@@ -258,11 +401,12 @@ def _device_checks():
     rp.synchronize_device(fake_torch, cpu)
     assert calls == [("mps", None), ("cuda", cuda)]
     assert rp.choose_moe_backend(None, "mps") == "metal"
-    assert rp.choose_moe_backend(None, "cuda") == "cpu"
+    assert rp.choose_moe_backend(None, "cuda") == "cuda"
     assert rp.choose_moe_backend(None, "cpu") == "cpu"
     assert rp.choose_moe_backend("metal", "cuda") == "metal"
+    assert rp.choose_moe_backend("cuda", "cuda") == "cuda"
     try:
-        rp.choose_moe_backend("cuda", "cuda")
+        rp.choose_moe_backend("vulkan", "cuda")
     except ValueError:
         pass
     else:
@@ -667,6 +811,8 @@ def _spine_cache_linux_checks():
 def main():
     _native_loader_checks()
     _native_module_manifest_checks()
+    _cuda_dequant_checks()
+    _prefetch_residency_filter_checks()
     _device_checks()
     _cpu_availability_checks()
     _memory_checks()

@@ -47,7 +47,10 @@ import runtime_platform
 # ---------------------------------------------------------------- flags -----
 FAST = os.environ.get("K3_FAST_SPINE", "1") == "1"
 # fine-grained overrides so the orchestrator can bisect the three changes
-DEQ = os.environ.get("K3_SPINE_DEQ", "metal" if FAST else "torch")   # metal|mulout|torch
+_DEQ_EXPLICIT = "K3_SPINE_DEQ" in os.environ
+DEQ = os.environ.get(
+    "K3_SPINE_DEQ", "metal" if FAST else "torch"
+)  # metal|cuda|mulout|torch
 PACK = os.environ.get("K3_SPINE_PACK", "1" if FAST else "0") == "1"  # packed read + 1 H2D
 READ_THREADS = runtime_platform.configured_cpu_workers(
     "K3_SPINE_READ_THREADS", 4 if FAST else 1
@@ -77,6 +80,36 @@ kernel void deq_f32(device float*       out  [[buffer(0)]],
 _lib = None
 _lib_err = None
 _lib_lock = threading.Lock()
+_cuda_deq_module = None
+_cuda_deq_devices = set()
+_cuda_deq_errors = {}
+_cuda_deq_lock = threading.Lock()
+
+
+def _cuda_dequant_requested_for_config(
+    fast, deq, deq_explicit, cuda_mode, cuda_explicit
+):
+    enabled = cuda_mode not in {
+        "0", "off", "false", "no", "disabled",
+    }
+    if not enabled:
+        return False
+    if deq_explicit:
+        return deq == "cuda"
+    return fast or cuda_explicit
+
+
+_CUDA_DEQ_EXPLICIT = "K3_CUDA_INT8_DEQUANT" in os.environ
+_cuda_deq_mode = os.environ.get(
+    "K3_CUDA_INT8_DEQUANT", "auto"
+).strip().lower()
+_cuda_deq_requested = _cuda_dequant_requested_for_config(
+    FAST,
+    DEQ,
+    _DEQ_EXPLICIT,
+    _cuda_deq_mode,
+    _CUDA_DEQ_EXPLICIT,
+)
 
 
 def metal_available():
@@ -112,6 +145,54 @@ def dequant_into(dst, q, sc):
     rows, cols = dst.shape
     _lib.deq_f32(dst, q, sc, cols, threads=rows * cols)
     return True
+
+
+def cuda_dequant_into(dst, q, sc):
+    """Try the qualified CUDA int8 dequantizer, otherwise retain torch.
+
+    Import stays inside the CUDA-only call site so a macOS/MPS or CPU process
+    neither loads nor probes the optional CUDA library.  Any native or
+    qualification error fails closed for the remainder of the process.
+    """
+    global _cuda_deq_module
+    if not _cuda_deq_requested:
+        return False
+    if dst.device.type != "cuda":
+        return False
+    device_key = (dst.device.type, dst.device.index)
+    if device_key in _cuda_deq_errors:
+        return False
+    with _cuda_deq_lock:
+        if device_key not in _cuda_deq_devices:
+            try:
+                if _cuda_deq_module is None:
+                    import cuda_moe
+                    _cuda_deq_module = cuda_moe
+                if not _cuda_deq_module.available(dst.device):
+                    raise RuntimeError(_cuda_deq_module.describe(dst.device))
+                _cuda_deq_devices.add(device_key)
+            except Exception as exc:
+                _cuda_deq_errors[device_key] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return False
+    try:
+        if _cuda_deq_module.dequant_int8_into(dst, q, sc):
+            return True
+        _cuda_deq_errors[device_key] = (
+            "native CUDA int8 dequantizer rejected the tensor layout"
+        )
+        return False
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        _cuda_deq_errors[device_key] = error
+        return False
+
+
+def cuda_dequant_error(device=None):
+    if device is None:
+        return dict(_cuda_deq_errors)
+    return _cuda_deq_errors.get((device.type, device.index))
 
 
 def dequant_torch(q, sc, out=None):
@@ -1773,6 +1854,10 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
                 and p.dtype == torch.float32 and dt == torch.float32)
         if fits and use_metal:
             dequant_into(p.data, q, sc)
+            if packed_qkv is not None and packed_qkv.consumes(name):
+                packed_qkv.mark_dense(name)
+            continue
+        if fits and dev.type == "cuda" and cuda_dequant_into(p.data, q, sc):
             if packed_qkv is not None and packed_qkv.consumes(name):
                 packed_qkv.mark_dense(name)
             continue

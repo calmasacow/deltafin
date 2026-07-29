@@ -883,13 +883,17 @@ _orig_moe_infer = ml.KimiSparseMoeBlock.moe_infer
 FAST_MOE = os.environ.get("K3_FAST_MOE", "1") == "1"
 fast_moe = runtime_platform.import_when_enabled(FAST_MOE, "fast_moe")
 
-# --- MoE compute backend (K3_MOE=cpu|metal) ----------------------------------
+# --- MoE compute backend (K3_MOE=cpu|metal|cuda) -----------------------------
 # cpu   : tools/fast_moe_batch.py when its native library is present, otherwise
 #         tools/fast_moe.py. The batch path keeps a persistent worker ring and
 #         is bit-identical; K3_CPU_MOE_BATCH=0 retains the legacy fallback.
 # metal : tools/metal_moe.py, the whole layer's selected experts as one GPU
 #         command buffer. Same signature, same semantics; matched the CPU path to
 #         2.5e-7 on real experts. Falls back to cpu (loudly) if Metal is missing.
+# cuda  : tools/cuda_moe.py after a versioned ABI/shape check and an on-device
+#         known-answer test. Expert residency can then avoid both disk reads and
+#         host-to-device copies. Any qualification/runtime failure disables the
+#         device and replays the complete route through the established CPU path.
 # K3_MOE_CHECK=N cross-checks the first N calls against the CPU kernel and raises
 # on disagreement — see tools/metal_moe.py. K3_METAL_BINDLESS=0 picks the
 # per-expert dispatch mode instead of the Tier-2 argument-buffer one.
@@ -913,6 +917,60 @@ if FAST_MOE and _CPU_BATCH_MODE not in ("0", "off", "false", "no"):
         # checkout or a future CPU can always retain the established kernel.
         print(f"[config] persistent CPU MoE ring unavailable "
               f"({type(exc).__name__}: {exc}); using legacy CPU GEMV", flush=True)
+_CPU_MOE_FN = _MOE_FN
+cuda_moe = None
+_CUDA_MOE_ACTIVE = False
+_CUDA_MOE_FALLBACK_REPORTED = False
+_CUDA_MODEL_KEY = f"{os.path.realpath(k3loader.RES)}:{H}:{NL}"
+
+
+def _disable_cuda_moe(reason):
+    """Fail closed once, retaining a complete and independently tested path."""
+    global _CUDA_MOE_ACTIVE, _CUDA_MOE_FALLBACK_REPORTED
+    global MOE_BACKEND, _MOE_FN, FAST_MOE
+    if cuda_moe is not None:
+        try:
+            cuda_moe.disable(DEV, str(reason))
+        except Exception:
+            pass
+    _CUDA_MOE_ACTIVE = False
+    MOE_BACKEND = "cpu"
+    _MOE_FN = _CPU_MOE_FN
+    FAST_MOE = _CPU_MOE_FN is not None
+    if not _CUDA_MOE_FALLBACK_REPORTED:
+        print(f"[config] CUDA MoE disabled ({reason}); "
+              "falling back to the established CPU expert path", flush=True)
+        _CUDA_MOE_FALLBACK_REPORTED = True
+
+
+def _activate_cuda_moe():
+    """Qualify the optional CUDA bridge without weakening any kill switch."""
+    global cuda_moe, _MOE_FN, _CUDA_MOE_ACTIVE, FAST_MOE
+    if not FAST_MOE:
+        _disable_cuda_moe("K3_FAST_MOE=0")
+    elif DEV.type != "cuda":
+        _disable_cuda_moe(f"selected device is {DEV}, not CUDA")
+    elif DT != torch.float32:
+        # The native ABI consumes fp32. In particular, never reinterpret an
+        # approximate-mode fp16 pointer as fp32.
+        _disable_cuda_moe(
+            f"native CUDA MoE requires fp32 input, current dtype is {DT}")
+    else:
+        try:
+            import cuda_moe as _cuda_moe  # noqa: E402
+            cuda_moe = _cuda_moe
+            if not cuda_moe.available(DEV):
+                raise RuntimeError(cuda_moe.describe(DEV))
+            _MOE_FN = cuda_moe.moe_infer
+            _CUDA_MOE_ACTIVE = True
+            FAST_MOE = True       # CUDA consumes raw MXFP4, never dequantized
+            print(f"[config] MoE backend: {cuda_moe.describe(DEV)}", flush=True)
+        except Exception as exc:
+            _disable_cuda_moe(f"{type(exc).__name__}: {exc}")
+
+
+if MOE_BACKEND == "cuda":
+    _activate_cuda_moe()
 if MOE_BACKEND == "metal":
     import metal_moe  # noqa: E402
     if metal_moe.available():
@@ -985,7 +1043,12 @@ def prefetch_prev_token():
     def run():
         for li in sorted(snap):
             try:
-                k3loader.fetch_experts(li, snap[li], dequant=False)
+                ids = snap[li]
+                if _CUDA_MOE_ACTIVE:
+                    ids = cuda_moe.missing_experts(
+                        li, ids, DEV, model_key=_CUDA_MODEL_KEY)
+                if ids:
+                    k3loader.fetch_experts(li, ids, dequant=False)
             except Exception:
                 pass
     threading.Thread(target=run, daemon=True).start()
@@ -999,12 +1062,56 @@ EXPERT_SEL = {"layer_calls": 0, "uniq": 0, "pos": 0}
 
 def _issue_next_expert_prefetch(li):
     """Issue speculation only after this layer's demand reads have landed."""
+    uncached = None
+    if _CUDA_MOE_ACTIVE:
+        def uncached(layer, candidates):
+            try:
+                return cuda_moe.missing_experts(
+                    layer, candidates, DEV, model_key=_CUDA_MODEL_KEY)
+            except Exception:
+                # Prefetch is optional and runs before the current layer's
+                # backend call. Do not change backend state here: returning
+                # the full list is always safe, and the demand path remains
+                # the qualification gate.
+                return candidates
+
     if pilot.enabled() and fetch_v2 is not None:
-        pilot.issue_prefetch(li + 1, fetch_v2, pread=PREAD)
+        if uncached is None:
+            pilot.issue_prefetch(li + 1, fetch_v2, pread=PREAD)
+        else:
+            pilot.issue_prefetch(
+                li + 1, fetch_v2, pread=PREAD, filter_ids=uncached)
     elif EXPERT_PREFETCH:
         nxt = _PREV_SEL.get(li + 1)
         if nxt:
-            fetch_v2.prefetch_layer(li + 1, nxt)
+            nxt = (
+                uncached(li + 1, list(nxt))
+                if uncached is not None else nxt
+            )
+            if nxt:
+                fetch_v2.prefetch_layer(li + 1, nxt)
+
+
+def _slow_moe_infer(self, x, topk_ids, topk_weight, raw, ids):
+    """Run the framework reference and return every expert to meta storage."""
+    try:
+        for e, weights in raw.items():
+            ex = self.experts[e]
+            for wn in ("w1", "w2", "w3"):
+                # Dequantized expert tensors are born on the CPU. The reference
+                # fallback must follow the resident activation to MPS/CUDA
+                # rather than installing cross-device parameters.
+                set_param(
+                    ex,
+                    wn + ".weight",
+                    weights[wn].to(device=x.device, dtype=x.dtype),
+                )
+        return _orig_moe_infer(self, x, topk_ids, topk_weight)
+    finally:
+        for e in ids:
+            for wn in ("w1", "w2", "w3"):
+                set_param(self.experts[e], wn + ".weight",
+                          torch.empty(0, device="meta"))
 
 
 def moe_infer_lazy(self, x, topk_ids, topk_weight):
@@ -1039,8 +1146,20 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
             TRACE.record(_step_ctx["step"], li, flat,
                          routing_record["weights"])
             return out
+    fetch_ids = ids
+    if _CUDA_MOE_ACTIVE:
+        try:
+            fetch_ids = cuda_moe.missing_experts(
+                li, ids, DEV, model_key=_CUDA_MODEL_KEY)
+        except Exception as exc:
+            _disable_cuda_moe(
+                f"cache query failed: {type(exc).__name__}: {exc}")
+            fetch_ids = ids
     t0 = time.time()
-    raw = k3loader.fetch_experts(li, ids, dequant=not FAST_MOE)
+    raw = (
+        k3loader.fetch_experts(li, fetch_ids, dequant=not FAST_MOE)
+        if fetch_ids else {}
+    )
     TIMES["expert_fetch"] += time.time() - t0
     # Speculative reads are issued only AFTER this layer's demand reads have
     # landed: the pread pool is FIFO, so a prefetch queued first would put the
@@ -1049,22 +1168,50 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
     TRACE.record(_step_ctx["step"], li, flat,
                  routing_record["weights"] if routing_record else topk_weight)
     if FAST_MOE:
-        tk = time.time()
-        out = _MOE_FN(
-            x, topk_ids, topk_weight, raw,
-            routing_record=routing_record)
-        TIMES["moe_kernel"] += time.time() - tk
-        return out
-    for e, w in raw.items():
-        ex = self.experts[e]
-        for wn in ("w1", "w2", "w3"):
-            set_param(ex, wn + ".weight", w[wn])
-    out = _orig_moe_infer(self, x, topk_ids, topk_weight)
-    for e in ids:  # free expert weights again
-        for wn in ("w1", "w2", "w3"):
-            set_param(self.experts[e], wn + ".weight",
-                      torch.empty(0, device="meta"))
-    return out
+        try:
+            # CUDA launches are asynchronous. Synchronize only while profiling;
+            # normal decoding keeps the established overlap opportunity.
+            if _CUDA_MOE_ACTIVE and PROFILE:
+                _device_synchronize()
+            tk = time.time()
+            if _CUDA_MOE_ACTIVE:
+                out = _MOE_FN(
+                    x, topk_ids, topk_weight, raw,
+                    routing_record=routing_record,
+                    layer_index=li,
+                    model_key=_CUDA_MODEL_KEY)
+            else:
+                out = _MOE_FN(
+                    x, topk_ids, topk_weight, raw,
+                    routing_record=routing_record)
+            if _CUDA_MOE_ACTIVE and PROFILE:
+                _device_synchronize()
+            TIMES["moe_kernel"] += time.time() - tk
+            return out
+        except Exception as exc:
+            if not _CUDA_MOE_ACTIVE:
+                raise
+            # `raw` can contain only cache misses. It is never safe to hand
+            # that partial set to the CPU backend, so fetch the whole route.
+            _disable_cuda_moe(
+                f"runtime failure: {type(exc).__name__}: {exc}")
+            t_retry = time.time()
+            if _CPU_MOE_FN is not None:
+                raw = k3loader.fetch_experts(li, ids, dequant=False)
+            else:
+                raw = k3loader.fetch_experts(li, ids, dequant=True)
+            TIMES["expert_fetch"] += time.time() - t_retry
+            tk = time.time()
+            if _CPU_MOE_FN is not None:
+                out = _CPU_MOE_FN(
+                    x, topk_ids, topk_weight, raw,
+                    routing_record=routing_record)
+            else:
+                out = _slow_moe_infer(
+                    self, x, topk_ids, topk_weight, raw, ids)
+            TIMES["moe_kernel"] += time.time() - tk
+            return out
+    return _slow_moe_infer(self, x, topk_ids, topk_weight, raw, ids)
 
 
 ml.KimiSparseMoeBlock.moe_infer = moe_infer_lazy

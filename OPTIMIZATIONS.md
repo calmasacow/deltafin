@@ -414,6 +414,88 @@ Implementation:
 [`tools/build_native.py`](tools/build_native.py), and
 [`tools/test_fused_gemv_portability.py`](tools/test_fused_gemv_portability.py).
 
+## Qualified CUDA expert residency and fused MXFP4 MoE
+
+**Status: Automatically considered on a CUDA resident device, but enabled only
+after ABI, layout and on-device known-answer checks. The implementation is new;
+maintainer-replicated CUDA token throughput and whole-sequence parity evidence
+are still wanted.**
+
+Moving the resident spine and attention to CUDA while bringing every routed
+expert back to the CPU leaves an obvious boundary in the middle of each MoE
+layer. The CUDA expert path removes that boundary without first expanding
+MXFP4 weights to fp32. Its kernel reads the same packed E2M1 nibbles and E8M0
+group scales as the CPU and Metal paths, performs gate/up GEMVs, applies SiTU,
+and performs the down GEMV on the selected CUDA device.
+
+This path is intentionally not enabled merely because `torch.cuda.is_available`
+returns true. The bridge checks a versioned native ABI, the model's fixed expert
+dimensions, the exact 17,547,264-byte expert span and a pointer-layout version.
+It then runs small deterministic MXFP4-GEMV and int8-dequant known-answer cases
+on the requested device. A missing library, stale build, unsupported device,
+wrong dtype or shape, failed launch, or failed answer leaves CUDA active for
+the resident model but selects the established CPU expert implementation.
+Approximate fp16 mode never crosses an fp32 raw-pointer ABI.
+
+Expert identity is stricter than a local expert number. K3 reuses IDs 0–895 in
+every MoE layer, so a cache indexed only by expert ID can silently execute one
+layer's weights in another layer. Deltafin keys residency by model namespace,
+CUDA device, exact layer and expert ID. Capacity comes from current free VRAM
+at the first real route—after model allocations—with an explicit safety reserve
+rather than from a fixed number of entries.
+The 92 MoE layers receive stable strata: each layer can evict only within its
+own quota, and a capacity smaller than 92 admits a deterministic spread of
+layers. Sequential traversal therefore cannot turn the cache into a
+whole-model global-LRU thrash.
+
+Each cache miss is assembled in reusable pinned host storage and transferred as
+one contiguous expert span, rather than six independent weight/scale copies.
+CUDA events guard pinned-slab reuse, and tensors are recorded on the stream that
+consumes them so neither the host staging pool nor PyTorch's allocator can
+recycle storage under an asynchronous operation. State is per device; the
+native translation unit itself owns no device allocation or retained pointer.
+
+The reduction is also deliberately conservative. One block owns an expert
+output element and reduces a fixed tree; there is no cross-block `atomicAdd`.
+Each selected expert produces its own output, and the route weights are combined
+in their original top-k order. Multi-position calls remain on CUDA rather than
+round-tripping every position through the CPU. The returned tensor is fresh,
+not an alias of reusable scratch.
+
+Residency is consulted before disk demand reads. Already-resident experts are
+not fetched again, and router-lookahead prefetch filters the same hits before
+issuing speculative I/O. If a cache query or native call fails, the driver
+disables that device's CUDA expert path, fetches the **complete** routed set
+again, and invokes the CPU backend. It never hands a partial miss-only mapping
+to a fallback that expects the full route.
+
+The same qualified bridge includes a flat-grid CUDA kernel for resident-spine
+int8 dequantization. It writes `int8 × fp16 row scale` directly into an existing
+fp32 destination, avoiding the pair of temporary conversions in the ordinary
+PyTorch expression. This subpath has its own local circuit breaker and respects
+an explicit `K3_SPINE_DEQ=torch` or `mulout` request; a dequant rejection does
+not disable an otherwise healthy CUDA MoE backend.
+
+Linux builds keep CUDA optional. Default `--cuda=auto` probes NVCC only on
+Linux and installs the required CPU libraries even when CUDA compilation,
+validation or installation fails. `--cuda=on` makes all requested artifacts a
+single fail-closed transaction; `--cuda=off` performs no CUDA compiler probe.
+The binary includes a conservative `sm_75` image and a `compute_75` PTX
+fallback rather than guessing a list of future architectures.
+
+No CUDA speed number is claimed here yet. The expected wins—GPU expert compute,
+fewer CPU/GPU boundaries, one-copy uploads and avoided disk reads on cache
+hits—are mechanisms, not a benchmark. Publication-quality evidence needs
+synchronized event timing, cache hit/upload counters, cold and warm runs,
+matched output, and medians on real NVIDIA systems.
+
+Implementation:
+[`tools/cuda_moe.py`](tools/cuda_moe.py),
+[`tools/cuda_moe_kernels.cu`](tools/cuda_moe_kernels.cu),
+[`tools/kimi_run.py`](tools/kimi_run.py),
+[`tools/spine_fast.py`](tools/spine_fast.py), and
+[`tools/test_cuda_moe.py`](tools/test_cuda_moe.py).
+
 ## Persistent CPU workers and batch-wide activation preparation
 
 **Status: Default when the batch native library validates; legacy native GEMV
@@ -620,14 +702,15 @@ not matching a product name:
   process, then CPU. An explicit `cuda:N`, `mps`, or `cpu` remains
   authoritative.
 - Metal MoE is selected only with an MPS resident device and a working Metal
-  library. CUDA currently accelerates the resident spine and attention while
-  routed MXFP4 experts retain the native CPU path.
+  library. CUDA MoE is selected only on a CUDA resident device after its
+  versioned ABI, shape/layout and on-device known-answer checks; failure keeps
+  the resident CUDA path and uses native CPU MXFP4 experts.
 - aarch64 selects NEON; x86-64 checks the required compatibility features and
   selects AVX2 only at runtime.
 - worker counts respect CPU affinity and Linux cgroup quotas.
-- RAM budgets respect host memory and Linux cgroup limits. Optional CUDA
-  pinning also reserves accelerator headroom instead of treating total VRAM as
-  free memory.
+- RAM budgets respect host memory and Linux cgroup limits. CUDA expert
+  residency budgets from current free VRAM, retains a safety reserve and uses
+  stable per-layer quotas instead of treating total VRAM as free memory.
 - the int8 spine is selected when present; optional operators still pass their
   own dispatcher, shape, dtype, and first-call gates.
 
@@ -639,7 +722,9 @@ the same crossover.
 Implementation:
 [`tools/runtime_platform.py`](tools/runtime_platform.py),
 [`tools/apple_silicon.py`](tools/apple_silicon.py), and
-[`tools/kimi_run.py`](tools/kimi_run.py).
+[`tools/kimi_run.py`](tools/kimi_run.py). CUDA-specific qualification and cache
+details are in
+[`tools/cuda_moe.py`](tools/cuda_moe.py).
 
 ## Small fixed-cost cleanups
 

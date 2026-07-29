@@ -27,8 +27,10 @@ class FakeFunction:
         self.callback = callback
         self.argtypes = None
         self.restype = None
+        self.calls = 0
 
     def __call__(self, *args):
+        self.calls += 1
         if self.callback is not None:
             return self.callback(*args)
         return self.result
@@ -41,6 +43,8 @@ class FakeLibrary:
         *,
         abi: int | None = None,
         shapes: tuple[int, int, int] | None = None,
+        cuda_abi: int | None = None,
+        cuda_shapes: tuple[int, int, int, int] | None = None,
     ):
         for symbol in symbols:
             setattr(self, symbol, FakeFunction())
@@ -56,6 +60,25 @@ class FakeLibrary:
                     span, ctypes.POINTER(ctypes.c_longlong)
                 ).contents.value = shapes[2]
             self.k3_metal_shapes = FakeFunction(callback=report_shapes)
+        if cuda_abi is not None:
+            self.k3_cuda_moe_abi_version = FakeFunction(cuda_abi)
+        if cuda_shapes is not None:
+            def report_cuda_shapes(hidden, intermediate, span, pointer_layout):
+                ctypes.cast(hidden, ctypes.POINTER(ctypes.c_int)).contents.value = (
+                    cuda_shapes[0]
+                )
+                ctypes.cast(
+                    intermediate, ctypes.POINTER(ctypes.c_int)
+                ).contents.value = cuda_shapes[1]
+                ctypes.cast(
+                    span, ctypes.POINTER(ctypes.c_int64)
+                ).contents.value = cuda_shapes[2]
+                ctypes.cast(
+                    pointer_layout, ctypes.POINTER(ctypes.c_uint32)
+                ).contents.value = cuda_shapes[3]
+            self.k3_cuda_moe_shapes = FakeFunction(
+                callback=report_cuda_shapes
+            )
 
 
 class TargetTests(unittest.TestCase):
@@ -117,6 +140,49 @@ class TargetTests(unittest.TestCase):
                     artifact.required_symbols
                 )
             )
+
+    def test_cuda_artifact_selection_is_explicit_and_deterministic(self):
+        linux = native.detect_target("linux", "x86_64")
+        darwin = native.detect_target("darwin", "arm64")
+
+        self.assertFalse(
+            any(
+                artifact.language == "cuda"
+                for artifact in native.artifacts_for(
+                    linux, cuda_mode="off", nvcc_available=True
+                )
+            )
+        )
+        self.assertFalse(
+            any(
+                artifact.language == "cuda"
+                for artifact in native.artifacts_for(
+                    linux, cuda_mode="auto", nvcc_available=False
+                )
+            )
+        )
+        auto = native.artifacts_for(
+            linux, cuda_mode="auto", nvcc_available=True
+        )
+        required = native.artifacts_for(
+            linux, cuda_mode="on", nvcc_available=False
+        )
+        for artifacts in (auto, required):
+            cuda = [item for item in artifacts if item.language == "cuda"]
+            self.assertEqual(len(cuda), 1)
+            self.assertEqual(cuda[0].destination.name, "libcudamoe.so")
+            self.assertEqual(cuda[0].expected_cuda_shapes, native.CUDA_SHAPES)
+
+        self.assertFalse(
+            any(
+                artifact.language == "cuda"
+                for artifact in native.artifacts_for(
+                    darwin, cuda_mode="auto", nvcc_available=True
+                )
+            )
+        )
+        with self.assertRaisesRegex(native.BuildError, "only on Linux"):
+            native.artifacts_for(darwin, cuda_mode="on")
 
     def test_cpuinfo_parser(self):
         with tempfile.TemporaryDirectory() as td:
@@ -190,6 +256,63 @@ class CommandTests(unittest.TestCase):
                 environ={"CC": "definitely-not-a-real-deltafin-compiler"},
             )
 
+    def test_cuda_command_uses_portable_floor_and_ptx_fallback(self):
+        target = native.detect_target("linux", "x86_64")
+        artifact = [
+            item
+            for item in native.artifacts_for(
+                target, cuda_mode="on", nvcc_available=True
+            )
+            if item.language == "cuda"
+        ][0]
+        command = native.compile_command(
+            artifact,
+            target,
+            Path("/tmp/libcudamoe.so"),
+            cuda_compiler=[sys.executable, "--nvcc-wrapper"],
+        )
+        self.assertEqual(command[:2], [sys.executable, "--nvcc-wrapper"])
+        self.assertIn("-Xcompiler=-fPIC", command)
+        self.assertIn("-gencode=arch=compute_75,code=sm_75", command)
+        self.assertIn("-gencode=arch=compute_75,code=compute_75", command)
+        self.assertFalse(any("sm_100" in part for part in command))
+        self.assertFalse(any("sm_120" in part for part in command))
+        self.assertEqual(command[-2:], ["-o", "/tmp/libcudamoe.so"])
+
+    def test_nvcc_environment_is_parsed_and_resolved_safely(self):
+        requested = []
+
+        def find(executable):
+            requested.append(executable)
+            return "/opt/cuda/bin/nvcc"
+
+        argv = native.cuda_compiler_argv(
+            {"NVCC": "custom-nvcc --use_fast_math"}, finder=find
+        )
+        self.assertEqual(requested, ["custom-nvcc"])
+        self.assertEqual(
+            argv, ["/opt/cuda/bin/nvcc", "--use_fast_math"]
+        )
+        self.assertIsNone(
+            native.cuda_compiler_argv({}, finder=lambda _name: None)
+        )
+        with self.assertRaisesRegex(native.BuildError, "NVCC is empty"):
+            native.cuda_compiler_argv({"NVCC": "   "})
+
+        def broken_path(_name):
+            raise OSError("synthetic PATH failure")
+
+        with self.assertRaisesRegex(native.BuildError, "could not locate NVCC"):
+            native.cuda_compiler_argv({}, finder=broken_path)
+
+
+class ParserTests(unittest.TestCase):
+    def test_cuda_mode_defaults_to_auto_and_accepts_all_modes(self):
+        parser = native._parser()
+        self.assertEqual(parser.parse_args([]).cuda, "auto")
+        for mode in ("auto", "on", "off"):
+            self.assertEqual(parser.parse_args([f"--cuda={mode}"]).cuda, mode)
+
 
 class ValidationTests(unittest.TestCase):
     def _path(self, directory: str) -> Path:
@@ -245,15 +368,102 @@ class ValidationTests(unittest.TestCase):
                     path, artifact, cdll_factory=lambda _: bad
                 )
 
+    def test_cuda_symbols_abi_and_layout_without_device_probe(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            artifact = native.Artifact(
+                "CUDA MoE",
+                path,
+                path,
+                "cuda",
+                native.CUDA_SYMBOLS,
+                abi_version=native.CUDA_ABI_VERSION,
+                abi_symbol="k3_cuda_moe_abi_version",
+                expected_cuda_shapes=native.CUDA_SHAPES,
+            )
+            good = FakeLibrary(
+                native.CUDA_SYMBOLS,
+                cuda_abi=native.CUDA_ABI_VERSION,
+                cuda_shapes=native.CUDA_SHAPES,
+            )
+            native.validate_artifact(
+                path, artifact, cdll_factory=lambda _: good
+            )
+            self.assertEqual(good.k3_cuda_moe_abi_version.calls, 1)
+            self.assertEqual(good.k3_cuda_moe_shapes.calls, 1)
+            self.assertEqual(good.k3_cuda_moe_available.calls, 0)
+            self.assertEqual(good.k3_cuda_moe_launch.calls, 0)
+
+            bad_abi = FakeLibrary(
+                native.CUDA_SYMBOLS,
+                cuda_abi=99,
+                cuda_shapes=native.CUDA_SHAPES,
+            )
+            with self.assertRaisesRegex(native.BuildError, "has ABI 99"):
+                native.validate_artifact(
+                    path, artifact, cdll_factory=lambda _: bad_abi
+                )
+
+            bad_span = FakeLibrary(
+                native.CUDA_SYMBOLS,
+                cuda_abi=native.CUDA_ABI_VERSION,
+                cuda_shapes=(3584, 3072, 1, 1),
+            )
+            with self.assertRaisesRegex(
+                native.BuildError, "shape/layout handshake returned"
+            ):
+                native.validate_artifact(
+                    path, artifact, cdll_factory=lambda _: bad_span
+                )
+
+            bad_layout = FakeLibrary(
+                native.CUDA_SYMBOLS,
+                cuda_abi=native.CUDA_ABI_VERSION,
+                cuda_shapes=(3584, 3072, 17_547_264, 99),
+            )
+            with self.assertRaisesRegex(
+                native.BuildError, "shape/layout handshake returned"
+            ):
+                native.validate_artifact(
+                    path, artifact, cdll_factory=lambda _: bad_layout
+                )
+
+            missing = FakeLibrary(
+                tuple(
+                    symbol
+                    for symbol in native.CUDA_SYMBOLS
+                    if symbol != "k3_cuda_last_error"
+                ),
+                cuda_abi=native.CUDA_ABI_VERSION,
+                cuda_shapes=native.CUDA_SHAPES,
+            )
+            with self.assertRaisesRegex(
+                native.BuildError, "k3_cuda_last_error"
+            ):
+                native.validate_artifact(
+                    path, artifact, cdll_factory=lambda _: missing
+                )
+
 
 class AtomicBuildTests(unittest.TestCase):
-    def _tree(self, root: Path) -> Path:
+    def _tree(
+        self,
+        root: Path,
+        *,
+        suffix: str = ".so",
+        cuda: bool = False,
+    ) -> Path:
         tools = root / "repo" / "tools"
         tools.mkdir(parents=True)
         (tools / "fused_gemv.c").write_text("gemv", encoding="utf-8")
         (tools / "fused_gemv_batch.c").write_text("batch", encoding="utf-8")
-        (tools / "libmxfp4gemv.so").write_bytes(b"old-gemv")
-        (tools / "libmxfp4batch.so").write_bytes(b"old-batch")
+        (tools / f"libmxfp4gemv{suffix}").write_bytes(b"old-gemv")
+        (tools / f"libmxfp4batch{suffix}").write_bytes(b"old-batch")
+        if cuda:
+            (tools / "cuda_moe_kernels.cu").write_text(
+                "cuda", encoding="utf-8"
+            )
+            (tools / "libcudamoe.so").write_bytes(b"old-cuda")
         return tools
 
     @staticmethod
@@ -261,7 +471,7 @@ class AtomicBuildTests(unittest.TestCase):
         output = Path(command[command.index("-o") + 1])
         source = next(
             Path(part).name for part in command
-            if str(part).endswith((".c", ".mm"))
+            if str(part).endswith((".c", ".mm", ".cu"))
         )
         output.write_bytes(f"new:{source}".encode())
 
@@ -284,6 +494,7 @@ class AtomicBuildTests(unittest.TestCase):
                     environ={"CC": sys.executable},
                     runner=fail_second,
                     validator=lambda _path, _artifact: None,
+                    cuda_mode="off",
                 )
             self.assertEqual(
                 (tools / "libmxfp4gemv.so").read_bytes(), b"old-gemv"
@@ -307,6 +518,7 @@ class AtomicBuildTests(unittest.TestCase):
                     environ={"CC": sys.executable},
                     runner=self._write_output,
                     validator=reject_batch,
+                    cuda_mode="off",
                 )
             self.assertEqual(
                 (tools / "libmxfp4gemv.so").read_bytes(), b"old-gemv"
@@ -331,6 +543,7 @@ class AtomicBuildTests(unittest.TestCase):
                 environ={"CC": sys.executable},
                 runner=self._write_output,
                 validator=accept,
+                cuda_mode="off",
             )
             self.assertEqual(
                 validated, ["MXFP4 GEMV", "MXFP4 batch"]
@@ -344,6 +557,265 @@ class AtomicBuildTests(unittest.TestCase):
                 (tools / "libmxfp4batch.so").read_bytes(),
                 b"new:fused_gemv_batch.c",
             )
+
+    def test_darwin_auto_keeps_outputs_and_never_probes_nvcc(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), suffix=".dylib")
+
+            def forbidden_probe(_name):
+                self.fail("Darwin auto mode must not probe NVCC")
+
+            outputs = native.build_native(
+                target=native.detect_target("darwin", "arm64"),
+                tools_dir=tools,
+                skip_metal=True,
+                cuda_mode="auto",
+                environ={"CC": sys.executable},
+                runner=self._write_output,
+                validator=lambda _path, _artifact: None,
+                nvcc_finder=forbidden_probe,
+            )
+            self.assertEqual(
+                [path.name for path in outputs],
+                ["libmxfp4gemv.dylib", "libmxfp4batch.dylib"],
+            )
+
+    def test_linux_auto_without_nvcc_builds_required_outputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td))
+            probes = []
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="auto",
+                environ={"CC": sys.executable},
+                runner=self._write_output,
+                validator=lambda _path, _artifact: None,
+                nvcc_finder=lambda name: probes.append(name),
+            )
+            self.assertEqual(probes, ["nvcc"])
+            self.assertEqual(len(outputs), 2)
+            self.assertEqual(
+                (tools / "libmxfp4gemv.so").read_bytes(),
+                b"new:fused_gemv.c",
+            )
+
+    def test_cuda_off_never_probes_or_builds_cuda(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            commands = []
+
+            def forbidden_probe(_name):
+                self.fail("CUDA off mode must not probe NVCC")
+
+            def record(command, cwd):
+                commands.append(command)
+                self._write_output(command, cwd)
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="off",
+                environ={"CC": sys.executable},
+                runner=record,
+                validator=lambda _path, _artifact: None,
+                nvcc_finder=forbidden_probe,
+            )
+            self.assertEqual(len(outputs), 2)
+            self.assertEqual(len(commands), 2)
+            self.assertFalse(
+                any(
+                    any(str(part).endswith(".cu") for part in command)
+                    for command in commands
+                )
+            )
+            self.assertEqual(
+                (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
+            )
+
+    def test_cuda_auto_compile_failure_does_not_block_cpu_install(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            reports = []
+
+            def fail_cuda(command, cwd):
+                self._write_output(command, cwd)
+                if any(str(part).endswith(".cu") for part in command):
+                    raise native.BuildError("synthetic nvcc rejection")
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="auto",
+                environ={"CC": sys.executable},
+                runner=fail_cuda,
+                validator=lambda _path, _artifact: None,
+                nvcc_finder=lambda _name: sys.executable,
+                reporter=reports.append,
+            )
+            self.assertEqual(len(outputs), 2)
+            self.assertIn("synthetic nvcc rejection", reports[0])
+            self.assertEqual(
+                (tools / "libmxfp4gemv.so").read_bytes(),
+                b"new:fused_gemv.c",
+            )
+            self.assertEqual(
+                (tools / "libmxfp4batch.so").read_bytes(),
+                b"new:fused_gemv_batch.c",
+            )
+            self.assertEqual(
+                (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
+            )
+
+    def test_cuda_auto_validation_failure_does_not_block_cpu_install(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            reports = []
+
+            def reject_cuda(_path, artifact):
+                if artifact.language == "cuda":
+                    raise ValueError("synthetic third-party validator failure")
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="auto",
+                environ={"CC": sys.executable},
+                runner=self._write_output,
+                validator=reject_cuda,
+                nvcc_finder=lambda _name: sys.executable,
+                reporter=reports.append,
+            )
+            self.assertEqual(len(outputs), 2)
+            self.assertIn("third-party validator failure", reports[0])
+            self.assertEqual(
+                (tools / "libmxfp4gemv.so").read_bytes(),
+                b"new:fused_gemv.c",
+            )
+            self.assertEqual(
+                (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
+            )
+
+    def test_cuda_on_failure_is_clear_and_preserves_all_outputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+
+            def reject_cuda(_path, artifact):
+                if artifact.language == "cuda":
+                    raise native.BuildError("synthetic CUDA ABI rejection")
+
+            with self.assertRaisesRegex(
+                native.BuildError,
+                "required by --cuda=on.*synthetic CUDA ABI rejection",
+            ):
+                native.build_native(
+                    target=native.detect_target("linux", "aarch64"),
+                    tools_dir=tools,
+                    cuda_mode="on",
+                    environ={"CC": sys.executable},
+                    runner=self._write_output,
+                    validator=reject_cuda,
+                    nvcc_finder=lambda _name: sys.executable,
+                )
+            self.assertEqual(
+                (tools / "libmxfp4gemv.so").read_bytes(), b"old-gemv"
+            )
+            self.assertEqual(
+                (tools / "libmxfp4batch.so").read_bytes(), b"old-batch"
+            )
+            self.assertEqual(
+                (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
+            )
+            self.assertFalse(list(tools.glob(".*.build-*")))
+
+    def test_cuda_on_success_installs_after_every_validation(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            validated = []
+
+            def accept(path, artifact):
+                self.assertTrue(path.read_bytes().startswith(b"new:"))
+                self.assertEqual(
+                    (tools / "libmxfp4gemv.so").read_bytes(), b"old-gemv"
+                )
+                self.assertEqual(
+                    (tools / "libmxfp4batch.so").read_bytes(), b"old-batch"
+                )
+                self.assertEqual(
+                    (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
+                )
+                validated.append(artifact.label)
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="on",
+                environ={"CC": sys.executable},
+                runner=self._write_output,
+                validator=accept,
+                nvcc_finder=lambda _name: sys.executable,
+            )
+            self.assertEqual(
+                validated, ["MXFP4 GEMV", "MXFP4 batch", "CUDA MoE"]
+            )
+            self.assertEqual(len(outputs), 3)
+            self.assertEqual(
+                (tools / "libcudamoe.so").read_bytes(),
+                b"new:cuda_moe_kernels.cu",
+            )
+
+    def test_cuda_auto_install_failure_does_not_roll_back_cpu(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            reports = []
+
+            def reject_cuda_replace(source, destination):
+                if Path(destination).name == "libcudamoe.so":
+                    raise OSError("synthetic CUDA install rejection")
+                os.replace(source, destination)
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="auto",
+                environ={"CC": sys.executable},
+                runner=self._write_output,
+                validator=lambda _path, _artifact: None,
+                nvcc_finder=lambda _name: sys.executable,
+                reporter=reports.append,
+                replace=reject_cuda_replace,
+            )
+            self.assertEqual(len(outputs), 2)
+            self.assertIn("synthetic CUDA install rejection", reports[0])
+            self.assertEqual(
+                (tools / "libmxfp4gemv.so").read_bytes(),
+                b"new:fused_gemv.c",
+            )
+            self.assertEqual(
+                (tools / "libmxfp4batch.so").read_bytes(),
+                b"new:fused_gemv_batch.c",
+            )
+            self.assertEqual(
+                (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
+            )
+
+    def test_cuda_on_missing_nvcc_fails_before_required_build(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            commands = []
+
+            with self.assertRaisesRegex(native.BuildError, "NVCC was not found"):
+                native.build_native(
+                    target=native.detect_target("linux", "aarch64"),
+                    tools_dir=tools,
+                    cuda_mode="on",
+                    environ={"CC": sys.executable},
+                    runner=lambda command, _cwd: commands.append(command),
+                    validator=lambda _path, _artifact: None,
+                    nvcc_finder=lambda _name: None,
+                )
+            self.assertEqual(commands, [])
 
     def test_install_error_rolls_back_prior_replacement(self):
         with tempfile.TemporaryDirectory() as td:

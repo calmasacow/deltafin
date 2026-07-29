@@ -215,13 +215,22 @@ def synchronize_device(torch_module, device) -> None:
 
 
 def choose_moe_backend(requested: str | None, device_type: str) -> str:
-    """Use Metal only by default on MPS; retain explicit Metal bring-up."""
+    """Choose the candidate raw-MXFP4 backend for the selected device.
+
+    CUDA is only a candidate here.  The runner still requires the versioned
+    native library and its on-device known-answer test to pass before enabling
+    it; otherwise it falls back to the established CPU path.
+    """
     value = (
         requested if requested is not None
-        else ("metal" if device_type == "mps" else "cpu")
+        else (
+            "metal" if device_type == "mps"
+            else "cuda" if device_type == "cuda"
+            else "cpu"
+        )
     ).strip().lower()
-    if value not in ("cpu", "metal"):
-        raise ValueError("K3_MOE must be cpu or metal")
+    if value not in ("cpu", "metal", "cuda"):
+        raise ValueError("K3_MOE must be cpu, metal, or cuda")
     return value
 
 

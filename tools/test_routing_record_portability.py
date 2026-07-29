@@ -129,18 +129,22 @@ def expected_output(ids, weights, width):
     return np.stack(rows)
 
 
-def extract_moe_infer_lazy(namespace):
+def extract_driver_function(name, namespace):
     tree = ast.parse((HERE / "kimi_run.py").read_text(encoding="utf-8"))
     function = next(
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "moe_infer_lazy"
+        and node.name == name
     )
     isolated = ast.Module(body=[function], type_ignores=[])
     ast.fix_missing_locations(isolated)
     exec(compile(isolated, str(HERE / "kimi_run.py"), "exec"), namespace)
-    return namespace["moe_infer_lazy"]
+    return namespace[name]
+
+
+def extract_moe_infer_lazy(namespace):
+    return extract_driver_function("moe_infer_lazy", namespace)
 
 
 class TraceSpy:
@@ -167,7 +171,7 @@ class FetchSpy:
 
     def fetch_experts(self, layer, ids, dequant):
         self.calls.append((layer, list(ids), dequant))
-        return {}
+        return {expert: expert for expert in ids}
 
 
 def driver_namespace(*, fast, trace_enabled, backend):
@@ -194,6 +198,15 @@ def driver_namespace(*, fast, trace_enabled, backend):
         "TIMES": {"expert_fetch": 0.0, "moe_kernel": 0.0},
         "TRACE": trace,
         "_MOE_FN": backend,
+        "_CPU_MOE_FN": backend,
+        "_CUDA_MOE_ACTIVE": False,
+        "_CUDA_MODEL_KEY": "/synthetic/model:4:2",
+        "cuda_moe": None,
+        "DEV": torch.device("cpu"),
+        "PROFILE": False,
+        "_device_synchronize": lambda: None,
+        "_disable_cuda_moe": lambda _reason: None,
+        "_slow_moe_infer": lambda *_args: "slow-result",
         "set_param": lambda *_args: None,
         "torch": torch,
         "_orig_moe_infer": lambda *_args: "slow-result",
@@ -360,6 +373,284 @@ class RoutingRecordTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertIs(trace.calls[0][3], records[0]["weights"])
         self.assertEqual(len(fetch.calls), 1)
+
+    def test_cuda_cache_hits_skip_fetch_and_keep_layer_identity(self):
+        ids_tensor, weights_tensor = route_fixture(1)
+        ids = RouteTensorSpy(ids_tensor)
+        weights = RouteTensorSpy(weights_tensor)
+        backend_calls = []
+        cache_calls = []
+
+        def backend(
+                x, topk_ids, topk_weight, raw, routing_record=None,
+                *, layer_index, model_key):
+            backend_calls.append((
+                x, topk_ids, topk_weight, raw, routing_record,
+                layer_index, model_key,
+            ))
+            return "cuda-result"
+
+        namespace, fetch, _trace = driver_namespace(
+            fast=True, trace_enabled=False, backend=backend)
+        namespace["_CUDA_MOE_ACTIVE"] = True
+        namespace["DEV"] = torch.device("cuda:1")
+        namespace["cuda_moe"] = types.SimpleNamespace(
+            missing_experts=lambda layer, experts, device, model_key=None: (
+                cache_calls.append((
+                    layer, list(experts), device, model_key
+                ))
+                or [3, 9]
+            )
+        )
+        infer = extract_moe_infer_lazy(namespace)
+        self.assertEqual(
+            infer(None, object(), ids, weights), "cuda-result")
+        self.assertEqual(
+            cache_calls,
+            [(17, [3, 7, 9], torch.device("cuda:1"),
+              "/synthetic/model:4:2")],
+        )
+        self.assertEqual(fetch.calls, [(17, [3, 9], False)])
+        self.assertEqual(set(backend_calls[0][3]), {3, 9})
+        self.assertEqual(backend_calls[0][5:], (
+            17, "/synthetic/model:4:2"))
+
+    def test_cuda_failure_refetches_complete_route_for_cpu(self):
+        ids_tensor, weights_tensor = route_fixture(1)
+        ids = RouteTensorSpy(ids_tensor)
+        weights = RouteTensorSpy(weights_tensor)
+        cpu_calls = []
+
+        def failing_cuda(*_args, **_kwargs):
+            raise RuntimeError("synthetic launch failure")
+
+        namespace, fetch, _trace = driver_namespace(
+            fast=True, trace_enabled=False, backend=failing_cuda)
+        namespace["_CUDA_MOE_ACTIVE"] = True
+        namespace["DEV"] = torch.device("cuda:0")
+        namespace["cuda_moe"] = types.SimpleNamespace(
+            missing_experts=lambda *_args, **_kwargs: []
+        )
+
+        def disable(_reason):
+            namespace["_CUDA_MOE_ACTIVE"] = False
+
+        def cpu_backend(
+                _x, _ids, _weights, raw, routing_record=None):
+            cpu_calls.append((raw, routing_record))
+            return "cpu-result"
+
+        namespace["_disable_cuda_moe"] = disable
+        namespace["_CPU_MOE_FN"] = cpu_backend
+        infer = extract_moe_infer_lazy(namespace)
+        self.assertEqual(infer(None, object(), ids, weights), "cpu-result")
+        # The all-hit CUDA query does no initial read. Once CUDA fails, the
+        # complete unique route—not a partial miss set—is fetched for CPU.
+        self.assertEqual(fetch.calls, [(17, [3, 7, 9], False)])
+        self.assertEqual(len(cpu_calls), 1)
+        self.assertEqual(ids.state.tolist_calls, 1)
+        self.assertEqual(weights.state.tolist_calls, 1)
+
+    def test_cuda_cache_query_failure_uses_complete_cpu_route(self):
+        ids_tensor, weights_tensor = route_fixture(1)
+        ids = RouteTensorSpy(ids_tensor)
+        weights = RouteTensorSpy(weights_tensor)
+        cpu_calls = []
+
+        def cpu_backend(
+                _x, _ids, _weights, raw, routing_record=None):
+            cpu_calls.append((raw, routing_record))
+            return "cpu-after-query-failure"
+
+        namespace, fetch, _trace = driver_namespace(
+            fast=True, trace_enabled=False, backend=cpu_backend)
+        namespace["_CUDA_MOE_ACTIVE"] = True
+        namespace["DEV"] = torch.device("cuda:0")
+
+        def query_failure(*_args, **_kwargs):
+            raise RuntimeError("synthetic cache corruption")
+
+        namespace["cuda_moe"] = types.SimpleNamespace(
+            missing_experts=query_failure)
+
+        def disable(_reason):
+            namespace["_CUDA_MOE_ACTIVE"] = False
+
+        namespace["_disable_cuda_moe"] = disable
+        infer = extract_moe_infer_lazy(namespace)
+        self.assertEqual(
+            infer(None, object(), ids, weights),
+            "cpu-after-query-failure",
+        )
+        self.assertEqual(fetch.calls, [(17, [3, 7, 9], False)])
+        self.assertEqual(len(cpu_calls), 1)
+
+    def test_slow_reference_moves_weights_to_activation_device(self):
+        moves = []
+        installed = []
+
+        class Weight:
+            def __init__(self, name):
+                self.name = name
+
+            def to(self, *, device, dtype):
+                moves.append((self.name, device, dtype))
+                return ("moved", self.name, device, dtype)
+
+        namespace = {
+            "set_param": lambda expert, name, value: installed.append(
+                (expert, name, value)
+            ),
+            "_orig_moe_infer": lambda *_args: "reference-result",
+            "torch": torch,
+        }
+        infer = extract_driver_function("_slow_moe_infer", namespace)
+        experts = {5: object(), 8: object()}
+        owner = types.SimpleNamespace(experts=experts)
+        raw = {
+            expert: {
+                name: Weight(f"{expert}.{name}")
+                for name in ("w1", "w2", "w3")
+            }
+            for expert in experts
+        }
+        x = types.SimpleNamespace(
+            device=torch.device("cuda:1"),
+            dtype=torch.float16,
+        )
+        self.assertEqual(
+            infer(owner, x, object(), object(), raw, [5, 8]),
+            "reference-result",
+        )
+        self.assertEqual(len(moves), 6)
+        self.assertTrue(all(
+            device == torch.device("cuda:1") and dtype == torch.float16
+            for _name, device, dtype in moves
+        ))
+        # Six installed weights followed by six meta releases.
+        self.assertEqual(len(installed), 12)
+
+    def test_slow_reference_cleans_partial_install_after_copy_failure(self):
+        installed = []
+        copy_calls = []
+
+        class Weight:
+            def to(self, *, device, dtype):
+                copy_calls.append((device, dtype))
+                if len(copy_calls) == 2:
+                    raise RuntimeError("synthetic accelerator OOM")
+                return self
+
+        namespace = {
+            "set_param": lambda expert, name, value: installed.append(
+                (expert, name, value)
+            ),
+            "_orig_moe_infer": lambda *_args: self.fail(
+                "reference inference ran after a failed weight copy"
+            ),
+            "torch": torch,
+        }
+        infer = extract_driver_function("_slow_moe_infer", namespace)
+        experts = {5: object(), 8: object()}
+        owner = types.SimpleNamespace(experts=experts)
+        raw = {
+            expert: {name: Weight() for name in ("w1", "w2", "w3")}
+            for expert in experts
+        }
+        x = types.SimpleNamespace(
+            device=torch.device("cuda:0"), dtype=torch.float32)
+        with self.assertRaisesRegex(RuntimeError, "synthetic accelerator OOM"):
+            infer(owner, x, object(), object(), raw, [5, 8])
+        released = [
+            (expert, name)
+            for expert, name, value in installed
+            if isinstance(value, torch.Tensor) and value.device.type == "meta"
+        ]
+        self.assertEqual(
+            released,
+            [
+                (experts[expert], f"{name}.weight")
+                for expert in (5, 8)
+                for name in ("w1", "w2", "w3")
+            ],
+        )
+
+    def test_cuda_startup_respects_kill_switch_and_dtype_gate(self):
+        available_calls = []
+        fake_cuda = types.SimpleNamespace(
+            available=lambda device: (
+                available_calls.append(device) or True
+            ),
+            describe=lambda _device: "qualified fake CUDA",
+            moe_infer=object(),
+        )
+
+        def run(*, fast, dtype):
+            disabled = []
+            namespace = {
+                "cuda_moe": None,
+                "_MOE_FN": object(),
+                "_CUDA_MOE_ACTIVE": False,
+                "FAST_MOE": fast,
+                "_disable_cuda_moe": disabled.append,
+                "DEV": types.SimpleNamespace(type="cuda"),
+                "DT": dtype,
+                "torch": torch,
+                "print": lambda *_args, **_kwargs: None,
+            }
+            activate = extract_driver_function(
+                "_activate_cuda_moe", namespace)
+            with mock.patch.dict(sys.modules, {"cuda_moe": fake_cuda}):
+                activate()
+            return namespace, disabled
+
+        namespace, disabled = run(fast=False, dtype=torch.float32)
+        self.assertEqual(disabled, ["K3_FAST_MOE=0"])
+        self.assertFalse(namespace["_CUDA_MOE_ACTIVE"])
+        self.assertEqual(available_calls, [])
+
+        namespace, disabled = run(fast=True, dtype=torch.float16)
+        self.assertEqual(len(disabled), 1)
+        self.assertIn("requires fp32", disabled[0])
+        self.assertFalse(namespace["_CUDA_MOE_ACTIVE"])
+        self.assertEqual(available_calls, [])
+
+        namespace, disabled = run(fast=True, dtype=torch.float32)
+        self.assertEqual(disabled, [])
+        self.assertTrue(namespace["_CUDA_MOE_ACTIVE"])
+        self.assertIs(namespace["_MOE_FN"], fake_cuda.moe_infer)
+        self.assertEqual(len(available_calls), 1)
+
+    def test_disable_cuda_restores_cpu_backend_state(self):
+        disabled = []
+        messages = []
+        cpu_backend = object()
+        namespace = {
+            "_CUDA_MOE_ACTIVE": True,
+            "_CUDA_MOE_FALLBACK_REPORTED": False,
+            "MOE_BACKEND": "cuda",
+            "_MOE_FN": object(),
+            "FAST_MOE": True,
+            "_CPU_MOE_FN": cpu_backend,
+            "cuda_moe": types.SimpleNamespace(
+                disable=lambda device, reason: disabled.append(
+                    (device, reason)
+                )
+            ),
+            "DEV": torch.device("cuda:2"),
+            "print": lambda message, **_kwargs: messages.append(message),
+        }
+        disable = extract_driver_function("_disable_cuda_moe", namespace)
+        disable("synthetic failure")
+        self.assertFalse(namespace["_CUDA_MOE_ACTIVE"])
+        self.assertEqual(namespace["MOE_BACKEND"], "cpu")
+        self.assertIs(namespace["_MOE_FN"], cpu_backend)
+        self.assertTrue(namespace["FAST_MOE"])
+        self.assertEqual(
+            disabled,
+            [(torch.device("cuda:2"), "synthetic failure")],
+        )
+        self.assertEqual(len(messages), 1)
 
     def test_slow_fallback_retains_trace_off_and_on_behavior(self):
         for trace_enabled in (False, True):

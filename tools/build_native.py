@@ -5,10 +5,12 @@ The script is independent of the caller's working directory:
 
     python tools/build_native.py
     python tools/build_native.py --skip-metal
+    python tools/build_native.py --cuda=off
 
-Every library is linked to a unique temporary path beside its destination.  All
-requested outputs must compile and pass their ABI/symbol validation before any
-existing library is replaced.
+Every library is linked to a unique temporary path beside its destination.
+Required CPU/Metal outputs remain one transaction.  On Linux, CUDA is a second,
+optional transaction in the default ``auto`` mode, so an installed CUDA toolkit
+that cannot build Deltafin's optional backend never breaks the CPU install.
 """
 
 from __future__ import annotations
@@ -31,6 +33,10 @@ TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
 NATIVE_ABI_VERSION = 1
 METAL_SHAPES = (3584, 3072, 17_547_264)
+CUDA_ABI_VERSION = 1
+CUDA_POINTER_LAYOUT_VERSION = 1
+CUDA_SHAPES = (3584, 3072, 17_547_264, CUDA_POINTER_LAYOUT_VERSION)
+CUDA_MODES = frozenset(("auto", "on", "off"))
 X86_64_BASE_FEATURES = {
     "avx": frozenset(("avx",)),
     "fma": frozenset(("fma",)),
@@ -60,7 +66,9 @@ class Artifact:
     language: str
     required_symbols: tuple[str, ...]
     abi_version: int | None = None
+    abi_symbol: str | None = None
     expected_metal_shapes: tuple[int, int, int] | None = None
+    expected_cuda_shapes: tuple[int, int, int, int] | None = None
 
 
 GEMV_SYMBOLS = (
@@ -105,6 +113,16 @@ METAL_SYMBOLS = (
     "k3_metal_flush",
     "k3_metal_moe_layer",
     "k3_metal_moe_positions",
+)
+
+CUDA_SYMBOLS = (
+    "k3_cuda_moe_abi_version",
+    "k3_cuda_moe_shapes",
+    "k3_cuda_moe_available",
+    "k3_cuda_moe_launch",
+    "k3_cuda_mxfp4_gemv",
+    "k3_cuda_int8_dequant",
+    "k3_cuda_last_error",
 )
 
 
@@ -202,8 +220,21 @@ def artifacts_for(
     *,
     tools_dir: Path = TOOLS_DIR,
     skip_metal: bool = False,
+    cuda_mode: str = "off",
+    nvcc_available: bool = False,
 ) -> list[Artifact]:
-    """Describe every output requested for one target."""
+    """Describe requested outputs without probing the host.
+
+    ``nvcc_available`` is deliberately injected by the caller.  This keeps
+    artifact selection deterministic in tests and ensures ``--cuda=off`` never
+    performs an accidental compiler lookup.
+    """
+    if cuda_mode not in CUDA_MODES:
+        raise BuildError(
+            f"invalid CUDA mode {cuda_mode!r}; expected auto, on, or off"
+        )
+    if cuda_mode == "on" and target.platform != "linux":
+        raise BuildError("the CUDA native backend is supported only on Linux")
     tools_dir = tools_dir.resolve()
     x86_symbols = X86_AVX2_SYMBOLS if target.machine == "x86_64" else ()
     artifacts = [
@@ -214,6 +245,7 @@ def artifacts_for(
             "c",
             (*GEMV_SYMBOLS, *x86_symbols),
             abi_version=NATIVE_ABI_VERSION,
+            abi_symbol="mxfp4_abi_version",
         ),
         Artifact(
             "MXFP4 batch",
@@ -222,6 +254,7 @@ def artifacts_for(
             "c",
             (*BATCH_SYMBOLS, *x86_symbols),
             abi_version=NATIVE_ABI_VERSION,
+            abi_symbol="mxfp4_abi_version",
         ),
     ]
     if target.supports_metal and not skip_metal:
@@ -233,6 +266,24 @@ def artifacts_for(
                 "cxx",
                 METAL_SYMBOLS,
                 expected_metal_shapes=METAL_SHAPES,
+            )
+        )
+    want_cuda = (
+        target.platform == "linux"
+        and cuda_mode != "off"
+        and (cuda_mode == "on" or nvcc_available)
+    )
+    if want_cuda:
+        artifacts.append(
+            Artifact(
+                "CUDA MoE",
+                tools_dir / "cuda_moe_kernels.cu",
+                tools_dir / "libcudamoe.so",
+                "cuda",
+                CUDA_SYMBOLS,
+                abi_version=CUDA_ABI_VERSION,
+                abi_symbol="k3_cuda_moe_abi_version",
+                expected_cuda_shapes=CUDA_SHAPES,
             )
         )
     return artifacts
@@ -263,14 +314,67 @@ def _compiler_argv(
     return argv
 
 
+def cuda_compiler_argv(
+    environ: Mapping[str, str],
+    *,
+    finder: Callable[[str], str | None] = shutil.which,
+) -> list[str] | None:
+    """Resolve ``NVCC`` safely, returning ``None`` when it is unavailable."""
+    value = environ.get("NVCC", "nvcc").strip()
+    try:
+        argv = shlex.split(value)
+    except ValueError as exc:
+        raise BuildError(f"could not parse NVCC={value!r}: {exc}") from exc
+    if not argv:
+        raise BuildError(
+            "NVCC is empty; set it to an nvcc executable or use --cuda=off"
+        )
+    try:
+        resolved = finder(argv[0])
+    except OSError as exc:
+        raise BuildError(
+            f"could not locate NVCC compiler {argv[0]!r}: {exc}"
+        ) from exc
+    if resolved is None:
+        return None
+    return [resolved, *argv[1:]]
+
+
 def compile_command(
     artifact: Artifact,
     target: Target,
     output: Path,
     *,
     environ: Mapping[str, str] = os.environ,
+    cuda_compiler: Sequence[str] | None = None,
 ) -> list[str]:
     """Construct the compiler invocation for one artifact."""
+    if artifact.language == "cuda":
+        if target.platform != "linux":
+            raise BuildError("the CUDA native backend is supported only on Linux")
+        compiler = (
+            list(cuda_compiler)
+            if cuda_compiler is not None
+            else cuda_compiler_argv(environ)
+        )
+        if not compiler:
+            raise BuildError(
+                "NVCC compiler not found; install the CUDA toolkit, set NVCC, "
+                "or use --cuda=off"
+            )
+        return [
+            *compiler,
+            "-O3",
+            "-std=c++17",
+            "-shared",
+            "-Xcompiler=-fPIC",
+            "-gencode=arch=compute_75,code=sm_75",
+            "-gencode=arch=compute_75,code=compute_75",
+            str(artifact.source),
+            "-o",
+            str(output),
+        ]
+
     compiler = _compiler_argv(artifact.language, target, environ)
     if artifact.language == "c":
         common = [
@@ -358,8 +462,11 @@ def validate_artifact(
         ) from exc
 
     symbols = list(artifact.required_symbols)
+    abi_symbol = artifact.abi_symbol
     if artifact.abi_version is not None:
-        symbols.insert(0, "mxfp4_abi_version")
+        abi_symbol = abi_symbol or "mxfp4_abi_version"
+        if abi_symbol not in symbols:
+            symbols.insert(0, abi_symbol)
     missing = [symbol for symbol in symbols if not hasattr(library, symbol)]
     if missing:
         raise BuildError(
@@ -367,7 +474,8 @@ def validate_artifact(
         )
 
     if artifact.abi_version is not None:
-        abi = getattr(library, "mxfp4_abi_version")
+        assert abi_symbol is not None
+        abi = getattr(library, abi_symbol)
         try:
             abi.argtypes = []
             abi.restype = ctypes.c_uint32
@@ -408,6 +516,42 @@ def validate_artifact(
             raise BuildError(
                 f"{artifact.label} shape handshake returned {observed_shapes}; "
                 f"expected {artifact.expected_metal_shapes}"
+            )
+
+    if artifact.expected_cuda_shapes is not None:
+        hidden = ctypes.c_int()
+        intermediate = ctypes.c_int()
+        span = ctypes.c_int64()
+        pointer_layout = ctypes.c_uint32()
+        shapes = getattr(library, "k3_cuda_moe_shapes")
+        try:
+            shapes.argtypes = [
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            shapes.restype = None
+            shapes(
+                ctypes.byref(hidden),
+                ctypes.byref(intermediate),
+                ctypes.byref(span),
+                ctypes.byref(pointer_layout),
+            )
+        except Exception as exc:
+            raise BuildError(
+                f"{artifact.label} shape/layout handshake failed: {exc}"
+            ) from exc
+        observed_shapes = (
+            hidden.value,
+            intermediate.value,
+            span.value,
+            pointer_layout.value,
+        )
+        if observed_shapes != artifact.expected_cuda_shapes:
+            raise BuildError(
+                f"{artifact.label} shape/layout handshake returned "
+                f"{observed_shapes}; expected {artifact.expected_cuda_shapes}"
             )
 
 
@@ -486,6 +630,11 @@ def install_validated(
 
 
 Validator = Callable[[Path, Artifact], None]
+Reporter = Callable[[str], None]
+
+
+def _default_reporter(message: str) -> None:
+    print(message, file=sys.stderr)
 
 
 def build_native(
@@ -493,21 +642,68 @@ def build_native(
     target: Target | None = None,
     tools_dir: Path = TOOLS_DIR,
     skip_metal: bool = False,
+    cuda_mode: str = "auto",
     environ: Mapping[str, str] = os.environ,
     runner: Callable[[Sequence[str], Path], None] | None = None,
     validator: Validator | None = None,
     cpu_flags: frozenset[str] | set[str] | None = None,
+    nvcc_finder: Callable[[str], str | None] = shutil.which,
+    reporter: Reporter = _default_reporter,
     replace: Callable[[str | os.PathLike[str], str | os.PathLike[str]], None]
     = os.replace,
 ) -> list[Path]:
-    """Compile, validate, and atomically install all target libraries."""
+    """Compile, validate, and atomically install target libraries.
+
+    CPU and Metal artifacts are always one required transaction.  CUDA is part
+    of that transaction only when explicitly required with ``cuda_mode="on"``.
+    In the default ``auto`` mode its build and install are independent and any
+    failure is reported as a warning after the required transaction succeeds.
+    """
     target = detect_target() if target is None else target
     preflight_target(target, cpu_flags=cpu_flags)
     tools_dir = tools_dir.resolve()
-    artifacts = artifacts_for(target, tools_dir=tools_dir, skip_metal=skip_metal)
-    for artifact in artifacts:
-        if not artifact.source.is_file():
-            raise BuildError(f"required source file not found: {artifact.source}")
+    required_artifacts = artifacts_for(
+        target,
+        tools_dir=tools_dir,
+        skip_metal=skip_metal,
+        cuda_mode="off",
+    )
+
+    # Deliberately do not resolve NVCC on Darwin or in off mode.
+    cuda_compiler: list[str] | None = None
+    cuda_artifacts: list[Artifact] = []
+    if cuda_mode not in CUDA_MODES:
+        raise BuildError(
+            f"invalid CUDA mode {cuda_mode!r}; expected auto, on, or off"
+        )
+    if cuda_mode == "on" and target.platform != "linux":
+        raise BuildError("the CUDA native backend is supported only on Linux")
+    if target.platform == "linux" and cuda_mode != "off":
+        try:
+            cuda_compiler = cuda_compiler_argv(
+                environ, finder=nvcc_finder
+            )
+        except BuildError as exc:
+            if cuda_mode == "on":
+                raise
+            reporter(f"optional CUDA build skipped: {exc}")
+        if cuda_compiler is None and cuda_mode == "on":
+            raise BuildError(
+                "CUDA was required by --cuda=on, but NVCC was not found. "
+                "Install the CUDA toolkit or set NVCC to its compiler"
+            )
+        if cuda_compiler is not None:
+            cuda_artifacts = [
+                artifact
+                for artifact in artifacts_for(
+                    target,
+                    tools_dir=tools_dir,
+                    skip_metal=skip_metal,
+                    cuda_mode=cuda_mode,
+                    nvcc_available=True,
+                )
+                if artifact.language == "cuda"
+            ]
 
     if runner is None:
         def invoke(command: Sequence[str], cwd: Path) -> None:
@@ -518,23 +714,77 @@ def build_native(
             validate_artifact(path, artifact)
         validator = check
 
-    prepared: list[tuple[Artifact, Path]] = []
+    required_prepared: list[tuple[Artifact, Path]] = []
+    cuda_prepared: list[tuple[Artifact, Path]] = []
     temporaries: list[Path] = []
-    try:
+
+    def prepare(
+        artifacts: Sequence[Artifact],
+        prepared: list[tuple[Artifact, Path]],
+    ) -> None:
         for artifact in artifacts:
+            if not artifact.source.is_file():
+                qualifier = (
+                    "optional CUDA" if artifact.language == "cuda" else "required"
+                )
+                raise BuildError(
+                    f"{qualifier} source file not found: {artifact.source}"
+                )
             temporary = _temporary_output(artifact.destination)
             temporaries.append(temporary)
             command = compile_command(
-                artifact, target, temporary, environ=environ
+                artifact,
+                target,
+                temporary,
+                environ=environ,
+                cuda_compiler=cuda_compiler,
             )
             runner(command, tools_dir.parent)
             validator(temporary, artifact)
             temporary.chmod(0o755)
             prepared.append((artifact, temporary))
 
-        # Nothing under a production filename changes until every output passed.
-        install_validated(prepared, replace=replace)
-        return [artifact.destination for artifact, _ in prepared]
+    try:
+        prepare(required_artifacts, required_prepared)
+        if cuda_artifacts:
+            try:
+                prepare(cuda_artifacts, cuda_prepared)
+            except Exception as exc:
+                if cuda_mode == "on":
+                    raise BuildError(
+                        "CUDA build required by --cuda=on failed: "
+                        f"{exc}"
+                    ) from exc
+                reporter(
+                    "optional CUDA build failed; continuing with required "
+                    f"CPU libraries: {exc}"
+                )
+                cuda_prepared.clear()
+
+        if cuda_mode == "on":
+            # Explicitly requested outputs are one all-or-nothing transaction.
+            prepared = [*required_prepared, *cuda_prepared]
+            install_validated(prepared, replace=replace)
+            return [artifact.destination for artifact, _ in prepared]
+
+        # Required outputs retain their existing all-or-nothing transaction.
+        install_validated(required_prepared, replace=replace)
+        outputs = [
+            artifact.destination for artifact, _ in required_prepared
+        ]
+        if cuda_prepared:
+            try:
+                install_validated(cuda_prepared, replace=replace)
+            except BuildError as exc:
+                reporter(
+                    "optional CUDA library was not installed; CPU libraries "
+                    f"remain available: {exc}"
+                )
+            else:
+                outputs.extend(
+                    artifact.destination for artifact, _ in cuda_prepared
+                )
+        return outputs
     finally:
         for temporary in temporaries:
             temporary.unlink(missing_ok=True)
@@ -551,6 +801,16 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="on Apple Silicon, build only the CPU GEMV and batch libraries",
     )
+    parser.add_argument(
+        "--cuda",
+        choices=sorted(CUDA_MODES),
+        default="auto",
+        help=(
+            "Linux CUDA backend: auto builds it when NVCC is available "
+            "without blocking CPU installation; on requires it; off never probes "
+            "(default: auto)"
+        ),
+    )
     return parser
 
 
@@ -558,7 +818,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         target = detect_target()
-        outputs = build_native(target=target, skip_metal=args.skip_metal)
+        outputs = build_native(
+            target=target,
+            skip_metal=args.skip_metal,
+            cuda_mode=args.cuda,
+        )
     except BuildError as exc:
         print(f"native build failed: {exc}", file=sys.stderr)
         return 1

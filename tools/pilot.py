@@ -344,13 +344,22 @@ def _union(rows, vals):
     return sorted(sorted(best, key=lambda e: -best[e])[:MAX_PREFETCH])
 
 
-def issue_prefetch(li, fetch_v2, pread=True):
+def issue_prefetch(li, fetch_v2, pread=True, filter_ids=None):
     """Start the predicted reads for layer `li`.  Called by the driver only AFTER
     the current layer's demand reads have completed, so a speculative read can
-    never sit in front of a demand read in the pread pool's FIFO queue."""
+    never sit in front of a demand read in the pread pool's FIFO queue.
+
+    An accelerator-residency backend may provide ``filter_ids(layer, ids)`` to
+    remove experts already resident on that device. A failed filter must return
+    its original input; prefetch remains only an optimization.
+    """
     ids = _PREF.pop(li, None)
     if not ids:
         return
+    if filter_ids is not None:
+        ids = list(filter_ids(li, list(ids)))
+        if not ids:
+            return
     STATS["issued_layers"] += 1
     # .bin experts are served by fetch_v2's pread pool, .npz experts by ours;
     # under pread each expert belongs to exactly one of the two, so route each

@@ -13,7 +13,8 @@
 Deltafin is a small research project that runs a Mixture-of-Experts model far
 larger than the machine it sits on. It supports Apple Silicon macOS and
 x86-64/aarch64 Linux, automatically selecting MPS, CUDA or CPU for the resident
-model path and a compatible native MXFP4 expert kernel. The maintainer-run
+model path and a qualified Metal, CUDA or CPU MXFP4 expert kernel. The
+maintainer-run
 reference is **0.0687 token/s (14.6 seconds/token)** on a modest 64 GB M1 Max;
 that is one first-generation machine, not a ceiling for newer hardware.
 
@@ -62,7 +63,10 @@ Linux, install a C/C++ compiler toolchain such as `build-essential` or GCC/Clang
 For an NVIDIA system, install a CUDA-enabled PyTorch build using the
 [official PyTorch selector](https://pytorch.org/get-started/locally/) before
 installing the remaining Python packages. Deltafin does not vendor PyTorch or a
-CUDA runtime.
+CUDA runtime. On Linux, the native build also detects NVCC when it is available.
+Its CUDA artifact is optional in the default `--cuda=auto` mode: a missing or
+incompatible toolkit cannot block the CPU libraries. Use `--cuda=on` to require
+and diagnose that artifact, or `--cuda=off` to skip the probe explicitly.
 
 ### Upgrade without downloading the model again
 
@@ -237,8 +241,12 @@ startup. These variables exist for overriding that:
 | Variable | Default | Meaning |
 |---|---|---|
 | `K3_DEV` | auto | `mps` when available, then the first CUDA device visible to the process, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
-| `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
+| `K3_MOE` | auto | `metal` on MPS; a native `cuda` candidate on CUDA; otherwise `cpu`. Optional GPU backends must pass their own ABI, shape and correctness checks or fall back to CPU |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
+| `K3_CUDA_MOE_LIB` | `tools/libcudamoe.so` | override the optional native CUDA library path |
+| `K3_CUDA_EXPERT_CACHE` | `auto` | maximum resident GPU experts; `auto` budgets from free VRAM at the first real route, after model allocations, while `0` keeps CUDA compute but disables residency |
+| `K3_CUDA_EXPERT_CACHE_RESERVE` | `auto` | VRAM kept outside the expert cache (`auto` is at least 2 GiB and 20% of free VRAM); accepts byte units or a percentage |
+| `K3_CUDA_INT8_DEQUANT` | `auto` | qualified one-pass CUDA dequant for int8 resident-spine tensors; `off` retains the selected PyTorch expression |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `auto` | packed row-int8 output head on a qualified native backend; automatic on MPS, forceable elsewhere, with the first real head call guarded by a dense fallback |
 | `K3_INT8_KDA_QKV` | `0` | experimental packed row-int8 bundle for KDA Q/K/V/G/F-A/B; one real MPS streamed-weight sequence has passed exactly, while every backend remains capability-gated with a dense fallback |
@@ -271,6 +279,8 @@ not promoted as general defaults here.
 - Apple Silicon macOS, or x86-64/aarch64 Linux. Linux x86-64 requires
   AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected at runtime.
 - A C/C++ compiler: Xcode Command Line Tools on macOS, or GCC/Clang on Linux.
+  Building the optional native CUDA expert path also requires NVCC; inference
+  retains the native CPU expert path when it is absent.
 - Python 3.12 or newer.
 - PyTorch for the selected device. NVIDIA acceleration requires a CUDA-enabled
   PyTorch build; CPU-only Linux remains supported.
@@ -315,7 +325,7 @@ flowchart LR
         subgraph TOK["per token"]
             R{"router<br/>top-16 of 896<br/>× 92 layers"}
             L["93 decoder layers<br/>MPS / CUDA / CPU"]
-            K["fused MXFP4 MoE<br/>Metal or CPU SIMD"]
+            K["fused MXFP4 MoE<br/>Metal / CUDA / CPU SIMD"]
         end
     end
     W -- "one range request<br/>per missing expert" --> EC
@@ -363,7 +373,8 @@ set, Deltafin selected CUDA plus the int8 spine and completed
 seconds** in that reported single run (139.6 s compute, 51.9 s expert fetch,
 40.8 s MoE kernel, 37.4 s preload wait). This is a community measurement from
 [pull request #2](https://github.com/gavamedia/deltafin/pull/2), not a
-maintainer-replicated benchmark.
+maintainer-replicated benchmark. It used the hybrid CUDA-resident/CPU-expert
+path and therefore is not a benchmark of the newer native CUDA expert kernel.
 
 The contributor also reported this four-configuration comparison on the same
 system; all four runs produced the same expected output:
@@ -420,8 +431,9 @@ hard-coded chip name:
   loading and expert matmuls. Newer Apple Max/Ultra chips and high-bandwidth
   Linux workstations should have more room than the M1 reference.
 - **Accelerator.** More capable Apple GPUs execute the MPS/Metal resident path
-  faster. CUDA accelerates the resident spine and attention on NVIDIA Linux;
-  routed MXFP4 MoE remains on the CPU until a native CUDA kernel lands.
+  faster. On NVIDIA Linux, CUDA accelerates the resident spine and attention;
+  the routed MXFP4 MoE also uses the native CUDA path after its ABI and
+  on-device correctness tests pass, with the native CPU kernel as fallback.
 - **SSD.** Expert reads are one of the largest slices and run at the throughput
   the local NVMe and filesystem can sustain.
 - **RAM.** This often matters most. The 53 GB int8 spine does not fit alongside
@@ -491,15 +503,17 @@ The short version is:
 | Host | Resident model / attention | Routed-expert MoE |
 |---|---|---|
 | Apple Silicon macOS | MPS | Metal, with a native CPU alternative |
-| NVIDIA Linux, x86-64 or aarch64 | CUDA | native CPU MXFP4 |
+| NVIDIA Linux, x86-64 or aarch64 | CUDA | qualified native CUDA MXFP4, with native CPU fallback |
 | Linux x86-64 (AVX/FMA3/SSSE3 baseline) | CPU | runtime AVX2/FMA or exact 128-bit compatibility MXFP4 |
 | Linux aarch64 | CPU | native NEON MXFP4 |
 
-The NVIDIA path is deliberately described as hybrid: CUDA accelerates the
-resident spine and attention, while routed MXFP4 experts still execute in the
-native CPU kernel. There is not yet a native CUDA MXFP4 MoE kernel.
-`build_native.py` selects `.dylib` or `.so`, applies the appropriate host ISA
-flags, validates required symbols and ABI, and only then installs the artifacts.
+The NVIDIA path qualifies the optional CUDA expert library with a versioned
+ABI, fixed shape/layout handshake and small on-device known-answer tests before
+the first real expert call. Failure leaves the resident CUDA model path intact
+and selects the native CPU MXFP4 fallback. `build_native.py` selects `.dylib` or
+`.so`, applies the appropriate host ISA flags, validates required symbols and
+ABI, and only then installs the artifacts. Optional CUDA build failure cannot
+block installation of the required CPU libraries.
 The x86 build is one fat binary: it requires the instructions used by the exact
 AVX/FMA3/SSSE3 baseline, detects AVX2 once at runtime, and calls the
 target-attributed 256-bit kernel only when the CPU and OS support it.
@@ -511,12 +525,12 @@ Validation is intentionally separated from platform support:
 | Apple Silicon / MPS + Metal | maintainer-run end-to-end benchmarks and exact-token gates |
 | Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
 | Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
-| Discrete NVIDIA Linux | device and portability paths exist; a maintainer-replicated end-to-end run is still wanted |
+| Native CUDA MXFP4 MoE | implementation is ABI/KAT/fallback-gated; CUDA hardware parity and throughput measurements are still wanted |
 
 ### Where this could go
 
-Roughly in order: a native CUDA MXFP4 MoE kernel for an all-accelerator NVIDIA
-path, further Metal expert-kernel tuning, a proper quality harness — average NLL
+Roughly in order: hardware-wide CUDA expert-kernel tuning, further Metal
+expert-kernel tuning, a proper quality harness — average NLL
 against the official API — so lossy speed/quality trade-offs can be measured
 rather than argued about, smarter expert prefetching, and eventually a native
 engine in the spirit of ds4, where most remaining overhead should disappear.
