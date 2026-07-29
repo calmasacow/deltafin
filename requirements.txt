@@ -1,0 +1,14 @@
+# Runtime dependencies managed by tools/upgrade.py.
+#
+# PyTorch is intentionally absent. Its correct wheel depends on the host
+# (MPS, CUDA, or CPU), so install it using https://pytorch.org/get-started/locally/
+# before installing this file.
+numpy
+safetensors
+tiktoken
+ml_dtypes
+blobfile
+transformers==4.56.2
+einops
+tokenizers
+packaging

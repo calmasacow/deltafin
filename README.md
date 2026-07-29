@@ -17,6 +17,10 @@ model path and a compatible native MXFP4 expert kernel. The maintainer-run
 reference is **0.0687 token/s (14.6 seconds/token)** on a modest 64 GB M1 Max;
 that is one first-generation machine, not a ceiling for newer hardware.
 
+The README stays focused on installing and running the project. For the
+mechanisms, measurements, and fallback rules behind the speed work, see
+[How Deltafin's optimizations work](OPTIMIZATIONS.md).
+
 ![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
 ![hardware](https://img.shields.io/badge/measured_on-M1_Max_·_64GB-silver)
 ![speed](https://img.shields.io/badge/decode-0.0687_tok%2Fs_·_14.6s%2Ftoken_(M1_Max)-orange)
@@ -41,11 +45,11 @@ cd deltafin
 
 # 1. environment (Python 3.12+)
 python3 -m venv venv
-./venv/bin/pip install torch numpy safetensors tiktoken ml_dtypes blobfile \
-    "transformers==4.56.2" einops tokenizers
+./venv/bin/python -m pip install torch
+./venv/bin/python -m pip install -r requirements.txt
 
 # 2. build and validate the native libraries for this host
-python3 tools/build_native.py
+./venv/bin/python tools/build_native.py
 
 # 3. download the model  (see the two modes below)
 ./venv/bin/python tools/setup_k3.py --full
@@ -137,6 +141,44 @@ change in our checks. Takes a few minutes:
 ./venv/bin/python tools/convert_spine_int8.py
 ```
 
+## Upgrade without downloading the model again
+
+Once this release is installed, upgrading is one command from the Deltafin
+folder:
+
+```bash
+./venv/bin/python tools/upgrade.py
+```
+
+The upgrader is deliberately conservative. It refuses a dirty or diverged Git
+checkout, fetches the configured upstream, accepts only a fast-forward, keeps
+the host-specific PyTorch build unchanged, refreshes the other dependencies,
+and rebuilds all native libraries transactionally. It never runs model setup,
+conversion, `git clean`, or `git reset`; downloaded models and caches remain
+where they are.
+
+### One-time upgrade from an older release
+
+Older copies do not contain `tools/upgrade.py` yet. From the existing Deltafin
+folder, first inspect the checkout:
+
+```bash
+git status --short
+```
+
+If that prints nothing, bootstrap the new upgrader and then let it finish the
+environment and native-library update:
+
+```bash
+git pull --ff-only
+./venv/bin/python tools/upgrade.py
+```
+
+If `git status --short` prints any paths, stop there rather than discarding or
+stashing them blindly. Commit or move work you want to keep, then retry. An
+upgrade never requires `setup_k3.py`, another 1.7 TB download, or manual
+one-library `clang` commands.
+
 ## Usage
 
 ```bash
@@ -215,7 +257,7 @@ startup. These variables exist for overriding that:
 | `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
-| `K3_INT8_LM_HEAD` | `auto` | packed row-int8 output head when a native operator passes its real-shape canary; automatic on MPS, forceable elsewhere, with an exact dense fallback |
+| `K3_INT8_LM_HEAD` | `auto` | packed row-int8 output head on a qualified native backend; automatic on MPS, forceable elsewhere, with the first real head call guarded by a dense fallback |
 | `K3_INT8_KDA_QKV` | `0` | experimental packed row-int8 bundle for KDA Q/K/V/G/F-A/B; one real MPS streamed-weight sequence has passed exactly, while every backend remains capability-gated with a dense fallback |
 | `K3_KDA_RECUR` | `device` | keep the KDA recurrence on the selected CPU, CUDA or MPS device; `cpu` preserves the historical MPS-to-CPU experiment and legacy `mps` is accepted as an alias for `device` |
 | `K3_SHORTCONV` | `auto` | use the portable decode-time four-tap multiply/sum kernel on MPS, CUDA and CPU; `conv1d` remains forceable for backend retesting |
@@ -235,6 +277,11 @@ startup. These variables exist for overriding that:
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
 | `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
 | `K3_RESPONSE_MEMO_ENTRIES` | `32` | exact in-process replay cache for identical deterministic API requests; `0` disables |
+
+Less commonly needed experimental controls, including packed-KDA storage and
+CPU padded-SDPA qualification, are documented with their evidence and fallback
+contracts in [the optimization guide](OPTIMIZATIONS.md). They are intentionally
+not promoted as general defaults here.
 
 ## Requirements
 
@@ -430,112 +477,30 @@ prompts are expensive because prefill touches many experts. We think it is
 interesting mainly as an existence proof, and as a testbed for
 streaming-inference techniques.
 
-## Techniques
+## Performance design
 
-Performance claims below were measured on real weights before they were
-retained. Compatibility-only paths are labelled separately and do not borrow a
-speed percentage from another machine. Little of this is novel on its own; most
-of it adapts ideas from the projects credited below to K3's particular shape.
+Deltafin gets most of its speed by moving fewer bytes, overlapping unavoidable
+reads with compute, reusing allocations and state, and selecting native kernels
+from observed runtime capabilities. The public README intentionally keeps that
+description broad.
 
-### I/O and streaming
+The detailed guide explains each retained optimization separately—including
+the unusual state-snapshot, packed-projection, page-cache, buffer-ownership and
+CPU FlashAttention paths—along with its measurements, exactness rules, platform
+scope, and fallback:
 
-- **Coalesced expert fetch.** Each expert's six tensors happen to be contiguous in
-  the shard files (we checked all 82,432), so a whole expert is a single 17.55 MB
-  range request over a small pool of keep-alive connections. That measured about
-  6.4× faster than fetching tensors individually.
-- **Raw-span disk cache.** Cache files are the shard bytes verbatim — no container
-  format, no parsing.
-- **Parallel expert reads.** A layer's 16 selected experts are read together by a
-  thread pool using `pread`, rather than being demand-faulted page by page while
-  the kernel computes. On the measured Mac, Darwin's `F_NOCACHE` kept 25
-  GB/token of expert traffic from evicting the page cache the spine needed;
-  Linux uses its own best-effort cache-advice path when explicitly enabled.
-  The Mac cold-read comparison was 0.87 GB/s faulting versus 6.85 GB/s reading,
-  worth 40 s → 4.3 s per token on that read path.
-- **Double-buffered layer loading.** A worker thread reads the next layer's spine
-  data while the current layer computes.
-- **Previous-token prefetch.** Consecutive tokens reuse about 31% of their expert
-  selections on a deduplicated holdout, so each token's set is fetched in the
-  background for the next one.
+**[Read: How Deltafin's optimizations work](OPTIMIZATIONS.md)**
 
-### Compute
+The short version is:
 
-- **Fused MXFP4 dequant+GEMV** ([`tools/fused_gemv.c`](tools/fused_gemv.c)) — a
-  native kernel that dequantizes and multiplies in one pass. An immutable 8 KiB
-  lookup covers the complete E8M0 scale domain, so the kernel no longer rebuilds
-  the same exponent table for every 32 weights. It uses NEON on aarch64 and
-  runtime-selected AVX2/FMA on x86-64, with an exact AVX/FMA3/SSSE3
-  compatibility implementation for hosts without AVX2.
-  The persistent x86 batch path permutes each distinct activation once for the
-  whole dispatch rather than once per expert or row chunk. The lookup and the
-  retained synthesis oracle are bit-identical for all 16 E2M1 codes, all 256
-  E8M0 bytes, odd shapes, multithreading and persistent batching on both
-  supported CPU architectures. Selected and compatibility implementations also
-  agree with the independent float64 reference within its stated numerical
-  bound. They replaced a much slower dequantize-then-matmul path. A Metal
-  version exists as a validated prototype.
-- **Template-layer buffer reuse.** All 69 KDA layers share one set of tensor
-  shapes and all 24 MLA layers another, so two persistent device-resident "template"
-  layers can receive each layer's weights via `copy_()`. This avoids the allocator
-  churn that profiling showed was a large share of per-token time.
-- **int8 resident spine.** Halves the per-token resident I/O. In our checks the
-  top-5 next-token candidates kept their order and the top logit moved by 0.07%.
-- **Custom Metal dequant kernel (Apple).** Loading the spine spent most of its time in a
-  row-broadcast multiply that MPS runs at 43 GB/s, against 334 GB/s for a plain
-  copy of the same bytes. A small `compile_shader` kernel fusing int8→fp32, the
-  row scale, and the copy reaches 297 GB/s; with persistent staging buffers and
-  transfers hoisted out from between dispatches, per-layer load went 118 ms →
-  21 ms. Bit-exact: `max|diff| = 0` on every tensor.
-- **Packed int8 output head (Apple).** The built-in MPS weight-only matmul consumes the
-  existing row-int8 checkpoint directly, avoiding a 4.7 GB fp32 head and its
-  dequantization. Capability checks and a caught dense fallback preserve support
-  across PyTorch releases and accelerator generations.
-- **Packed int8 KDA projection bundle.** An opt-in controller keeps
-  Q/K/V/G/F-A/B in one row-int8 arena and collapses the six same-input
-  projections into one native call when the backend passes real-shape and
-  unequal-row canaries. A real streamed-weight MPS run executed 816 projections
-  as 136 calls with exact emitted tokens and no fallback. Unsupported CPU,
-  CUDA, MPS, shape or ABI combinations stay on the dense path; broader
-  backend timing is still required before this becomes automatic.
-- **Pure-PyTorch KDA shim** ([`tools/fla/`](tools/fla)) — Kimi Delta Attention's
-  recurrence, short convolution, and gated norm, ported from fla-core's semantics.
-  Chunked and step-by-step execution agree to about 1e-9. At decode the recurrence
-  stays on the selected device by default; an explicit CPU mode remains
-  available for backend-specific retesting.
-
-### Decoding
-
-- **N-gram speculation.** Drafts come free from suffix matching against the text
-  so far, and are verified in a two-position batch whose fixed costs are shared.
-  This is worthwhile here precisely because resident I/O and compute — not expert
-  fetching — dominate a warm token. Accepted drafts reproduced the reference
-  sequence exactly in our tests. Rollback retains the old immutable state
-  objects instead of cloning ~475 MB, then restores them in constant time; replay
-  tests preserve the exact future sequence.
-
-```mermaid
-sequenceDiagram
-    participant D as n-gram draft
-    participant M as model (one T=2 pass)
-    participant S as state snapshot
-    D->>M: [last_token, draft]
-    M->>M: 93 layers, shared cost
-    alt draft verified
-        M-->>D: 2 tokens accepted
-    else draft wrong
-        S-->>M: state restored (bit-exact)
-        M-->>D: 1 token, nothing lost
-    end
-```
-
-### Scaling with RAM
-
-- At startup Deltafin reserves memory for the OS (`max(10 GB, 18%)`) and pins as
-  many private resident layers as the selected mode allows, while respecting
-  host and container limits and accelerator headroom when that pinning path is
-  active. The default shared templates instead minimize live device storage.
-  A 128 GB machine also gives the expert and spine page caches substantially
-  more room.
+- immutable model data stays packed until the operation that consumes it;
+- streamed layers and routed experts use separate, overlapping data paths;
+- temporary tensors, routing records and cache state are reused when ownership
+  makes that safe;
+- optional native paths qualify themselves by capability and correctness
+  checks, then fall back without changing the model data;
+- a structural byte or allocation saving is not reported as a tokens/second
+  win until a balanced full-model measurement supports it.
 
 ## Where this could go
 

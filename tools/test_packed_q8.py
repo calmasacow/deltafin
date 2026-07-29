@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Disk-free tests for backend-neutral packed row-int8 discovery."""
+import pathlib
+import sys
 import unittest
 
 import torch
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
 import packed_q8
 
