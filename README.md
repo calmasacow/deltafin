@@ -34,7 +34,7 @@ mechanisms, measurements, and fallback rules behind the speed work, see
 
 ---
 
-## Install or upgrade
+## 1. Install or upgrade
 
 ### New installation
 
@@ -102,33 +102,6 @@ stashing them blindly. Commit or move work you want to keep, then retry. An
 upgrade never requires `setup_k3.py`, another 1.7 TB download, or manual
 one-library `clang` commands.
 
-### Supported platforms
-
-| Host | Resident model / attention | Routed-expert MoE |
-|---|---|---|
-| Apple Silicon macOS | MPS | Metal, with a native CPU alternative |
-| NVIDIA Linux, x86-64 or aarch64 | CUDA | native CPU MXFP4 |
-| Linux x86-64 (AVX/FMA3/SSSE3 baseline) | CPU | runtime AVX2/FMA or exact 128-bit compatibility MXFP4 |
-| Linux aarch64 | CPU | native NEON MXFP4 |
-
-The NVIDIA path is deliberately described as hybrid: CUDA accelerates the
-resident spine and attention, while routed MXFP4 experts still execute in the
-native CPU kernel. There is not yet a native CUDA MXFP4 MoE kernel.
-`build_native.py` selects `.dylib` or `.so`, applies the appropriate host ISA
-flags, validates required symbols and ABI, and only then installs the artifacts.
-The x86 build is one fat binary: it requires the instructions used by the exact
-AVX/FMA3/SSSE3 baseline, detects AVX2 once at runtime, and calls the
-target-attributed 256-bit kernel only when the CPU and OS support it.
-
-Validation is intentionally separated from platform support:
-
-| Configuration | Current evidence |
-|---|---|
-| Apple Silicon / MPS + Metal | maintainer-run end-to-end benchmarks and exact-token gates |
-| Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
-| Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
-| Discrete NVIDIA Linux | device and portability paths exist; a maintainer-replicated end-to-end run is still wanted |
-
 ### The two modes
 
 | | `--full` (recommended) | `--stream` |
@@ -181,7 +154,7 @@ change in our checks. Takes a few minutes:
 ./venv/bin/python tools/convert_spine_int8.py
 ```
 
-## Usage
+## 2. Use from the command line
 
 ```bash
 # ask a question; generates until the model finishes its answer
@@ -200,7 +173,7 @@ is part of the experience.
 Set `K3_TRACE=buffered` to log router selections to `router_trace.jsonl` for
 offline study. Performance runs leave tracing off.
 
-## OpenAI-compatible server
+## 3. Use through an OpenAI-compatible server
 
 Deltafin can serve the standard OpenAI API, so chat interfaces, the `openai` SDK
 and coding agents can use it by changing a base URL:
@@ -247,7 +220,15 @@ Please read these caveats before pointing anything automated at it:
 - **Agents are a curiosity, not a workflow.** Coding assistants work in
   principle, but their long system prompts make prefill expensive.
 
-## Configuration
+---
+
+## Reference and technical details
+
+The three sections above cover the normal path: install or upgrade Deltafin,
+run it directly, or expose it through the compatible server. The remaining
+sections collect configuration, implementation, platform and benchmark detail.
+
+### Configuration
 
 Everything works with no configuration: Deltafin picks a preferred available
 device and the int8 spine when it has been built, and says what it chose at
@@ -285,7 +266,7 @@ CPU padded-SDPA qualification, are documented with their evidence and fallback
 contracts in [the optimization guide](OPTIMIZATIONS.md). They are intentionally
 not promoted as general defaults here.
 
-## Requirements
+### Requirements
 
 - Apple Silicon macOS, or x86-64/aarch64 Linux. Linux x86-64 requires
   AVX, FMA3, SSE3 and SSSE3; AVX2 is detected and selected at runtime.
@@ -293,7 +274,8 @@ not promoted as general defaults here.
 - Python 3.12 or newer.
 - PyTorch for the selected device. NVIDIA acceleration requires a CUDA-enabled
   PyTorch build; CPU-only Linux remains supported.
-- Disk: ~1.7 TB for the full install, ~215 GB for streaming (see [Install](#install)).
+- Disk: ~1.7 TB for the full install, ~215 GB for streaming (see
+  [Install or upgrade](#1-install-or-upgrade)).
 - Network access to Hugging Face.
 
 Host RAM and container/cgroup limits are budgeted automatically. Accelerator
@@ -303,7 +285,7 @@ remains authoritative. More memory lets Deltafin retain more of the resident
 spine and expert page cache. See
 [Why newer hardware should be faster](#why-newer-hardware-should-be-faster).
 
-## How it works
+### How it works
 
 K3's weights total about 1.56 TB, which is more than most single workstations
 can hold in RAM. The observation that makes local inference possible anyway is
@@ -344,7 +326,7 @@ flowchart LR
     L -- "logits" --> R
 ```
 
-## What to expect
+### What to expect
 
 The maintainer reference below was measured on **one modest M1 Max (10-core CPU,
 32-core GPU, 64 GB, internal NVMe)** with the full model installed locally,
@@ -371,7 +353,7 @@ shows how much this I/O-heavy workload moved even on the same quiet machine.
 > We expect newer, higher-bandwidth and higher-RAM systems to do better, but will
 > label those numbers separately when someone measures them.
 
-### Community Linux + CUDA result
+#### Community Linux + CUDA result
 
 [Maurice Brown (`trumb`)](https://github.com/trumb) reported an end-to-end run
 on an NVIDIA DGX Spark (GB10 Grace-Blackwell, 20-core Cortex-X925, 128 GB unified
@@ -399,7 +381,7 @@ almost no room for the expert page cache, while the roughly 53 GB int8 spine
 freed enough cache headroom for preload wait to collapse. That result is a good
 reminder that quantization can change the I/O regime, not just arithmetic cost.
 
-### Recent exact-path improvements
+#### Recent exact-path improvements
 
 The newest measurements below are balanced A/Bs on the same M1 Max. Token
 oracles were checked for every full-model run.
@@ -428,7 +410,7 @@ re-read every token, and at the ~7 GB/s this access pattern sustains that is abo
 hold the spine without displacing the page cache the expert reads need) or a
 smaller spine.
 
-### Why newer hardware should be faster
+#### Why newer hardware should be faster
 
 The maintainer numbers above come from an M1 Max, but the dominant costs vary
 with memory, storage, CPU SIMD and accelerator capability rather than a
@@ -479,7 +461,7 @@ prompts are expensive because prefill touches many experts. We think it is
 interesting mainly as an existence proof, and as a testbed for
 streaming-inference techniques.
 
-## Performance design
+### Performance design
 
 Deltafin gets most of its speed by moving fewer bytes, overlapping unavoidable
 reads with compute, reusing allocations and state, and selecting native kernels
@@ -504,7 +486,34 @@ The short version is:
 - a structural byte or allocation saving is not reported as a tokens/second
   win until a balanced full-model measurement supports it.
 
-## Where this could go
+### Supported platforms
+
+| Host | Resident model / attention | Routed-expert MoE |
+|---|---|---|
+| Apple Silicon macOS | MPS | Metal, with a native CPU alternative |
+| NVIDIA Linux, x86-64 or aarch64 | CUDA | native CPU MXFP4 |
+| Linux x86-64 (AVX/FMA3/SSSE3 baseline) | CPU | runtime AVX2/FMA or exact 128-bit compatibility MXFP4 |
+| Linux aarch64 | CPU | native NEON MXFP4 |
+
+The NVIDIA path is deliberately described as hybrid: CUDA accelerates the
+resident spine and attention, while routed MXFP4 experts still execute in the
+native CPU kernel. There is not yet a native CUDA MXFP4 MoE kernel.
+`build_native.py` selects `.dylib` or `.so`, applies the appropriate host ISA
+flags, validates required symbols and ABI, and only then installs the artifacts.
+The x86 build is one fat binary: it requires the instructions used by the exact
+AVX/FMA3/SSSE3 baseline, detects AVX2 once at runtime, and calls the
+target-attributed 256-bit kernel only when the CPU and OS support it.
+
+Validation is intentionally separated from platform support:
+
+| Configuration | Current evidence |
+|---|---|
+| Apple Silicon / MPS + Metal | maintainer-run end-to-end benchmarks and exact-token gates |
+| Linux aarch64 / CUDA + CPU MoE | community end-to-end run and contributor kernel tests on DGX Spark |
+| Linux x86-64 / CPU | strict fat-binary compilation plus selected/compatibility exactness under Rosetta; native Linux AVX2 timing is still wanted |
+| Discrete NVIDIA Linux | device and portability paths exist; a maintainer-replicated end-to-end run is still wanted |
+
+### Where this could go
 
 Roughly in order: a native CUDA MXFP4 MoE kernel for an all-accelerator NVIDIA
 path, further Metal expert-kernel tuning, a proper quality harness — average NLL
@@ -512,7 +521,7 @@ against the official API — so lossy speed/quality trade-offs can be measured
 rather than argued about, smarter expert prefetching, and eventually a native
 engine in the spirit of ds4, where most remaining overhead should disappear.
 
-## Thanks
+### Thanks
 
 Deltafin leans heavily on work that others published openly. In rough order of
 influence:
@@ -550,7 +559,7 @@ influence:
   **[ml_dtypes](https://github.com/jax-ml/ml_dtypes)** (our bit-exactness
   reference for e2m1) and **[tiktoken](https://github.com/openai/tiktoken)**.
 
-## License
+### License
 
 Deltafin's own code is [MIT](LICENSE). Two things in this repository are not ours:
 
