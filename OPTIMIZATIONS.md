@@ -344,6 +344,40 @@ Implementation:
 [`tools/kimi_run.py`](tools/kimi_run.py), and
 [`tools/test_routing_record_portability.py`](tools/test_routing_record_portability.py).
 
+## Zero-copy MLA query view at single-token decode
+
+**Status: Opt-in, exact within its qualified contract; structural evidence
+only.**
+
+The downloaded MLA forward reshapes each query projection, splits its adjacent
+128- and 64-wide columns, then concatenates those unchanged columns back in the
+same order. For T=1, the contiguous projection already admits the canonical
+`[B,96,1,192]` view. `K3_MLA_QUERY_ALIAS=1` reuses that storage instead of
+allocating the query concatenation.
+
+Across K3's 24 MLA layers, this removes 24 concatenation outputs and 1,769,472
+bytes (1.6875 MiB) of temporary payload from an ordinary one-token pass. This
+is allocation accounting, not measured DRAM traffic or a tokens-per-second
+result.
+
+The wrapper is installed only when the downloaded initializer, forward, and
+eager-attention provider match reviewed source fingerprints. At runtime it
+also requires inference mode, gradients off, T=1, and the exact registered
+read-only provider. A contiguous projection with the canonical stride takes
+the alias; an unexpected projection layout uses the established split-and-
+concatenate construction without running the projection twice. Training,
+T>1, changed source, or another provider calls the original forward.
+
+Tests cover bit-exact full forwards, cache-bearing decode sequences, T=1/2/8
+transitions, noncontiguous fallback, provider mutation, reload and opt-out
+behavior, compilation wrapping, and CPU-SDPA composition. A physical MPS check
+runs when that backend is available. The default remains off pending quiet
+full-token timing and wider physical-device measurements.
+
+Implementation:
+[`tools/attn_fast.py`](tools/attn_fast.py) and
+[`tools/test_mla_query_alias.py`](tools/test_mla_query_alias.py).
+
 ## CPU value padding to unlock fused SDPA
 
 **Status: Opt-in, default off, fingerprinted per live CPU/runtime shape.**
@@ -480,8 +514,22 @@ Linux builds keep CUDA optional. Default `--cuda=auto` probes NVCC only on
 Linux and installs the required CPU libraries even when CUDA compilation,
 validation or installation fails. `--cuda=on` makes all requested artifacts a
 single fail-closed transaction; `--cuda=off` performs no CUDA compiler probe.
-The binary includes a conservative `sm_75` image and a `compute_75` PTX
-fallback rather than guessing a list of future architectures.
+The build asks NVCC which real and virtual architectures it supports, parses
+all installed GPU capabilities defensively, and adds a native SASS image for
+each compatible capability. A conservative `compute_75` PTX image remains in
+the binary for forward portability whenever NVCC supports it; a future toolkit
+that drops it uses its lowest supported virtual target. Native detection never
+replaces that PTX fallback. If an automatically selected native target fails
+compilation or validation, the builder retries the portable target. A strict
+`K3_CUDA_ARCH` override supports cross-builds without allowing malformed
+values to leak into compiler flags.
+
+CUDA header compatibility follows the same narrow approach. The MXFP4 NaN
+sentinel uses a project-owned device helper rather than a toolkit macro, and
+device availability uses the stable attribute API instead of fields removed
+from CUDA 13. Once the runtime device is resolved, spine-dequant startup warms
+Metal only for MPS; CUDA remains lazy, and the CPU path touches neither
+accelerator backend.
 
 No CUDA speed number is claimed here yet. The expected wins—GPU expert compute,
 fewer CPU/GPU boundaries, one-copy uploads and avoided disk reads on cache
@@ -744,6 +792,9 @@ headline:
 - Cache presence is indexed once and updated at the atomic publication
   boundary rather than rescanning or repeatedly `stat`-ing the 82,432-file
   expert pool.
+- A successful two-position speculative verification transfers both argmax
+  IDs to the host together. This avoids a second accelerator synchronization
+  before emitting the already-verified next token.
 
 These changes remove host overhead and allocation noise; they do not carry
 separate tokens-per-second claims.

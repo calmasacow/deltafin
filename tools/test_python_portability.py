@@ -179,6 +179,9 @@ def _native_module_manifest_checks():
     assert "DT != torch.float32" in source
     assert "layer_index=li" in source
     assert "model_key=_CUDA_MODEL_KEY" in source
+    assert "spine_fast.effective_dequant_backend(DEV)" in source
+    assert 'DEV.type == "mps" and _SPINE_DEQ == "metal"' in source
+    assert "spine_fast.describe(DEV)" in source
     # Definition + two CUDA-MoE profile gates + two whole-pass profile gates.
     # Normal decode must not add an unconditional accelerator synchronization.
     assert source.count("_device_synchronize()") == 5
@@ -193,6 +196,7 @@ def _cuda_dequant_checks():
         if isinstance(node, ast.FunctionDef)
         and node.name in {
             "_cuda_dequant_requested_for_config",
+            "_effective_deq_for_config",
             "cuda_dequant_into",
             "cuda_dequant_error",
         }
@@ -230,6 +234,13 @@ def _cuda_dequant_checks():
     assert requested(False, "cuda", True, "auto", False) is True
     assert requested(True, "torch", True, "1", True) is False
     assert requested(True, "cuda", True, "off", True) is False
+    effective = namespace["_effective_deq_for_config"]
+    assert effective("metal", False, True, True, "cuda") == "cuda"
+    assert effective("metal", False, True, False, "cuda") == "torch"
+    assert effective("metal", False, False, True, "cuda") == "torch"
+    assert effective("metal", False, True, True, "mps") == "metal"
+    assert effective("metal", False, True, True, "cpu") == "torch"
+    assert effective("mulout", True, False, True, "cpu") == "mulout"
     dequant = namespace["cuda_dequant_into"]
 
     cpu = SimpleNamespace(device=SimpleNamespace(type="cpu", index=None))

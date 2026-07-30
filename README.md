@@ -66,7 +66,11 @@ installing the remaining Python packages. Deltafin does not vendor PyTorch or a
 CUDA runtime. On Linux, the native build also detects NVCC when it is available.
 Its CUDA artifact is optional in the default `--cuda=auto` mode: a missing or
 incompatible toolkit cannot block the CPU libraries. Use `--cuda=on` to require
-and diagnose that artifact, or `--cuda=off` to skip the probe explicitly.
+and diagnose that artifact, or `--cuda=off` to skip the probe explicitly. When
+an NVIDIA driver exposes GPU compute capabilities that the installed NVCC
+supports, the build adds native images for those GPUs while retaining portable
+PTX. `K3_CUDA_ARCH=sm_89` (or a comma-separated list) is the strict manual
+override for cross-builds.
 
 ### Upgrade without downloading the model again
 
@@ -244,6 +248,7 @@ startup. These variables exist for overriding that:
 | `K3_MOE` | auto | `metal` on MPS; a native `cuda` candidate on CUDA; otherwise `cpu`. Optional GPU backends must pass their own ABI, shape and correctness checks or fall back to CPU |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_CUDA_MOE_LIB` | `tools/libcudamoe.so` | override the optional native CUDA library path |
+| `K3_CUDA_ARCH` | auto | add compiler-supported native CUDA images detected from installed GPUs while retaining a portable PTX fallback; accepts strict values such as `sm_89` or `sm_89,sm_120` for cross-builds |
 | `K3_CUDA_EXPERT_CACHE` | `auto` | maximum resident GPU experts; `auto` budgets from free VRAM at the first real route, after model allocations, while `0` keeps CUDA compute but disables residency |
 | `K3_CUDA_EXPERT_CACHE_RESERVE` | `auto` | VRAM kept outside the expert cache (`auto` is at least 2 GiB and 20% of free VRAM); accepts byte units or a percentage |
 | `K3_CUDA_INT8_DEQUANT` | `auto` | qualified one-pass CUDA dequant for int8 resident-spine tensors; `off` retains the selected PyTorch expression |
@@ -251,6 +256,7 @@ startup. These variables exist for overriding that:
 | `K3_INT8_LM_HEAD` | `auto` | packed row-int8 output head on a qualified native backend; automatic on MPS, forceable elsewhere, with the first real head call guarded by a dense fallback |
 | `K3_INT8_KDA_QKV` | `0` | experimental packed row-int8 bundle for KDA Q/K/V/G/F-A/B; one real MPS streamed-weight sequence has passed exactly, while every backend remains capability-gated with a dense fallback |
 | `K3_KDA_RECUR` | `device` | keep the KDA recurrence on the selected CPU, CUDA or MPS device; `cpu` preserves the historical MPS-to-CPU experiment and legacy `mps` is accepted as an alias for `device` |
+| `K3_MLA_QUERY_ALIAS` | `0` | opt-in T=1 eager-MLA zero-copy query view; source, provider, inference and layout gates retain the established path on any mismatch; removes a redundant allocation, with no end-to-end speed claim yet ([details](OPTIMIZATIONS.md#zero-copy-mla-query-view-at-single-token-decode)) |
 | `K3_SHORTCONV` | `auto` | use the portable decode-time four-tap multiply/sum kernel on MPS, CUDA and CPU; `conv1d` remains forceable for backend retesting |
 | `K3_SPEC` | `1` | n-gram speculation (lossless) |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |

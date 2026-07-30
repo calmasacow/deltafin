@@ -655,6 +655,16 @@ class TestCudaSourceInvariants(unittest.TestCase):
         self.assertIn("const int64_t index", self.source)
         self.assertIn("const int64_t row = index / cols", self.source)
 
+    def test_cuda_compatibility_uses_stable_project_owned_primitives(self):
+        self.assertIn("mxfp4_quiet_nan()", self.source)
+        self.assertIn("__int_as_float(0x7fffffff)", self.source)
+        self.assertNotIn("CUDART_NAN_F", self.source)
+        self.assertIn("cudaDevAttrComputeMode", self.source)
+        self.assertIn("cudaDevAttrComputeCapabilityMajor", self.source)
+        self.assertIn("cudaDevAttrComputeCapabilityMinor", self.source)
+        self.assertNotIn(".computeMode", self.source)
+        self.assertNotIn("CUDART_VERSION", self.source)
+
     def test_expert_layout_constants_match_python(self):
         normalized = self.source.replace("'", "")
         self.assertIn(

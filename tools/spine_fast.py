@@ -112,6 +112,38 @@ _cuda_deq_requested = _cuda_dequant_requested_for_config(
 )
 
 
+def _effective_deq_for_config(
+    deq,
+    deq_explicit,
+    cuda_requested,
+    pack,
+    device_type,
+):
+    """Describe the backend that can actually run on the selected device."""
+    if device_type == "cuda":
+        if cuda_requested and pack:
+            return "cuda"
+        return deq if deq in {"torch", "mulout"} else "torch"
+    if device_type == "mps":
+        return deq if deq in {"metal", "torch", "mulout"} else "torch"
+    if device_type == "cpu":
+        return deq if deq in {"torch", "mulout"} else "torch"
+    if deq_explicit:
+        return deq
+    return "torch"
+
+
+def effective_dequant_backend(device):
+    device_type = getattr(device, "type", device)
+    return _effective_deq_for_config(
+        DEQ,
+        _DEQ_EXPLICIT,
+        _cuda_deq_requested,
+        PACK,
+        str(device_type),
+    )
+
+
 def metal_available():
     """Compile the dequant shader once; False (with a reason in metal_error())
     if this build/machine cannot."""
@@ -1915,10 +1947,13 @@ def apply_pack(module, prefix, pack, dev, dt, inv, dtmap, set_param, load_reside
     pack["q"] = pack["sc"] = pack["other"] = None
 
 
-def describe():
-    bits = [f"pack={int(PACK)}", f"deq={DEQ}", f"read_threads={READ_THREADS}"]
-    if DEQ == "metal":
+def describe(device=None):
+    deq = DEQ if device is None else effective_dequant_backend(device)
+    bits = [f"pack={int(PACK)}", f"deq={deq}", f"read_threads={READ_THREADS}"]
+    if deq == "metal":
         bits.append("metal_ok=" + ("1" if metal_available() else f"0({metal_error()})"))
+    elif deq == "cuda":
+        bits.append("cuda_ok=lazy")
     if spine_io.ENABLED:
         bits.append("| io: " + spine_io.describe())
     return " ".join(bits)

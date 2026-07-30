@@ -58,7 +58,16 @@ K3_MLA_CPU_SDPA = 0 (default) | 1
     or CPU product name. The cache remains 128-wide. Any missing capability,
     unsupported shape, allocation failure, or operator failure uses eager
     attention and is reported by cpu_sdpa_status().
+
+K3_MLA_QUERY_ALIAS = 0 (default) | 1
+    During inference-only T=1 eager MLA, reuse the raw query projection as a
+    canonical [B,H,1,D] view instead of splitting and concatenating its
+    unchanged adjacent columns. The downloaded model forward is fingerprinted;
+    unreviewed source, training, gradients, noncontiguous output, or another
+    attention provider retains the original allocation.
 """
+import hashlib
+import inspect
 import os
 import threading
 import time
@@ -77,6 +86,14 @@ if COMPILE == "1":
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
+_MLA_QUERY_ALIAS_MODE = os.environ.get(
+    "K3_MLA_QUERY_ALIAS", "0"
+).strip().lower()
+if _MLA_QUERY_ALIAS_MODE not in _TRUE | _FALSE:
+    raise ValueError(
+        "K3_MLA_QUERY_ALIAS must be 0/off/false or 1/on/true"
+    )
+MLA_QUERY_ALIAS_REQUESTED = _MLA_QUERY_ALIAS_MODE in _TRUE
 _CPU_SDPA_MODE = os.environ.get("K3_MLA_CPU_SDPA", "0").strip().lower()
 if _CPU_SDPA_MODE not in _TRUE | _FALSE:
     raise ValueError("K3_MLA_CPU_SDPA must be 0/off/false or 1/on/true")
@@ -91,6 +108,24 @@ _CPU_SDPA_CONTEXT_BUCKETS = (
 _CPU_SDPA_NATIVE_OPERATOR = (
     "aten::_scaled_dot_product_flash_attention_for_cpu"
 )
+
+# Moonshot's model source is downloaded during setup and deliberately not
+# vendored.  This fingerprint binds the narrow forward replacement below to
+# the exact audited implementation it mirrors.  A changed upstream method is
+# left untouched until its semantics are reviewed again.
+_MLA_FORWARD_SHA256 = (
+    "769d433c7a003717eabf67b5cf3d9b5f93e48ddce93958f377daa49ad75d4649"
+)
+_MLA_INIT_SHA256 = (
+    "3adbd7b174d36f0505027e8f98f469956919322a571e3168fc9a9d9218d59f27"
+)
+_EAGER_ATTENTION_SHA256 = (
+    "a44f9c5a86e27cac20fd7d168d422f93e90515b79ff6fdc521ed93f1724fdadc"
+)
+_MLA_QUERY_ALIAS_INSTALLED = False
+_MLA_QUERY_ALIAS_REASON = "not attempted"
+_MLA_QUERY_ALIAS_SAFE_PROVIDERS = set()
+_MLA_QUERY_ALIAS_TOKEN = object()
 
 # The line is useful even with no overrides: it proves that the live lower-level
 # shims and this reporting module agree on the optimized defaults.
@@ -134,9 +169,14 @@ def describe(device=None):
         cpu_sdpa = "guarded"
     elif CPU_SDPA_REQUESTED and _CPU_SDPA_INSTALL_REASON:
         cpu_sdpa = f"disabled({_CPU_SDPA_INSTALL_REASON})"
+    mla_query = (
+        "t1-alias"
+        if _MLA_QUERY_ALIAS_INSTALLED
+        else f"off({_MLA_QUERY_ALIAS_REASON})"
+    )
     s = (
         f"recur={recur} shortconv={shortconv} compile={COMPILE} "
-        f"mla_cpu_sdpa={cpu_sdpa}"
+        f"mla_cpu_sdpa={cpu_sdpa} mla_query={mla_query}"
     )
     if COMPILE != "0":
         s += f"({COMPILE_MODE})"
@@ -341,6 +381,22 @@ def _disable_cpu_sdpa_key(key, reason, *, canary):
             _CPU_SDPA_STATS["runtime_failures"] += 1
 
 
+def _mark_audited_eager_attention(function):
+    """Mark only the reviewed read-only eager provider as alias-safe."""
+    if function in _MLA_QUERY_ALIAS_SAFE_PROVIDERS:
+        return True
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError):
+        return False
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if digest != _EAGER_ATTENTION_SHA256:
+        return False
+    _MLA_QUERY_ALIAS_SAFE_PROVIDERS.add(function)
+    function._k3_mla_query_alias_safe = True
+    return True
+
+
 def _make_cpu_sdpa_forward(original):
     def cpu_sdpa_forward(
         module,
@@ -460,6 +516,11 @@ def _make_cpu_sdpa_forward(original):
             )
         return output, None
 
+    provider_is_safe = _mark_audited_eager_attention(original)
+    cpu_sdpa_forward._k3_mla_query_alias_safe = provider_is_safe
+    cpu_sdpa_forward._k3_original = original
+    if provider_is_safe:
+        _MLA_QUERY_ALIAS_SAFE_PROVIDERS.add(cpu_sdpa_forward)
     return cpu_sdpa_forward
 
 
@@ -614,10 +675,299 @@ def _get_compiled(mod, fn):
     return got
 
 
+def _install_mla_query_alias(ml):
+    """Remove one redundant MLA query cat for qualified T=1 inference.
+
+    The downloaded reference splits the adjacent 128/64 columns of the query
+    projection and immediately concatenates them in the same order.  At T=1,
+    the raw [B,1,H*D] projection has a canonical zero-copy [B,H,1,D] view.
+    Training and unknown attention providers retain the independent cat
+    allocation because they have not qualified its alias/version semantics.
+    """
+    global _MLA_QUERY_ALIAS_INSTALLED, _MLA_QUERY_ALIAS_REASON
+
+    attention_class = getattr(ml, "KimiMLAAttention", None)
+    if attention_class is None:
+        # Some focused installer tests intentionally provide only the eager
+        # attention function.  That namespace has no MLA class to patch.
+        return False
+
+    def canonical_original(function):
+        """Return the reviewed upstream forward beneath verified K3 wrappers."""
+        seen = set()
+        while (
+            getattr(function, "_k3_mla_query_alias", False)
+            or getattr(function, "_k3_mla_compile_wrapper", False)
+        ):
+            if (
+                id(function) in seen
+                or getattr(function, "_k3_model_class", None)
+                is not attention_class
+            ):
+                return None
+            seen.add(id(function))
+            function = getattr(function, "_k3_original", None)
+            if function is None:
+                return None
+        try:
+            original_source = inspect.getsource(function)
+        except (OSError, TypeError):
+            return None
+        original_digest = hashlib.sha256(
+            original_source.encode("utf-8")
+        ).hexdigest()
+        return (
+            function
+            if original_digest == _MLA_FORWARD_SHA256
+            else None
+        )
+
+    current = attention_class.forward
+    current_is_wrapper = bool(
+        getattr(current, "_k3_mla_query_alias", False)
+        or getattr(current, "_k3_mla_compile_wrapper", False)
+    )
+    if not MLA_QUERY_ALIAS_REQUESTED:
+        # This also handles an in-process attn_fast reload: do not report the
+        # feature as disabled while a wrapper owned by the previous module
+        # instance is still active.
+        if current_is_wrapper:
+            original = canonical_original(current)
+            if original is not None:
+                attention_class.forward = original
+        _MLA_QUERY_ALIAS_INSTALLED = False
+        _MLA_QUERY_ALIAS_REASON = "disabled by K3_MLA_QUERY_ALIAS"
+        return False
+
+    try:
+        init_source = inspect.getsource(attention_class.__init__)
+    except (OSError, TypeError) as exc:
+        _MLA_QUERY_ALIAS_INSTALLED = False
+        _MLA_QUERY_ALIAS_REASON = (
+            f"initializer source unavailable: {type(exc).__name__}"
+        )
+        return False
+    init_digest = hashlib.sha256(
+        init_source.encode("utf-8")
+    ).hexdigest()
+    if init_digest != _MLA_INIT_SHA256:
+        _MLA_QUERY_ALIAS_INSTALLED = False
+        _MLA_QUERY_ALIAS_REASON = (
+            f"unreviewed model initializer {init_digest[:12]}"
+        )
+        return False
+
+    if current_is_wrapper:
+        original = canonical_original(current)
+        if original is None:
+            _MLA_QUERY_ALIAS_INSTALLED = False
+            _MLA_QUERY_ALIAS_REASON = "unverified prior alias marker"
+            return False
+        if (
+            getattr(current, "_k3_mla_query_alias", False)
+            and getattr(current, "_k3_mla_query_alias_token", None)
+            is _MLA_QUERY_ALIAS_TOKEN
+        ):
+            _MLA_QUERY_ALIAS_INSTALLED = True
+            _MLA_QUERY_ALIAS_REASON = None
+            return True
+        # A verified wrapper from an older module instance closes over that
+        # instance's provider registry and compile cache. Rebuild from the
+        # canonical downloaded method rather than nesting stale wrappers.
+        attention_class.forward = original
+        current = original
+
+    try:
+        source = inspect.getsource(current)
+    except (OSError, TypeError) as exc:
+        _MLA_QUERY_ALIAS_INSTALLED = False
+        _MLA_QUERY_ALIAS_REASON = (
+            f"source unavailable: {type(exc).__name__}"
+        )
+        return False
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if digest != _MLA_FORWARD_SHA256:
+        _MLA_QUERY_ALIAS_INSTALLED = False
+        _MLA_QUERY_ALIAS_REASON = (
+            f"unreviewed model forward {digest[:12]}"
+        )
+        return False
+
+    original = current
+
+    def mla_forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        batch_size, seq_length = hidden_states.shape[:-1]
+        attention_interface = ml.eager_attention_forward
+        provider_is_safe = bool(
+            self.config._attn_implementation == "eager"
+            and attention_interface in _MLA_QUERY_ALIAS_SAFE_PROVIDERS
+        )
+        if (
+            seq_length != 1
+            or self.training
+            or torch.is_grad_enabled()
+            or not provider_is_safe
+        ):
+            return original(
+                self,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                **kwargs,
+            )
+
+        key_shape = (
+            batch_size,
+            seq_length,
+            -1,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+
+        if self.q_lora_rank is not None:
+            raw_query = self.q_b_proj(
+                self.q_a_layernorm(self.q_a_proj(hidden_states))
+            )
+        else:
+            raw_query = self.q_proj(hidden_states)
+
+        canonical_stride = (
+            self.num_heads * self.q_head_dim,
+            self.q_head_dim,
+            self.q_head_dim,
+            1,
+        )
+        if raw_query.is_contiguous():
+            query_states = raw_query.view(
+                batch_size,
+                self.num_heads,
+                1,
+                self.q_head_dim,
+            )
+        else:
+            query_states = None
+        if (
+            query_states is None
+            or query_states.stride() != canonical_stride
+        ):
+            # Preserve the downloaded query construction from the already
+            # computed projection. Calling original() here would execute a
+            # hooked, stateful, or random custom projection twice.
+            query_shape = (
+                batch_size,
+                seq_length,
+                -1,
+                self.q_head_dim,
+            )
+            old_query = raw_query.view(query_shape).transpose(1, 2)
+            q_pass, q_rot = torch.split(
+                old_query,
+                [self.qk_nope_head_dim, self.qk_rope_head_dim],
+                dim=-1,
+            )
+            query_states = torch.cat((q_pass, q_rot), dim=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        k_pass, k_rot = torch.split(
+            compressed_kv,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        k_pass = self.kv_b_proj(
+            self.kv_a_layernorm(k_pass)
+        ).view(key_shape).transpose(1, 2)
+        k_pass, value_states = torch.split(
+            k_pass,
+            [self.qk_nope_head_dim, self.v_head_dim],
+            dim=-1,
+        )
+
+        k_rot = k_rot.view(
+            batch_size,
+            1,
+            seq_length,
+            self.qk_rope_head_dim,
+        )
+        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+            )
+
+        if (
+            self.config._attn_implementation == "flash_attention_2"
+            and self.q_head_dim != self.v_head_dim
+        ):
+            value_states = F.pad(
+                value_states,
+                [0, self.q_head_dim - self.v_head_dim],
+            )
+
+        attn_output, _ = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=(
+                0.0 if not self.training else self.attention_dropout
+            ),
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        if (
+            self.config._attn_implementation == "flash_attention_2"
+            and self.q_head_dim != self.v_head_dim
+        ):
+            attn_output = attn_output[
+                :, :, :, : self.v_head_dim
+            ]
+
+        attn_output = attn_output.reshape(
+            batch_size,
+            seq_length,
+            -1,
+        ).contiguous()
+        if self.use_output_gate:
+            g = self.g_proj(hidden_states).sigmoid()
+            attn_output = attn_output * g
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+    mla_forward._k3_mla_query_alias = True
+    mla_forward._k3_mla_query_alias_token = _MLA_QUERY_ALIAS_TOKEN
+    mla_forward._k3_original = original
+    mla_forward._k3_model_class = attention_class
+    attention_class.forward = mla_forward
+    _ORIG.setdefault(
+        ("mla_query_alias", attention_class),
+        original,
+    )
+    _MLA_QUERY_ALIAS_INSTALLED = True
+    _MLA_QUERY_ALIAS_REASON = None
+    return True
+
+
 def install(ml):
     """Apply the enabled patches to Moonshot's modeling module."""
     global _CPU_SDPA_INSTALLED, _CPU_SDPA_INSTALL_REASON
     install_cache_portability(ml)
+    eager_attention = getattr(ml, "eager_attention_forward", None)
+    if MLA_QUERY_ALIAS_REQUESTED and eager_attention is not None:
+        _mark_audited_eager_attention(eager_attention)
     if CPU_SDPA_REQUESTED:
         if COMPILE != "0":
             _CPU_SDPA_INSTALL_REASON = (
@@ -632,6 +982,7 @@ def install(ml):
             ml.eager_attention_forward = _make_cpu_sdpa_forward(original)
             _CPU_SDPA_INSTALLED = True
             _CPU_SDPA_INSTALL_REASON = None
+    _install_mla_query_alias(ml)
     if COMPILE == "0":
         return
     try:
@@ -642,7 +993,10 @@ def install(ml):
         pass
 
     if COMPILE == "layer":
-        orig_layer = _ORIG.setdefault("layer", ml.KimiDecoderLayer.forward)
+        orig_layer = _ORIG.setdefault(
+            ("layer", ml.KimiDecoderLayer),
+            ml.KimiDecoderLayer.forward,
+        )
 
         def layer_forward(self, *a, **kw):
             return _get_compiled(self, orig_layer)(*a, **kw)
@@ -650,8 +1004,16 @@ def install(ml):
         ml.KimiDecoderLayer.forward = layer_forward
         return
 
-    orig_kda = _ORIG.setdefault("kda", ml.KimiDeltaAttention.forward)
-    orig_mla = _ORIG.setdefault("mla", ml.KimiMLAAttention.forward)
+    orig_kda = _ORIG.setdefault(
+        ("kda", ml.KimiDeltaAttention),
+        ml.KimiDeltaAttention.forward,
+    )
+    orig_mla = ml.KimiMLAAttention.forward
+    while getattr(orig_mla, "_k3_mla_compile_wrapper", False):
+        if getattr(orig_mla, "_k3_model_class", None) is not ml.KimiMLAAttention:
+            break
+        orig_mla = getattr(orig_mla, "_k3_original", orig_mla)
+    _ORIG[("mla", ml.KimiMLAAttention)] = orig_mla
 
     def kda_forward(self, hidden_states, attention_mask=None, cache_params=None, **kw):
         # A 2D mask is the varlen/unpad path: data-dependent shapes, never worth
@@ -689,5 +1051,16 @@ def install(ml):
         past_key_values.value_cache[li] = slot.value_cache[0]
         return out
 
+    mla_forward._k3_mla_query_alias = bool(
+        getattr(orig_mla, "_k3_mla_query_alias", False)
+    )
+    mla_forward._k3_mla_query_alias_token = getattr(
+        orig_mla,
+        "_k3_mla_query_alias_token",
+        None,
+    )
+    mla_forward._k3_mla_compile_wrapper = True
+    mla_forward._k3_original = orig_mla
+    mla_forward._k3_model_class = ml.KimiMLAAttention
     ml.KimiDeltaAttention.forward = kda_forward
     ml.KimiMLAAttention.forward = mla_forward

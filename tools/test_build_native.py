@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -279,6 +280,30 @@ class CommandTests(unittest.TestCase):
         self.assertFalse(any("sm_120" in part for part in command))
         self.assertEqual(command[-2:], ["-o", "/tmp/libcudamoe.so"])
 
+    def test_cuda_command_adds_native_sass_without_losing_portable_ptx(self):
+        target = native.detect_target("linux", "x86_64")
+        artifact = next(
+            item
+            for item in native.artifacts_for(
+                target, cuda_mode="on", nvcc_available=True
+            )
+            if item.language == "cuda"
+        )
+        command = native.compile_command(
+            artifact,
+            target,
+            Path("/tmp/libcudamoe.so"),
+            cuda_compiler=[sys.executable, "--nvcc-wrapper"],
+            cuda_codegen=native.CudaCodegen("75", ("89", "120")),
+        )
+        self.assertIn("-gencode=arch=compute_75,code=sm_75", command)
+        self.assertIn("-gencode=arch=compute_89,code=sm_89", command)
+        self.assertIn("-gencode=arch=compute_120,code=sm_120", command)
+        self.assertIn("-gencode=arch=compute_75,code=compute_75", command)
+        self.assertNotIn(
+            "-gencode=arch=compute_120,code=compute_120", command
+        )
+
     def test_nvcc_environment_is_parsed_and_resolved_safely(self):
         requested = []
 
@@ -304,6 +329,149 @@ class CommandTests(unittest.TestCase):
 
         with self.assertRaisesRegex(native.BuildError, "could not locate NVCC"):
             native.cuda_compiler_argv({}, finder=broken_path)
+
+
+class CudaArchitectureTests(unittest.TestCase):
+    @staticmethod
+    def _result(stdout="", stderr="", returncode=0):
+        return subprocess.CompletedProcess(
+            (), returncode, stdout=stdout, stderr=stderr
+        )
+
+    def test_normalization_and_override_validation(self):
+        expected = {
+            "8.9": "89",
+            "sm_89": "89",
+            "compute_89": "89",
+            "12.0": "120",
+            "sm_120": "120",
+        }
+        for value, normalized in expected.items():
+            with self.subTest(value=value):
+                self.assertEqual(
+                    native.normalize_cuda_arch(value), normalized
+                )
+        self.assertEqual(
+            native.parse_cuda_arches("sm_120, 8.9;sm_89"),
+            ("89", "120"),
+        )
+        for value in ("", "sm_7", "sm_74", "8.9\n8.6", "sm_89,-O0"):
+            with self.subTest(value=value):
+                with self.assertRaises(native.BuildError):
+                    if value:
+                        native.normalize_cuda_arch(value)
+                    else:
+                        native.parse_cuda_arches(value)
+
+    def test_detector_handles_multiple_gpus_and_malformed_rows(self):
+        commands = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            return self._result("8.9\n8.6\nN/A\n12.0\n8.9\n")
+
+        arches = native.detect_cuda_arches(
+            nvidia_smi="/usr/bin/nvidia-smi",
+            runner=run,
+        )
+        self.assertEqual(arches, ("86", "89", "120"))
+        self.assertEqual(
+            commands,
+            [[
+                "/usr/bin/nvidia-smi",
+                "--query-gpu=compute_cap",
+                "--format=csv,noheader,nounits",
+            ]],
+        )
+
+    def test_detector_fails_closed_without_executing_a_shell(self):
+        self.assertEqual(native.detect_cuda_arches(nvidia_smi=None), ())
+
+        def timeout(_command, **_kwargs):
+            raise subprocess.TimeoutExpired("nvidia-smi", 10)
+
+        self.assertEqual(
+            native.detect_cuda_arches(
+                nvidia_smi="/usr/bin/nvidia-smi", runner=timeout
+            ),
+            (),
+        )
+        self.assertEqual(
+            native.detect_cuda_arches(
+                nvidia_smi="/usr/bin/nvidia-smi",
+                runner=lambda _command, **_kwargs: self._result(
+                    "8.9", returncode=9
+                ),
+            ),
+            (),
+        )
+
+    def test_nvcc_support_intersects_real_and_virtual_targets(self):
+        def run(command, **_kwargs):
+            if "--list-gpu-code" in command:
+                return self._result(
+                    "sm_75\nsm_89\nsm_90a\nsm_100f\nsm_120\n"
+                )
+            if "--list-gpu-arch" in command:
+                return self._result(
+                    "compute_75\ncompute_89\ncompute_90a\ncompute_100f\n"
+                )
+            self.fail(f"unexpected command: {command}")
+
+        self.assertEqual(
+            native.nvcc_supported_arches(["/opt/cuda/bin/nvcc"], runner=run),
+            {"75", "89"},
+        )
+
+    def test_auto_selection_filters_toolkit_mismatch_and_keeps_floor(self):
+        reports = []
+
+        def run(command, **_kwargs):
+            if "--list-gpu-code" in command:
+                return self._result("sm_75\nsm_89\n")
+            if "--list-gpu-arch" in command:
+                return self._result("compute_75\ncompute_89\n")
+            if "--query-gpu=compute_cap" in command:
+                return self._result("8.9\n12.0\n")
+            self.fail(f"unexpected command: {command}")
+
+        selected = native.resolve_cuda_codegen(
+            {},
+            ["/opt/cuda/bin/nvcc"],
+            runner=run,
+            nvidia_smi_finder=lambda _name: "/usr/bin/nvidia-smi",
+            reporter=reports.append,
+        )
+        self.assertEqual(selected, native.CudaCodegen("75", ("89",)))
+        self.assertIn("sm_120", reports[0])
+        self.assertIn("compute_75 PTX", reports[0])
+
+    def test_explicit_override_is_strict_and_compiler_checked(self):
+        def run(command, **_kwargs):
+            if "--list-gpu-code" in command:
+                return self._result("sm_75\nsm_89\n")
+            if "--list-gpu-arch" in command:
+                return self._result("compute_75\ncompute_89\n")
+            self.fail("an explicit override must not probe nvidia-smi")
+
+        selected = native.resolve_cuda_codegen(
+            {"K3_CUDA_ARCH": "sm_89"},
+            ["/opt/cuda/bin/nvcc"],
+            runner=run,
+            nvidia_smi_finder=lambda _name: self.fail(
+                "an explicit override must not locate nvidia-smi"
+            ),
+        )
+        self.assertEqual(
+            selected, native.CudaCodegen("75", ("89",), True)
+        )
+        with self.assertRaisesRegex(native.BuildError, "does not list"):
+            native.resolve_cuda_codegen(
+                {"K3_CUDA_ARCH": "sm_120"},
+                ["/opt/cuda/bin/nvcc"],
+                runner=run,
+                nvidia_smi_finder=lambda _name: None,
+            )
 
 
 class ParserTests(unittest.TestCase):
@@ -574,6 +742,7 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=self._write_output,
                 validator=lambda _path, _artifact: None,
                 nvcc_finder=forbidden_probe,
+                nvidia_smi_finder=forbidden_probe,
             )
             self.assertEqual(
                 [path.name for path in outputs],
@@ -593,6 +762,9 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=self._write_output,
                 validator=lambda _path, _artifact: None,
                 nvcc_finder=lambda name: probes.append(name),
+                nvidia_smi_finder=lambda _name: self.fail(
+                    "nvidia-smi must not be probed without NVCC"
+                ),
             )
             self.assertEqual(probes, ["nvcc"])
             self.assertEqual(len(outputs), 2)
@@ -621,6 +793,7 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=record,
                 validator=lambda _path, _artifact: None,
                 nvcc_finder=forbidden_probe,
+                nvidia_smi_finder=forbidden_probe,
             )
             self.assertEqual(len(outputs), 2)
             self.assertEqual(len(commands), 2)
@@ -652,6 +825,7 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=fail_cuda,
                 validator=lambda _path, _artifact: None,
                 nvcc_finder=lambda _name: sys.executable,
+                cuda_codegen=native.CudaCodegen(),
                 reporter=reports.append,
             )
             self.assertEqual(len(outputs), 2)
@@ -667,6 +841,71 @@ class AtomicBuildTests(unittest.TestCase):
             self.assertEqual(
                 (tools / "libcudamoe.so").read_bytes(), b"old-cuda"
             )
+
+    def test_auto_detected_native_failure_retries_portable_cuda(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            reports = []
+            cuda_commands = []
+
+            def reject_native_only(command, cwd):
+                if any(str(part).endswith(".cu") for part in command):
+                    cuda_commands.append(list(command))
+                    if any("sm_89" in str(part) for part in command):
+                        raise native.BuildError("synthetic native rejection")
+                self._write_output(command, cwd)
+
+            outputs = native.build_native(
+                target=native.detect_target("linux", "aarch64"),
+                tools_dir=tools,
+                cuda_mode="on",
+                environ={"CC": sys.executable},
+                runner=reject_native_only,
+                validator=lambda _path, _artifact: None,
+                nvcc_finder=lambda _name: sys.executable,
+                cuda_codegen=native.CudaCodegen("75", ("89",)),
+                reporter=reports.append,
+            )
+            self.assertEqual(len(outputs), 3)
+            self.assertEqual(len(cuda_commands), 2)
+            self.assertTrue(
+                any("sm_89" in str(part) for part in cuda_commands[0])
+            )
+            self.assertFalse(
+                any("sm_89" in str(part) for part in cuda_commands[1])
+            )
+            self.assertTrue(
+                any("retrying the portable" in report for report in reports)
+            )
+
+    def test_explicit_native_failure_does_not_silently_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            tools = self._tree(Path(td), cuda=True)
+            cuda_calls = 0
+
+            def reject_cuda(command, cwd):
+                nonlocal cuda_calls
+                if any(str(part).endswith(".cu") for part in command):
+                    cuda_calls += 1
+                    raise native.BuildError("synthetic explicit rejection")
+                self._write_output(command, cwd)
+
+            with self.assertRaisesRegex(
+                native.BuildError, "synthetic explicit rejection"
+            ):
+                native.build_native(
+                    target=native.detect_target("linux", "aarch64"),
+                    tools_dir=tools,
+                    cuda_mode="on",
+                    environ={"CC": sys.executable},
+                    runner=reject_cuda,
+                    validator=lambda _path, _artifact: None,
+                    nvcc_finder=lambda _name: sys.executable,
+                    cuda_codegen=native.CudaCodegen(
+                        "75", ("89",), explicit=True
+                    ),
+                )
+            self.assertEqual(cuda_calls, 1)
 
     def test_cuda_auto_validation_failure_does_not_block_cpu_install(self):
         with tempfile.TemporaryDirectory() as td:
@@ -685,6 +924,7 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=self._write_output,
                 validator=reject_cuda,
                 nvcc_finder=lambda _name: sys.executable,
+                cuda_codegen=native.CudaCodegen(),
                 reporter=reports.append,
             )
             self.assertEqual(len(outputs), 2)
@@ -717,6 +957,7 @@ class AtomicBuildTests(unittest.TestCase):
                     runner=self._write_output,
                     validator=reject_cuda,
                     nvcc_finder=lambda _name: sys.executable,
+                    cuda_codegen=native.CudaCodegen(),
                 )
             self.assertEqual(
                 (tools / "libmxfp4gemv.so").read_bytes(), b"old-gemv"
@@ -755,6 +996,7 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=self._write_output,
                 validator=accept,
                 nvcc_finder=lambda _name: sys.executable,
+                cuda_codegen=native.CudaCodegen(),
             )
             self.assertEqual(
                 validated, ["MXFP4 GEMV", "MXFP4 batch", "CUDA MoE"]
@@ -783,6 +1025,7 @@ class AtomicBuildTests(unittest.TestCase):
                 runner=self._write_output,
                 validator=lambda _path, _artifact: None,
                 nvcc_finder=lambda _name: sys.executable,
+                cuda_codegen=native.CudaCodegen(),
                 reporter=reports.append,
                 replace=reject_cuda_replace,
             )

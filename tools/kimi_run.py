@@ -576,9 +576,11 @@ _TEMPLATE_ARENA_INFO = {}
 import spine_fast  # noqa: E402
 import spine_io  # noqa: E402
 
-if spine_fast.FAST or spine_fast.DEQ == "metal":
+_SPINE_DEQ = spine_fast.effective_dequant_backend(DEV)
+if DEV.type == "mps" and _SPINE_DEQ == "metal":
     spine_fast.metal_available()          # compile once, on the main thread
-    print(f"[spine] fast path: {spine_fast.describe()}", flush=True)
+if spine_fast.FAST or _SPINE_DEQ != "torch":
+    print(f"[spine] fast path: {spine_fast.describe(DEV)}", flush=True)
 
 # N1: keep every eligible same-input KDA first-stage projection as row-int8 and
 # call a capability-proven native weight-only matmul instead of dequantizing
@@ -1925,9 +1927,13 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
                 snap = snapshot_states(cache)
                 logits = forward_pass(layers, cache, embed([generated[-1], draft]),
                                       step=s, verbose=False)
-                n1 = int(logits[0, 0].argmax())
+                # Read both verifier decisions in one device-to-host transfer.
+                # The first position decides accept/rollback; on acceptance the
+                # second ID is already present instead of forcing another sync.
+                verified = logits[0].argmax(-1).tolist()
+                n1 = verified[0]
                 if n1 == draft:
-                    new = [n1, int(logits[0, 1].argmax())]
+                    new = verified[:2]
                     tag = " spec+2"
                 else:
                     restore_states(cache, snap)

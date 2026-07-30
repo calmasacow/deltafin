@@ -20,6 +20,7 @@ import ctypes
 import dataclasses
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -37,6 +38,15 @@ CUDA_ABI_VERSION = 1
 CUDA_POINTER_LAYOUT_VERSION = 1
 CUDA_SHAPES = (3584, 3072, 17_547_264, CUDA_POINTER_LAYOUT_VERSION)
 CUDA_MODES = frozenset(("auto", "on", "off"))
+CUDA_PORTABLE_ARCH = "75"
+_CUDA_ARCH_TOKEN = re.compile(
+    r"(?:(?:sm|compute)_)?(?:(\d{1,2})\.(\d)|(\d{2,3}))\Z",
+    re.IGNORECASE,
+)
+_CUDA_LISTED_ARCH = re.compile(
+    r"\b(?:sm|compute)_(\d{2,3})\b",
+    re.IGNORECASE,
+)
 X86_64_BASE_FEATURES = {
     "avx": frozenset(("avx",)),
     "fma": frozenset(("fma",)),
@@ -56,6 +66,15 @@ class Target:
     suffix: str
     c_arch_flags: tuple[str, ...]
     supports_metal: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class CudaCodegen:
+    """Portable PTX floor plus optional device-specific binary images."""
+
+    portable: str = CUDA_PORTABLE_ARCH
+    native: tuple[str, ...] = ()
+    explicit: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,6 +359,188 @@ def cuda_compiler_argv(
     return [resolved, *argv[1:]]
 
 
+def normalize_cuda_arch(value: str) -> str:
+    """Return NVCC's numeric architecture suffix after strict validation."""
+    candidate = value.strip().lower()
+    match = _CUDA_ARCH_TOKEN.fullmatch(candidate)
+    if match is None:
+        raise BuildError(
+            "CUDA architectures must look like 8.9, sm_89, compute_89, "
+            f"or sm_120 (got {value!r})"
+        )
+    major, minor, compact = match.groups()
+    number = int(compact if compact is not None else f"{int(major)}{minor}")
+    if number < int(CUDA_PORTABLE_ARCH):
+        raise BuildError(
+            f"CUDA architecture sm_{number} is below Deltafin's "
+            f"sm_{CUDA_PORTABLE_ARCH} support floor"
+        )
+    return str(number)
+
+
+def parse_cuda_arches(value: str) -> tuple[str, ...]:
+    """Parse a comma/space-separated K3_CUDA_ARCH override."""
+    stripped = value.strip()
+    if not stripped:
+        raise BuildError("K3_CUDA_ARCH is empty; use auto or e.g. sm_89")
+    tokens = [token for token in re.split(r"[\s,;]+", stripped) if token]
+    arches = {normalize_cuda_arch(token) for token in tokens}
+    return tuple(sorted(arches, key=int))
+
+
+def _probe_output(
+    command: Sequence[str],
+    *,
+    runner: Callable[..., object] = subprocess.run,
+    timeout: float = 10.0,
+) -> str | None:
+    """Capture a short, non-shell tool query; return None on any probe failure."""
+    try:
+        result = runner(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if int(getattr(result, "returncode", 1)) != 0:
+        return None
+    return str(getattr(result, "stdout", "") or "")
+
+
+def detect_cuda_arches(
+    *,
+    nvidia_smi: str | None,
+    runner: Callable[..., object] = subprocess.run,
+) -> tuple[str, ...]:
+    """Query every installed GPU capability, ignoring malformed rows safely."""
+    if not nvidia_smi:
+        return ()
+    output = _probe_output(
+        [
+            nvidia_smi,
+            "--query-gpu=compute_cap",
+            "--format=csv,noheader,nounits",
+        ],
+        runner=runner,
+    )
+    if output is None:
+        return ()
+    detected: set[str] = set()
+    for line in output.splitlines()[:256]:
+        candidate = line.strip()
+        if not candidate or len(candidate) > 32:
+            continue
+        try:
+            detected.add(normalize_cuda_arch(candidate))
+        except BuildError:
+            continue
+    return tuple(sorted(detected, key=int))
+
+
+def nvcc_supported_arches(
+    cuda_compiler: Sequence[str],
+    *,
+    runner: Callable[..., object] = subprocess.run,
+) -> frozenset[str] | None:
+    """Return architectures accepted as both real code and virtual PTX."""
+    real_output = _probe_output(
+        [*cuda_compiler, "--list-gpu-code"], runner=runner
+    )
+    virtual_output = _probe_output(
+        [*cuda_compiler, "--list-gpu-arch"], runner=runner
+    )
+    if real_output is None or virtual_output is None:
+        return None
+
+    def listed(output: str) -> set[str]:
+        return {
+            str(int(match.group(1)))
+            for match in _CUDA_LISTED_ARCH.finditer(output)
+            if int(match.group(1)) >= int(CUDA_PORTABLE_ARCH)
+        }
+
+    supported = listed(real_output).intersection(listed(virtual_output))
+    return frozenset(supported)
+
+
+def resolve_cuda_codegen(
+    environ: Mapping[str, str],
+    cuda_compiler: Sequence[str],
+    *,
+    runner: Callable[..., object] = subprocess.run,
+    nvidia_smi_finder: Callable[[str], str | None] = shutil.which,
+    reporter: Callable[[str], None] | None = None,
+) -> CudaCodegen:
+    """Select native images without sacrificing a forward-compatible PTX floor."""
+    supported = nvcc_supported_arches(cuda_compiler, runner=runner)
+    if supported is not None and not supported:
+        raise BuildError(
+            "NVCC reports no architecture at or above Deltafin's sm_75 floor"
+        )
+    portable = (
+        CUDA_PORTABLE_ARCH
+        if supported is None or CUDA_PORTABLE_ARCH in supported
+        else min(supported, key=int)
+    )
+
+    override = environ.get("K3_CUDA_ARCH")
+    explicit = override is not None and override.strip().lower() != "auto"
+    if explicit:
+        requested = parse_cuda_arches(override)
+        if supported is not None:
+            rejected = [arch for arch in requested if arch not in supported]
+            if rejected:
+                rendered = ", ".join(f"sm_{arch}" for arch in rejected)
+                raise BuildError(
+                    f"K3_CUDA_ARCH requests {rendered}, but this NVCC does "
+                    "not list that architecture"
+                )
+        native = tuple(arch for arch in requested if arch != portable)
+        return CudaCodegen(portable, native, True)
+
+    try:
+        nvidia_smi = nvidia_smi_finder("nvidia-smi")
+    except OSError:
+        nvidia_smi = None
+    detected = detect_cuda_arches(
+        nvidia_smi=nvidia_smi,
+        runner=runner,
+    )
+    rejected = (
+        tuple(arch for arch in detected if arch not in supported)
+        if supported is not None else ()
+    )
+    native = tuple(
+        arch for arch in detected
+        if arch != portable and (supported is None or arch in supported)
+    )
+    if rejected and reporter is not None:
+        reporter(
+            "NVCC cannot target detected "
+            + ", ".join(f"sm_{arch}" for arch in rejected)
+            + f"; retaining portable compute_{portable} PTX"
+        )
+    return CudaCodegen(portable, native, False)
+
+
+def cuda_gencode_flags(codegen: CudaCodegen) -> list[str]:
+    """Render deterministic SASS targets plus one portable PTX image."""
+    arches = sorted({codegen.portable, *codegen.native}, key=int)
+    flags = [
+        f"-gencode=arch=compute_{arch},code=sm_{arch}"
+        for arch in arches
+    ]
+    flags.append(
+        f"-gencode=arch=compute_{codegen.portable},"
+        f"code=compute_{codegen.portable}"
+    )
+    return flags
+
+
 def compile_command(
     artifact: Artifact,
     target: Target,
@@ -347,6 +548,7 @@ def compile_command(
     *,
     environ: Mapping[str, str] = os.environ,
     cuda_compiler: Sequence[str] | None = None,
+    cuda_codegen: CudaCodegen | None = None,
 ) -> list[str]:
     """Construct the compiler invocation for one artifact."""
     if artifact.language == "cuda":
@@ -362,14 +564,27 @@ def compile_command(
                 "NVCC compiler not found; install the CUDA toolkit, set NVCC, "
                 "or use --cuda=off"
             )
+        if cuda_codegen is None:
+            override = environ.get("K3_CUDA_ARCH")
+            cuda_codegen = CudaCodegen(
+                CUDA_PORTABLE_ARCH,
+                (
+                    ()
+                    if override is None or override.strip().lower() == "auto"
+                    else tuple(
+                        arch for arch in parse_cuda_arches(override)
+                        if arch != CUDA_PORTABLE_ARCH
+                    )
+                ),
+                override is not None and override.strip().lower() != "auto",
+            )
         return [
             *compiler,
             "-O3",
             "-std=c++17",
             "-shared",
             "-Xcompiler=-fPIC",
-            "-gencode=arch=compute_75,code=sm_75",
-            "-gencode=arch=compute_75,code=compute_75",
+            *cuda_gencode_flags(cuda_codegen),
             str(artifact.source),
             "-o",
             str(output),
@@ -648,6 +863,9 @@ def build_native(
     validator: Validator | None = None,
     cpu_flags: frozenset[str] | set[str] | None = None,
     nvcc_finder: Callable[[str], str | None] = shutil.which,
+    nvidia_smi_finder: Callable[[str], str | None] = shutil.which,
+    cuda_probe_runner: Callable[..., object] = subprocess.run,
+    cuda_codegen: CudaCodegen | None = None,
     reporter: Reporter = _default_reporter,
     replace: Callable[[str | os.PathLike[str], str | os.PathLike[str]], None]
     = os.replace,
@@ -672,6 +890,7 @@ def build_native(
     # Deliberately do not resolve NVCC on Darwin or in off mode.
     cuda_compiler: list[str] | None = None
     cuda_artifacts: list[Artifact] = []
+    resolved_cuda_codegen = cuda_codegen
     if cuda_mode not in CUDA_MODES:
         raise BuildError(
             f"invalid CUDA mode {cuda_mode!r}; expected auto, on, or off"
@@ -692,6 +911,33 @@ def build_native(
                 "CUDA was required by --cuda=on, but NVCC was not found. "
                 "Install the CUDA toolkit or set NVCC to its compiler"
             )
+        if cuda_compiler is not None:
+            if resolved_cuda_codegen is None:
+                try:
+                    resolved_cuda_codegen = resolve_cuda_codegen(
+                        environ,
+                        cuda_compiler,
+                        runner=cuda_probe_runner,
+                        nvidia_smi_finder=nvidia_smi_finder,
+                        reporter=reporter,
+                    )
+                except BuildError as exc:
+                    if cuda_mode == "on":
+                        raise
+                    reporter(f"optional CUDA build skipped: {exc}")
+                    cuda_compiler = None
+            if (
+                resolved_cuda_codegen is not None
+                and resolved_cuda_codegen.native
+            ):
+                reporter(
+                    "CUDA codegen adds native "
+                    + ", ".join(
+                        f"sm_{arch}" for arch in resolved_cuda_codegen.native
+                    )
+                    + f" SASS while retaining compute_"
+                    f"{resolved_cuda_codegen.portable} PTX"
+                )
         if cuda_compiler is not None:
             cuda_artifacts = [
                 artifact
@@ -721,6 +967,8 @@ def build_native(
     def prepare(
         artifacts: Sequence[Artifact],
         prepared: list[tuple[Artifact, Path]],
+        *,
+        codegen: CudaCodegen | None = None,
     ) -> None:
         for artifact in artifacts:
             if not artifact.source.is_file():
@@ -738,6 +986,7 @@ def build_native(
                 temporary,
                 environ=environ,
                 cuda_compiler=cuda_compiler,
+                cuda_codegen=codegen,
             )
             runner(command, tools_dir.parent)
             validator(temporary, artifact)
@@ -748,18 +997,54 @@ def build_native(
         prepare(required_artifacts, required_prepared)
         if cuda_artifacts:
             try:
-                prepare(cuda_artifacts, cuda_prepared)
+                prepare(
+                    cuda_artifacts,
+                    cuda_prepared,
+                    codegen=resolved_cuda_codegen,
+                )
             except Exception as exc:
-                if cuda_mode == "on":
+                retry_error = exc
+                can_retry_portable = (
+                    resolved_cuda_codegen is not None
+                    and bool(resolved_cuda_codegen.native)
+                    and not resolved_cuda_codegen.explicit
+                )
+                if can_retry_portable:
+                    portable_codegen = CudaCodegen(
+                        resolved_cuda_codegen.portable
+                    )
+                    # A future build may contain more than one CUDA artifact.
+                    # Discard any candidates completed before the failure and
+                    # rebuild the complete CUDA transaction at the safe floor.
+                    cuda_prepared.clear()
+                    reporter(
+                        "native CUDA architecture build failed; retrying the "
+                        f"portable sm_{portable_codegen.portable} + "
+                        f"compute_{portable_codegen.portable} target: {exc}"
+                    )
+                    try:
+                        prepare(
+                            cuda_artifacts,
+                            cuda_prepared,
+                            codegen=portable_codegen,
+                        )
+                    except Exception as portable_exc:
+                        retry_error = portable_exc
+                    else:
+                        retry_error = None
+                if retry_error is None:
+                    pass
+                elif cuda_mode == "on":
                     raise BuildError(
                         "CUDA build required by --cuda=on failed: "
-                        f"{exc}"
-                    ) from exc
-                reporter(
-                    "optional CUDA build failed; continuing with required "
-                    f"CPU libraries: {exc}"
-                )
-                cuda_prepared.clear()
+                        f"{retry_error}"
+                    ) from retry_error
+                else:
+                    reporter(
+                        "optional CUDA build failed; continuing with required "
+                        f"CPU libraries: {retry_error}"
+                    )
+                    cuda_prepared.clear()
 
         if cuda_mode == "on":
             # Explicitly requested outputs are one all-or-nothing transaction.

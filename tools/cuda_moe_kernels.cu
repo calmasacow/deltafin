@@ -80,6 +80,13 @@ __device__ __forceinline__ float e2m1_value(uint8_t code) {
     return (code & 8u) ? -magnitude : magnitude;
 }
 
+// Keep the on-disk MXFP4 NaN sentinel independent of CUDA header macros.
+// 0x7fffffff is the established quiet-NaN payload, while __int_as_float is
+// available as a device intrinsic across the supported toolkit range.
+__device__ __forceinline__ float mxfp4_quiet_nan() {
+    return __int_as_float(0x7fffffff);
+}
+
 // One block owns one complete output element.  Each thread sums whole MXFP4
 // groups, then the fixed binary tree below reduces in a repeatable order.  No
 // atomic operation participates in either an expert output or route combine.
@@ -111,7 +118,7 @@ __global__ void mxfp4_gemv_kernel(
     for (int group = threadIdx.x; group < groups; group += blockDim.x) {
         const uint8_t scale_byte = row_scales[group];
         if (scale_byte == 255u) {
-            local = CUDART_NAN_F;
+            local = mxfp4_quiet_nan();
             break;
         }
         const int exponent = static_cast<int>(scale_byte) - 127;
@@ -262,22 +269,37 @@ extern "C" int k3_cuda_moe_available(int device) {
         set_error("CUDA availability", "device index is outside the visible range");
         return kUnsupported;
     }
-    cudaDeviceProp properties{};
-    status = cudaGetDeviceProperties(&properties, device);
+    int compute_mode = -1;
+    status = cudaDeviceGetAttribute(
+        &compute_mode, cudaDevAttrComputeMode, device);
     if (status != cudaSuccess) {
-        return cuda_status("cudaGetDeviceProperties", status);
+        return cuda_status("cudaDeviceGetAttribute(compute mode)", status);
     }
-    if (properties.computeMode == cudaComputeModeProhibited) {
+    if (compute_mode == cudaComputeModeProhibited) {
         set_error("CUDA availability", "device compute mode is prohibited");
         return kUnsupported;
+    }
+    int major = 0;
+    int minor = 0;
+    status = cudaDeviceGetAttribute(
+        &major, cudaDevAttrComputeCapabilityMajor, device);
+    if (status != cudaSuccess) {
+        return cuda_status(
+            "cudaDeviceGetAttribute(compute capability major)", status);
+    }
+    status = cudaDeviceGetAttribute(
+        &minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (status != cudaSuccess) {
+        return cuda_status(
+            "cudaDeviceGetAttribute(compute capability minor)", status);
     }
     std::snprintf(
         g_last_error,
         sizeof(g_last_error),
-        "available: %s compute capability %d.%d",
-        properties.name,
-        properties.major,
-        properties.minor);
+        "available: device %d compute capability %d.%d",
+        device,
+        major,
+        minor);
     return 1;
 }
 

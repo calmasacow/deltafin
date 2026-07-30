@@ -84,6 +84,126 @@ class GenerateBoundsTests(unittest.TestCase):
         self.assertEqual(calls, 1)
 
 
+class _ArgmaxVector:
+    def __init__(self, values, counters):
+        self._values = list(values)
+        self._counters = counters
+
+    def tolist(self):
+        self._counters["bulk_transfers"] += 1
+        return list(self._values)
+
+
+class _VerifierRows:
+    def __init__(self, values, counters):
+        self._values = values
+        self._counters = counters
+
+    def argmax(self, dim):
+        if dim != -1:
+            raise AssertionError(f"unexpected argmax dim {dim}")
+        self._counters["row_argmax_calls"] += 1
+        return _ArgmaxVector(self._values, self._counters)
+
+
+class _VerifierLogits:
+    """Reject scalar-position reads so the test enforces one bulk handoff."""
+
+    def __init__(self, values, counters):
+        self._values = values
+        self._counters = counters
+
+    def __getitem__(self, index):
+        if index != 0:
+            self._counters["scalar_position_reads"] += 1
+            raise AssertionError(f"unexpected scalar verifier read {index!r}")
+        return _VerifierRows(self._values, self._counters)
+
+
+class ShallowSpecArgmaxTests(unittest.TestCase):
+    def test_accept_reads_both_argmax_ids_in_one_bulk_transfer(self):
+        counters = {
+            "row_argmax_calls": 0,
+            "bulk_transfers": 0,
+            "scalar_position_reads": 0,
+        }
+        verifier = _VerifierLogits([7, 8], counters)
+        streamed = []
+        with (
+            mock.patch.object(
+                kr,
+                "forward_pass",
+                side_effect=[_logits(1), verifier],
+            ),
+            mock.patch.object(kr, "ngram_draft", return_value=7),
+            mock.patch.object(kr, "snapshot_states", return_value={}),
+            mock.patch.object(kr, "restore_states") as restore,
+            mock.patch.object(kr.spec_decode, "enabled", return_value=False),
+            mock.patch.object(kr, "prefetch_prev_token"),
+            mock.patch.dict(os.environ, {"K3_PREFETCH": "0"}),
+        ):
+            generated = kr.generate(
+                [],
+                object(),
+                lambda ids: ids,
+                [41],
+                max_new=3,
+                spec=True,
+                on_token=streamed.append,
+            )
+        self.assertEqual(generated, [1, 7, 8])
+        self.assertEqual(streamed, generated)
+        self.assertEqual(
+            counters,
+            {
+                "row_argmax_calls": 1,
+                "bulk_transfers": 1,
+                "scalar_position_reads": 0,
+            },
+        )
+        restore.assert_not_called()
+
+    def test_miss_uses_first_bulk_id_then_restores_and_reruns(self):
+        counters = {
+            "row_argmax_calls": 0,
+            "bulk_transfers": 0,
+            "scalar_position_reads": 0,
+        }
+        verifier = _VerifierLogits([9, 63], counters)
+        streamed = []
+        snapshot = object()
+        with (
+            mock.patch.object(
+                kr,
+                "forward_pass",
+                side_effect=[_logits(1), verifier, _logits(8)],
+            ),
+            mock.patch.object(kr, "ngram_draft", return_value=7),
+            mock.patch.object(
+                kr, "snapshot_states", return_value=snapshot
+            ),
+            mock.patch.object(kr, "restore_states") as restore,
+            mock.patch.object(kr.spec_decode, "enabled", return_value=False),
+            mock.patch.object(kr, "prefetch_prev_token"),
+            mock.patch.dict(os.environ, {"K3_PREFETCH": "0"}),
+        ):
+            generated = kr.generate(
+                [],
+                object(),
+                lambda ids: ids,
+                [41],
+                max_new=2,
+                spec=True,
+                on_token=streamed.append,
+            )
+        self.assertEqual(generated, [1, 8])
+        self.assertEqual(streamed, generated)
+        self.assertEqual(counters["row_argmax_calls"], 1)
+        self.assertEqual(counters["bulk_transfers"], 1)
+        self.assertEqual(counters["scalar_position_reads"], 0)
+        restore.assert_called_once_with(mock.ANY, snapshot)
+
+
 class ReplayCaptureLifetimeTests(unittest.TestCase):
     def _step(self, rollback):
         logits = torch.zeros(1, 3, 32)
