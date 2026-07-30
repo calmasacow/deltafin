@@ -209,9 +209,10 @@ minutes:
 ./venv/bin/python tools/kimi_run.py --prompt "The largest planet in our solar system is" --max-new 17 --stats
 ```
 
-Tokens print as they are generated, so you always see the text as it comes.
-Ctrl-C stops cleanly at any point and prints the result so far; `--max-new N`
-caps the length. Add `--stats` to show prefill time and live steady-decode
+In chat mode, the answer streams as uninterrupted text unless `--stats` or
+`K3_PROFILE=1` requests diagnostic output. Ctrl-C stops cleanly at any point
+and keeps the answer generated so far; `--max-new N` caps the length. Add
+`--stats` to show token-level diagnostics, prefill time and live steady-decode
 throughput. Its decode rate excludes prefill and the first output token,
 matching the benchmark convention, and updates after each target pass (which
 may certify several tokens).
