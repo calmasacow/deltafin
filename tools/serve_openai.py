@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kimi_run as kr  # noqa: E402
+import universal_draft  # noqa: E402
 from response_memo import DeterministicResponseMemo  # noqa: E402
 
 MODEL_ID = "deltafin-kimi-k3"
@@ -50,16 +51,20 @@ _lock = threading.Lock()
 _tok = None
 _layers = None
 _embed = None
+_universal_drafter = None
 _memo = DeterministicResponseMemo(RESPONSE_MEMO_ENTRIES)
 
 
 def _boot():
-    global _tok, _layers, _embed
+    global _tok, _layers, _embed, _universal_drafter
     from transformers import AutoTokenizer
     print("[serve] loading tokenizer + layer skeletons...", flush=True)
     _tok = AutoTokenizer.from_pretrained(
         os.path.join(kr.ROOT, "k3-meta"), trust_remote_code=True)
     kr.check_expert_pool()
+    _universal_drafter = universal_draft.load_local_drafter(
+        kr.ROOT, _tok, kr.DEV
+    )
     _layers = kr.build_layers()
     _embed = kr.LazyEmbed()
     print("[serve] ready", flush=True)
@@ -77,24 +82,31 @@ def _split_reasoning(text):
 def _gen(ids, max_new, on_delta=None):
     """Run one generation under the global lock; stream decoded-text deltas."""
     cache = kr.ml.KimiDynamicCache(kr.config)
-    toks = []
     decoder = kr.IncrementalTokenDecoder(_tok) if on_delta else None
 
     def on_token(t):
         if t == kr.EOS_ID:
             return
-        toks.append(t)
-        delta = decoder.append(t) if decoder is not None else ""
-        if on_delta and delta:
+        delta = decoder.append(t)
+        if delta:
             on_delta(delta)
 
-    out = kr.generate(_layers, cache, _embed, ids, max_new, on_token=on_token)
+    out = kr.generate(
+        _layers,
+        cache,
+        _embed,
+        ids,
+        max_new,
+        on_token=on_token if on_delta else None,
+        universal_drafter=_universal_drafter,
+    )
     if decoder is not None:
         tail = decoder.finish()
         if tail:
             on_delta(tail)
-    if kr.EOS_ID in out:
-        out = out[:out.index(kr.EOS_ID)]
+    # generate() guarantees that EOS, when present, is the final emitted ID.
+    if out and out[-1] == kr.EOS_ID:
+        out.pop()
         finish = "stop"
     else:
         finish = "length"
@@ -251,8 +263,12 @@ def main():
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[serve] Deltafin OpenAI-compatible API on http://{args.host}:{args.port}/v1",
           flush=True)
-    print("[serve] note: ~1 token/min; first chat request on a cold expert cache "
-          "is very slow (large prefill fetch). Warm up with short completions.", flush=True)
+    print(
+        "[serve] note: speed depends strongly on draft acceptance and cache "
+        "state; the first chat request on a cold expert cache can be very slow "
+        "(large prefill fetch). Warm up with short completions.",
+        flush=True,
+    )
     srv.serve_forever()
 
 

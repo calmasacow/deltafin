@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))    # fla shim, k3loader, mxfp4
 
 import runtime_platform  # noqa: E402
 import packed_q8  # noqa: E402
+import quality_policy  # noqa: E402
 import routing_record as routing_records  # noqa: E402
 import numpy as np
 import torch
@@ -35,6 +36,9 @@ import importlib  # noqa: E402
 import apple_silicon  # noqa: E402
 
 from k3pkg import modeling_kimi_linear as ml
+import kv_cache  # noqa: E402
+
+kv_cache.install(ml)
 
 CFG_JSON = json.load(open(os.path.join(ROOT, "k3-meta/config.json")))["text_config"]
 Cfg = getattr(ml, "KimiLinearConfig", None)
@@ -43,17 +47,13 @@ if Cfg is None:
 config = Cfg(**CFG_JSON)
 config._attn_implementation = "eager"
 BASE_MOE_TOP_K = int(config.num_experts_per_token)
-MOE_TOP_K = int(os.environ.get("K3_MOE_TOP_K", BASE_MOE_TOP_K))
-if not 1 <= MOE_TOP_K <= BASE_MOE_TOP_K:
-    raise ValueError(
-        f"K3_MOE_TOP_K must be in [1,{BASE_MOE_TOP_K}], got {MOE_TOP_K}")
-if MOE_TOP_K != BASE_MOE_TOP_K:
-    config.num_experts_per_token = MOE_TOP_K
-    print(f"[quality] routed experts reduced {BASE_MOE_TOP_K}->{MOE_TOP_K}; "
-          "this is an explicit approximate speed dial", flush=True)
+MOE_TOP_K = quality_policy.full_moe_top_k(
+    BASE_MOE_TOP_K, os.environ.get("K3_MOE_TOP_K")
+)
 H = config.hidden_size
 NL = config.num_hidden_layers
 PFX = "language_model.model."
+_PREADV = getattr(os, "preadv", None)
 # Sensible defaults, no env vars required: use the GPU when there is one, and
 # use the int8 spine when it has been built. Both remain overridable.
 INT8_DIR = os.path.join(ROOT, "k3-resident-int8/tensors")
@@ -119,36 +119,23 @@ def _auto_spine():
 
 
 DEV = _resolve_device()                                      # cpu | mps | cuda[:N]
-SPINE = os.environ.get("K3_SPINE") or _auto_spine()           # bf16 | int8 | mixed
+SPINE = quality_policy.supported_spine(
+    os.environ.get("K3_SPINE") or _auto_spine()
+)                                                            # bf16 | int8
 if SPINE == "bf16" and "K3_SPINE" not in os.environ:
     print("[config] int8 spine not found — using bf16 (2x the per-token I/O). "
           "Build it with: python tools/convert_spine_int8.py", flush=True)
 
-# --- mixed-precision spine (K3_SPINE=mixed; DEFAULT IS UNCHANGED) ------------
-# The 53 GB int8 spine is re-read every token, so bytes are seconds. A mixed
-# spine keeps int8 where the error lands on token identity and drops selected
-# ROLES to 6 or 4 bits; tools/mixed_spine.py reads the mix (falling back to the
-# int8 spine for every tensor the policy left alone) and dequantizes each codec
-# with its own Metal kernel. Build one with:
-#     python tools/convert_spine_int4.py --policy moe4
-# Per-role error measurements that justify a policy: tools/spine_sensitivity.py.
-MIXED = SPINE == "mixed"
-QUANT = SPINE in ("int8", "mixed")      # "a quantized spine of some kind"
-if MIXED:
-    import mixed_spine  # noqa: E402
-    if not mixed_spine.available():
-        sys.exit(f"K3_SPINE=mixed but no mixed spine at {mixed_spine.MIXED_DIR}. "
-                 f"Build one with: python tools/convert_spine_int4.py --policy moe4")
-    print(f"[spine] mixed: {mixed_spine.describe()}", flush=True)
-    if os.environ.get("K3_PROFILE", "0") == "1":
-        import atexit
-        atexit.register(lambda: print(mixed_spine.phase_report(), flush=True))
-# K3_APPROX=1 = "approx mode": approximate numerics (fp16 weights) + n-gram
-# speculation. Output stays coherent but near-tie tokens may differ from the
-# fp32 reference — never use for oracle runs. Speed effect is unproven until a
-# quiet-machine A/B; if it measures faster it can earn a faster name.
-APPROX = os.environ.get("K3_APPROX", "0") == "1"
-DT = torch.float16 if (APPROX or os.environ.get("K3_DTYPE", "fp32") == "fp16") else torch.float32
+MIXED = False
+QUANT = SPINE == "int8"
+# These old experimental controls could change near-tie tokens. The supported
+# runtime now refuses them: speed work may alter scheduling and representation
+# only after parity gates, never by requesting lower-quality activation math.
+quality_policy.require_fp32(
+    os.environ.get("K3_APPROX"), os.environ.get("K3_DTYPE")
+)
+APPROX = False
+DT = torch.float32
 
 
 def _mode_enabled(value, *, automatic):
@@ -228,6 +215,26 @@ _PACKED_Q8_BACKEND = packed_q8.discover(
     ),
     max_tokens=os.environ.get("K3_PACKED_Q8_MAX_T", "auto"),
     fusion_mode=os.environ.get("K3_INT8_QKV_FUSE", "auto"),
+)
+# o_proj has the transposed KDA shape and consumes a different activation.
+# Qualify that exact shape independently: success at [projection,H] cannot
+# establish support for [H,projection] in a private backend.
+_PACKED_Q8_O_BACKEND = packed_q8.discover(
+    torch,
+    DEV,
+    torch.float32,
+    (H, _KDA_PROJECTION_SIZE),
+    mode=(
+        os.environ.get("K3_NATIVE_INT8", "auto")
+        if (
+            _PACKED_Q8_NEEDED
+            and _INT8_KDA_QKV_REQUESTED_EARLY
+        )
+        else "off"
+    ),
+    max_tokens=os.environ.get("K3_PACKED_Q8_MAX_T", "auto"),
+    # o_proj is an independent tail projection, never a fusion group.
+    fusion_mode="off",
 )
 INT8_LM_HEAD = bool(
     _INT8_LM_HEAD_REQUESTED
@@ -353,6 +360,77 @@ class EventLog:
             self._f = None
 
 
+class LiveDecodeStats:
+    """Request-local, display-only CLI throughput accounting.
+
+    Decode throughput excludes prefill and its first output token, matching the
+    public steady-decode benchmark. Durations come from the existing per-pass
+    wall clock, so assistant proposal and target verification time are both
+    included.
+    """
+
+    def __init__(self, enabled=False):
+        self.enabled = bool(enabled)
+        self.prefill_ns = 0
+        self.prompt_tokens = 0
+        self.decode_ns = 0
+        self.decode_tokens = 0
+
+    def record_prefill(self, duration_ns, prompt_tokens):
+        if not self.enabled:
+            return None
+        self.prefill_ns = max(0, int(duration_ns))
+        self.prompt_tokens = max(0, int(prompt_tokens))
+        return (
+            f"[stats] prefill {self.prefill_ns / 1e9:.3f}s | "
+            f"{self.prompt_tokens} prompt tokens | first output token ready"
+        )
+
+    def record_decode(self, duration_ns, emitted_tokens, uag_status=None):
+        if not self.enabled:
+            return None
+        duration_ns = max(0, int(duration_ns))
+        emitted_tokens = max(0, int(emitted_tokens))
+        self.decode_ns += duration_ns
+        self.decode_tokens += emitted_tokens
+
+        seconds = self.decode_ns / 1e9
+        rate = self.decode_tokens / seconds if seconds > 0 else 0.0
+        seconds_per_token = (
+            seconds / self.decode_tokens if self.decode_tokens else 0.0
+        )
+        parts = [
+            f"[stats] decode {self.decode_tokens} tok / {seconds:.3f}s",
+            f"{rate:.4f} tok/s",
+            f"{seconds_per_token:.3f} s/token",
+            f"last +{emitted_tokens} tok in {duration_ns / 1e9:.3f}s",
+        ]
+        if uag_status:
+            accepted = int(uag_status.get("accepted_drafts", 0))
+            proposed = int(uag_status.get("target_drafts", 0))
+            if proposed:
+                parts.append(
+                    f"drafts {accepted}/{proposed} "
+                    f"({accepted / proposed * 100:.0f}%)"
+                )
+        return " | ".join(parts)
+
+    def final_line(self, total_model_ns):
+        if not self.enabled:
+            return None
+        seconds = self.decode_ns / 1e9
+        rate = self.decode_tokens / seconds if seconds > 0 else 0.0
+        seconds_per_token = (
+            seconds / self.decode_tokens if self.decode_tokens else 0.0
+        )
+        return (
+            f"[stats] final prefill {self.prefill_ns / 1e9:.3f}s | "
+            f"steady decode {self.decode_tokens} tok / {seconds:.3f}s | "
+            f"{rate:.4f} tok/s | {seconds_per_token:.3f} s/token | "
+            f"model total {max(0, int(total_model_ns)) / 1e9:.3f}s"
+        )
+
+
 class IncrementalTokenDecoder:
     """Decode K3's token bytes once while preserving UTF-8 split boundaries."""
 
@@ -393,12 +471,7 @@ def set_param(root, dotted, tensor):
 
 
 def _load_int8(full):
-    """Return dequantized fp32 tensor on DEV from the int8 spine, or None.
-    Under K3_SPINE=mixed this resolves through the mixed spine first (i4/i6),
-    which itself falls back to these same int8 blobs."""
-    if MIXED:
-        return mixed_spine.load(full, INT8_DIR, k3loader.INV[full]["shape"],
-                                dev=DEV, dtype=DT)
+    """Return a dequantized fp32 tensor from the int8 spine, or ``None``."""
     op = os.path.join(INT8_DIR, full + ".i8")
     if not os.path.exists(op):
         return None
@@ -584,9 +657,10 @@ if spine_fast.FAST or _SPINE_DEQ != "torch":
 
 # N1: keep every eligible same-input KDA first-stage projection as row-int8 and
 # call a capability-proven native weight-only matmul instead of dequantizing
-# Q/K/V/G/F-A/B into the shared fp32 template arena. The historical QKV
-# environment/API name is retained for compatibility. Capability and exception
-# gates retain the dense path everywhere else.
+# Q/K/V/G/F-A/B into the shared fp32 template arena. A separately shape-proven
+# o_proj may use the same storage lifetime through an independent call. The
+# historical QKV environment/API name is retained for compatibility.
+# Capability and exception gates retain the dense path everywhere else.
 # Eligibility is based on runtime capabilities, never an OS/product name.
 _INT8_KDA_QKV_REQUESTED = _INT8_KDA_QKV_REQUESTED_EARLY
 _INT8_KDA_QKV_REASONS = []
@@ -632,6 +706,16 @@ if _INT8_KDA_QKV_REQUESTED and not INT8_KDA_QKV:
         "[kda-qkv] packed-int8 request unavailable: "
         + "; ".join(_INT8_KDA_QKV_REASONS)
         + "; using dequantized dense projections",
+        flush=True,
+    )
+elif INT8_KDA_QKV and not _PACKED_Q8_O_BACKEND.available:
+    print(
+        "[kda-o] packed-int8 output projection unavailable: "
+        + (
+            _PACKED_Q8_O_BACKEND.reason
+            or "independent output-shape canary failed"
+        )
+        + "; keeping o_proj dense",
         flush=True,
     )
 
@@ -747,6 +831,7 @@ def _int8_kda_qkv_runtime_status():
             for controller in controllers
         ),
         "backend": _PACKED_Q8_BACKEND.status(),
+        "o_backend": _PACKED_Q8_O_BACKEND.status(),
         "controllers": [
             controller.status() for controller in controllers
         ],
@@ -985,6 +1070,8 @@ if MOE_BACKEND == "metal":
         MOE_BACKEND = "cpu"
         print(f"[config] K3_MOE=metal unavailable ({metal_moe.last_error()}) "
               f"— falling back to cpu", flush=True)
+if CPU_BATCH_ACTIVE:
+    fast_moe_batch.configure_autotune(MOE_BACKEND == "cpu")
 if MOE_BACKEND == "cpu" and CPU_BATCH_ACTIVE:
     print(f"[config] CPU MoE: persistent worker ring "
           f"({fast_moe_batch.pool_threads()} threads, "
@@ -1245,7 +1332,6 @@ spec_decode.install(ml, lambda: _step_ctx["layer"],
 if spec_decode.enabled():
     print(f"[spec] {spec_decode.describe()}", flush=True)
 
-
 def _pilot_load(full):
     """The resident loader the layer templates use — so a cached gate is the
     exact tensor the model routes with (int8-dequantized under K3_SPINE=int8)."""
@@ -1306,6 +1392,32 @@ class LazyEmbed:
             i = j
         return b"".join(rows[tid] for tid in tids)
 
+    def _local_row_buffer(self, tid):
+        """Read one row directly into its final mutable tensor owner.
+
+        ``pread`` returns immutable bytes, which the frombuffer handoff must
+        copy into a bytearray. macOS and Linux expose ``preadv``; filling that
+        bytearray in place removes the common T=1 copy. The loop retains the
+        old error contract and completes a positive partial read.
+        """
+        if _PREADV is None:
+            return None
+        result = bytearray(self.rowbytes)
+        view = memoryview(result)
+        done = 0
+        while done < self.rowbytes:
+            count = _PREADV(
+                self._fd,
+                [view[done:]],
+                tid * self.rowbytes + done,
+            )
+            if count <= 0:
+                raise IOError(
+                    f"short embedding read {done}/{self.rowbytes}"
+                )
+            done += count
+        return result
+
     def _row(self, tid):
         if self._ensure_fd() is not None:
             buf = os.pread(self._fd, self.rowbytes, tid * self.rowbytes)
@@ -1323,9 +1435,20 @@ class LazyEmbed:
 
     def __call__(self, ids):
         tids = [int(t) for t in ids]
-        buf = (self._local_rows(tids) if self._ensure_fd() is not None
-               else b"".join(self._row(tid) for tid in tids))
-        t = torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(len(tids), H)
+        local = self._ensure_fd() is not None
+        owner = (
+            self._local_row_buffer(tids[0])
+            if local and len(tids) == 1
+            else None
+        )
+        if owner is None:
+            buf = (
+                self._local_rows(tids)
+                if local
+                else b"".join(self._row(tid) for tid in tids)
+            )
+            owner = bytearray(buf)
+        t = torch.frombuffer(owner, dtype=torch.bfloat16).reshape(len(tids), H)
         return t.to(DEV, DT).unsqueeze(0)  # [1, T, H]
 
 
@@ -1358,6 +1481,11 @@ def build_layers():
                         DEV,
                         _INT8_KDA_QKV_STATE,
                         _PACKED_Q8_BACKEND,
+                        o_backend=(
+                            _PACKED_Q8_O_BACKEND
+                            if _PACKED_Q8_O_BACKEND.available
+                            else None
+                        ),
                         storage_mode=_INT8_KDA_STORAGE_MODE,
                         stage_sync_mode=_INT8_KDA_STAGE_SYNC_MODE,
                     )
@@ -1371,12 +1499,17 @@ def build_layers():
             packed_bytes = sum(
                 controller.nbytes for controller in installed
             )
+            packed_o = any(
+                "o" in getattr(controller, "independent_roles", ())
+                for controller in installed
+            )
             print(
                 f"[kda-bundle] native packed-int8 active for "
                 f"{len(installed)} KDA template(s), "
                 f"{packed_bytes/2**20:.1f} MiB persistent storage, "
                 f"device={DEV.type}, max_T={_PACKED_Q8_BACKEND.max_tokens}, "
                 f"fused_bundle={int(_PACKED_Q8_BACKEND.fuse_qkv)}, "
+                f"o_proj={int(packed_o)}, "
                 f"storage={_INT8_KDA_STORAGE_MODE}, "
                 f"stage_sync={_INT8_KDA_STAGE_SYNC_MODE}",
                 flush=True,
@@ -1545,43 +1678,191 @@ def _pack_bytes(pack):
 # keeping the streaming tier out of cache turns that into a hit rate equal to
 # the fraction that fits, using clean file pages rather than swappable heap.
 _RESIDENT_SPEC = os.environ.get("K3_SPINE_RESIDENT_GB")
-_RESIDENT_GB = float(_RESIDENT_SPEC or 0)
-if _RESIDENT_SPEC is not None and _RESIDENT_GB >= 0 and spine_io.STREAM_TIER and QUANT:
-    _rset, _rbytes = spine_cache.resident_tier(INT8_DIR, PFX, NL, _RESIDENT_GB * 1e9)
-    spine_io.set_resident_tier(_rset)
-    print(f"[spine] page-cache resident tier: {len(_rset)}/{NL} layers, "
-          f"{_rbytes/1e9:.1f} GB; the rest use streaming cache advice",
-          flush=True)
+_STREAM_SPEC = os.environ.get("K3_SPINE_STREAM_NOCACHE", "auto").strip().lower()
+_STREAM_FALSE = {"0", "false", "off", "no", "disabled"}
+_STREAM_TRUE = {"1", "true", "on", "yes", "enabled"}
+if _STREAM_SPEC in _STREAM_FALSE:
+    _SPINE_STREAM_NOCACHE = False
+    _AUTO_RESIDENT_BYTES = 0
+    _SPINE_CACHE_POLICY = "explicitly disabled"
+elif _STREAM_SPEC in _STREAM_TRUE:
+    _SPINE_STREAM_NOCACHE = True
+    _AUTO_RESIDENT_BYTES = 0
+    _SPINE_CACHE_POLICY = "explicitly enabled"
+elif _STREAM_SPEC == "auto":
+    _layer_sizes = (
+        spine_cache.layer_bytes(INT8_DIR, PFX, NL)
+        if SPINE == "int8" and spine_fast.PACK else []
+    )
+    _recommended_ws = APPLE_CAPS.metal.get(
+        "recommended_max_working_set_bytes"
+    )
+    (
+        _SPINE_STREAM_NOCACHE,
+        _AUTO_RESIDENT_BYTES,
+        _SPINE_CACHE_POLICY,
+    ) = spine_cache.automatic_stream_policy(
+        system=APPLE_CAPS.system,
+        physical_bytes=APPLE_CAPS.physical_memory_bytes,
+        recommended_working_set_bytes=_recommended_ws,
+        spine_bytes=sum(_layer_sizes),
+    )
+else:
+    raise ValueError(
+        "K3_SPINE_STREAM_NOCACHE must be auto, 0/1, false/true, or off/on"
+    )
+
+if _RESIDENT_SPEC is not None:
+    _RESIDENT_GB = float(_RESIDENT_SPEC or 0)
+    if _RESIDENT_GB < 0:
+        raise ValueError("K3_SPINE_RESIDENT_GB must be non-negative")
+    _RESIDENT_BYTES = int(_RESIDENT_GB * 1e9)
+else:
+    _RESIDENT_BYTES = _AUTO_RESIDENT_BYTES
+
+
+def _packed_spine_fd_requirement():
+    """Count the complete installed packed-reader descriptor working set."""
+    if SPINE != "int8" or not spine_fast.PACK:
+        return None
+    paths = set()
+    layer_prefix = f"{PFX}layers."
+    for full in k3loader.INV:
+        if not full.startswith(layer_prefix) or ".experts." in full:
+            continue
+        int8_path = os.path.join(INT8_DIR, full + ".i8")
+        if os.path.exists(int8_path):
+            paths.add(int8_path)
+            scale_path = os.path.join(INT8_DIR, full + ".sc")
+            if os.path.exists(scale_path):
+                paths.add(scale_path)
+            continue
+        resident_path = os.path.join(k3loader.RES, full)
+        if os.path.exists(resident_path):
+            paths.add(resident_path)
+    # Darwin F_NOCACHE is an fd attribute. If read-ahead is also enabled, the
+    # same streaming path can occupy both the normal and no-cache tables.
+    if (
+        sys.platform == "darwin"
+        and spine_io.RDADVISE
+        and _SPINE_STREAM_NOCACHE
+    ):
+        return len(paths) * 2
+    return len(paths)
+
+
+_SPINE_FD_REQUIRED = _packed_spine_fd_requirement()
+
+# Reader width and chunk size depend on the storage controller.  Ask the pure
+# capability policy for a measured tuple rather than applying this M1 result to
+# a newer Mac (or any Linux host). Explicit controls remain authoritative.
+_SPINE_READER_AUTO_TUNED = False
+if "K3_SPINE_FDCACHE" in os.environ:
+    _explicit_fdcache = os.environ.get("K3_SPINE_FDCACHE", "0") == "1"
+    spine_io.configure_reader_shape(
+        fdcache=_explicit_fdcache,
+        required_fds=_SPINE_FD_REQUIRED,
+    )
+    if _explicit_fdcache and not spine_io.FDCACHE:
+        print(
+            "[spine] descriptor cache disabled safely: "
+            f"{spine_io.FDCACHE_REASON}",
+            flush=True,
+        )
+if _STREAM_SPEC == "auto" and _SPINE_STREAM_NOCACHE:
+    (
+        _auto_reader_threads,
+        _auto_reader_fdcache,
+        _auto_reader_chunk,
+        _SPINE_READER_POLICY,
+    ) = spine_cache.automatic_reader_policy(
+        system=APPLE_CAPS.system,
+        physical_bytes=APPLE_CAPS.physical_memory_bytes,
+        effective_cpu_count=runtime_platform.available_cpu_count(),
+        recommended_working_set_bytes=APPLE_CAPS.metal.get(
+            "recommended_max_working_set_bytes"
+        ),
+        max_buffer_length_bytes=APPLE_CAPS.metal.get(
+            "max_buffer_length_bytes"
+        ),
+        stream_nocache=_SPINE_STREAM_NOCACHE,
+    )
+    if (
+        _auto_reader_fdcache is not None
+        and "K3_SPINE_FDCACHE" not in os.environ
+    ):
+        spine_io.configure_reader_shape(
+            fdcache=_auto_reader_fdcache,
+            required_fds=_SPINE_FD_REQUIRED,
+        )
+        _SPINE_READER_AUTO_TUNED = True
+        if _auto_reader_fdcache and not spine_io.FDCACHE:
+            print(
+                "[spine] descriptor cache disabled safely: "
+                f"{spine_io.FDCACHE_REASON}",
+                flush=True,
+            )
+    if (
+        _auto_reader_chunk is not None
+        and "K3_SPINE_CHUNK_MB" not in os.environ
+    ):
+        spine_io.configure_reader_shape(chunk_bytes=_auto_reader_chunk)
+        _SPINE_READER_AUTO_TUNED = True
+    if (
+        _auto_reader_threads is not None
+        and "K3_SPINE_READ_THREADS" not in os.environ
+    ):
+        spine_fast.configure_read_threads(_auto_reader_threads)
+        _SPINE_READER_AUTO_TUNED = True
+else:
+    _SPINE_READER_POLICY = "automatic reader tuning is inactive"
+
+_rset, _rbytes = set(), 0
+_runtime_resident_tier = None
+if _SPINE_STREAM_NOCACHE and SPINE == "int8" and spine_fast.PACK:
+    _rset, _rbytes = spine_cache.resident_tier(
+        INT8_DIR, PFX, NL, _RESIDENT_BYTES
+    )
+    _runtime_resident_tier = _rset
+    _policy_label = "automatic" if _STREAM_SPEC == "auto" else "explicit"
+    print(
+        f"[spine] {_policy_label} page-cache policy: "
+        f"{len(_rset)}/{NL} resident layers, {_rbytes/1e9:.1f} GB; "
+        f"the rest stream without cache admission "
+        f"({_SPINE_CACHE_POLICY}); reader="
+        f"{spine_fast.READ_THREADS}t/fd{int(spine_io.FDCACHE)}/"
+        f"{spine_io.CHUNK_MB:g}MiB",
+        flush=True,
+    )
+_stream_tier_args = (
+    {"resident_prefixes": _runtime_resident_tier}
+    if _runtime_resident_tier is not None else {}
+)
+spine_io.configure_stream_tier(
+    _SPINE_STREAM_NOCACHE, spine_mode=SPINE, **_stream_tier_args
+)
 
 
 def _spine_read(module, prefix):
     cached = _SPINE_CACHE.get(prefix)
     if cached is not None:
         return cached
-    if MIXED:            # always packed: mixed_spine has no per-tensor read path
-        pack = mixed_spine.read_pack(module, prefix, INT8_DIR, k3loader.RES,
-                                     k3loader.INV)
-    elif spine_fast.PACK:
+    if spine_fast.PACK:
         pack = spine_fast.read_pack(module, prefix, INT8_DIR, k3loader.RES,
                                     k3loader.INV, SPINE, k3loader.load_resident)
     else:
         pack = _read_resident_bytes(module, prefix)
-    if _SPINE_CACHE.enabled and spine_fast.PACK and not MIXED and isinstance(pack, dict):
-        # not MIXED: the cache pins buffers through spine_fast's pool, and a
-        # mixed pack comes from mixed_spine's — pinning the wrong pool would let
-        # the next layer's readinto overwrite cached weights in place.
+    if (
+        _SPINE_CACHE.enabled
+        and spine_fast.PACK
+        and isinstance(pack, dict)
+    ):
         if not _SPINE_CACHE.admit(prefix, pack, _pack_bytes(pack)):
             _SPINE_CACHE.poll()
     return pack
 
 
 def _spine_apply(module, prefix, pack):
-    if MIXED:
-        t0 = time.time()
-        mixed_spine.apply_pack(module, prefix, pack, DEV, DT, k3loader.INV,
-                               k3loader._DT, set_param, k3loader.load_resident)
-        TIMES["resident_io"] += time.time() - t0
-        return
     if spine_fast.PACK:
         t0 = time.time()
         spine_fast.apply_pack(module, prefix, pack, DEV, DT, k3loader.INV,
@@ -1602,14 +1883,20 @@ def causal_mask(T, past=0, dtype=None):
     return m
 
 
-def forward_pass(layers, cache, hidden, step, verbose=True):
+def forward_pass(
+    layers,
+    cache,
+    hidden,
+    step,
+    verbose=True,
+):
     """hidden: [1, T, H] fp32. Returns logits [1, T, vocab]."""
     T = hidden.shape[1]
     if pilot.PILOT:
         pilot.init(config, DEV, _pilot_load, PFX,
                    load_packed=_load_int8_packed if QUANT else None,
                    native_int8=(
-                       _PACKED_Q8_BACKEND.matmul
+                       _PACKED_Q8_BACKEND
                        if (
                            _PACKED_Q8_BACKEND.available
                            and DEV.type == "mps"
@@ -1805,63 +2092,195 @@ def restore_states(cache, snap, keep=0):
 
 
 EOS_ID = 163586  # <|end_of_msg|> — K3's generation stop token
+# Eight drafts form the T=9 ceiling that has passed a whole-model sequential
+# token oracle. An isolated packed-head probe also looked safe through T=16,
+# but a T=13 whole-model verifier changed a greedy token and is rejected.
+MAX_EXACT_DRAFTS = 8
 
 
-def _spec_step_deep(layers, cache, embed, ctx, pending, s):
-    """One K3_SPEC_DEPTH>1 pass. Returns (new_tokens, tag).
+class ExactVerifierRestoreError(RuntimeError):
+    """The target cache could not be proven restored after verifier failure."""
 
-    Verifies D+1 positions in a single forward pass and accepts the longest
-    correct prefix: with `argm[i] = argmax(logits[0, i])`, argm[0] is the true
-    token after `pending` and is always correct, argm[i] is correct iff drafts
-    0..i-1 were all correct. So k = #leading drafts matching argm, and the
-    emitted run is argm[0..k] — k+1 tokens, the last of which (the model's
-    argmax at the mismatch) is the free correct token.
 
-    The pass consumed D+1 positions but only k+1 are real, so the cache is
-    rolled back to exactly k+1; see tools/spec_decode.py for why that is exact
-    for the KDA fold as well as the MLA KV.
+def _verify_draft_tokens_exact(
+    layers,
+    cache,
+    embed,
+    pending,
+    drafts,
+    s,
+    *,
+    remaining,
+    source,
+    record_spec_stats=False,
+):
+    """Certify externally supplied drafts with the ordinary K3 target.
+
+    With ``argm[i] = argmax(logits[0, i])``, ``argm[0]`` is the true token
+    after ``pending`` and ``argm[i]`` is valid iff every earlier draft matched.
+    The target therefore emits the longest accepted prefix plus its own first
+    mismatch/bonus token. Neither a draft model nor its tokenizer can directly
+    emit output.
+
+    The output budget and EOS are enforced inside the cache transaction. A
+    cheap reference-only snapshot is retained so any unexpected verifier or
+    rollback failure can restore the pristine target state before the caller
+    falls back to ordinary T=1 decoding. Universal cross-tokenizer proposals
+    use a narrow restore-and-rerun after any partial match: a deliberately wide
+    MPS stress test proved that retaining a prefix computed inside a larger
+    batch can perturb a later greedy token. Full matches need no rollback and
+    keep the fast path.
     """
-    D = spec_decode.next_depth()
-    drafts = spec_decode.draft(ctx, D, ngram_draft)
+    validated = []
+    vocab_size = int(config.vocab_size)
+    for index, token in enumerate(drafts):
+        if isinstance(token, bool) or not isinstance(token, int):
+            raise TypeError(
+                f"{source} draft {index} must be an integer token ID"
+            )
+        if not 0 <= token < vocab_size:
+            raise ValueError(
+                f"{source} draft {index} is outside vocabulary: {token}"
+            )
+        validated.append(token)
+    drafts = validated
     if not drafts:
-        logits = forward_pass(layers, cache, embed([pending]), step=s, verbose=False)
-        tok = int(logits[0, -1].argmax())
-        spec_decode.record(0, 0, 1)
-        return [tok], " spec-nodraft"
-
+        raise ValueError("exact draft verifier requires at least one draft")
+    if len(drafts) > MAX_EXACT_DRAFTS:
+        raise ValueError(
+            f"exact draft verifier supports at most "
+            f"{MAX_EXACT_DRAFTS} drafts"
+        )
+    if (
+        isinstance(pending, bool)
+        or not isinstance(pending, int)
+        or not 0 <= pending < vocab_size
+    ):
+        raise ValueError(f"invalid pending token ID: {pending!r}")
+    remaining = int(remaining)
+    if remaining < 1:
+        raise ValueError("remaining output budget must be positive")
+    inputs = [int(pending), *drafts]
     rerun = spec_decode.ROLLBACK == "rerun"
-    snap = snapshot_states(cache) if rerun else None
+    safe_partial_rerun = rerun or source == "uag"
+    snap = snapshot_states(cache)
     mla_len = spec_decode.snapshot_mla(cache, NL)
     replay_armed = False
     try:
-        if not rerun:
-            # Replay consumes the captured KDA inputs. The reference rerun path
-            # restores the pre-pass tensor objects and re-executes instead, so
-            # arming there only pins hundreds of MiB without being read.
+        if not safe_partial_rerun:
             spec_decode.arm()
             replay_armed = True
-        logits = forward_pass(layers, cache, embed([pending] + drafts),
-                              step=s, verbose=False)
-        argm = logits[0].argmax(-1).tolist()      # one device sync, D+1 entries
-        k = 0
-        while k < len(drafts) and argm[k] == drafts[k]:
-            k += 1
-        new = argm[:k + 1]
-        if k < len(drafts) and not rerun:
-            spec_decode.rollback_replay(cache, k + 1, mla_len)
+        logits = forward_pass(
+            layers, cache, embed(inputs), step=s, verbose=False
+        )
+        # One device-to-host handoff for the complete verifier decision.
+        argm = [
+            int(token)
+            for token in logits[0].argmax(-1).tolist()
+        ]
+        if len(argm) != len(inputs):
+            raise RuntimeError(
+                f"{source} verifier returned {len(argm)} rows for "
+                f"{len(inputs)} inputs"
+            )
+        accepted = 0
+        while (
+            accepted < len(drafts)
+            and argm[accepted] == drafts[accepted]
+        ):
+            accepted += 1
+        keep = min(accepted + 1, remaining)
+        try:
+            eos_index = argm[:accepted + 1].index(EOS_ID)
+        except ValueError:
+            pass
+        else:
+            keep = min(keep, eos_index + 1)
+        new = argm[:keep]
+
+        if keep < len(inputs):
+            if safe_partial_rerun:
+                # Restore and re-feed the pending token plus every emitted
+                # token except the last, which is precisely the next pending
+                # token and therefore must not yet be present in the cache.
+                # UAG always takes this branch on a partial match. It costs an
+                # extra target pass only when a proposal misses, while keeping
+                # successful full-accept passes free of replay capture.
+                restore_states(cache, snap)
+                spec_decode.STATS["reruns"] += 1
+                rerun_logits = forward_pass(
+                    layers,
+                    cache,
+                    embed([int(pending), *new[:-1]]),
+                    step=s,
+                    verbose=False,
+                )
+                rerun_ids = [
+                    int(token)
+                    for token in rerun_logits[0].argmax(-1).tolist()
+                ]
+                if rerun_ids != new:
+                    raise RuntimeError(
+                        f"{source} narrow rerun changed verifier decisions"
+                    )
+            else:
+                spec_decode.rollback_replay(cache, keep, mla_len)
+    except BaseException:
+        if replay_armed:
+            spec_decode.release()
+            replay_armed = False
+        try:
+            restore_states(cache, snap)
+        except BaseException as restore_error:
+            raise ExactVerifierRestoreError(
+                f"{source} verifier failed and target-cache restoration "
+                "also failed; refusing to continue generation"
+            ) from restore_error
+        raise
     finally:
         if replay_armed:
             spec_decode.release()
-    if k < len(drafts) and rerun:
-        # Reference path: back to the pre-pass state with the certified
-        # whole-tensor restore, then re-feed exactly the accepted tokens.
-        # Costs a second spine read; used to validate the replay path.
-        restore_states(cache, snap)
-        spec_decode.STATS["reruns"] += 1
-        forward_pass(layers, cache, embed([pending] + new[:-1]),
-                     step=s, verbose=False)
-    spec_decode.record(k, len(drafts), len(new))
-    return new, f" spec+{len(new)} ({k}/{len(drafts)} draft)"
+    committed_accepted = min(accepted, len(new))
+    if record_spec_stats:
+        spec_decode.record(
+            committed_accepted, len(drafts), len(new)
+        )
+    return (
+        new,
+        f" {source}+{len(new)} "
+        f"({committed_accepted}/{len(drafts)} draft)",
+        committed_accepted,
+    )
+
+
+def _spec_step_deep(layers, cache, embed, ctx, pending, s, remaining=None):
+    """One K3_SPEC_DEPTH>1 n-gram pass. Returns ``(new_tokens, tag)``."""
+    if remaining is not None and remaining <= 1:
+        depth = 0
+    else:
+        depth = spec_decode.next_depth()
+        if remaining is not None:
+            depth = min(depth, remaining - 1)
+    drafts = spec_decode.draft(ctx, depth, ngram_draft)
+    if not drafts:
+        logits = forward_pass(
+            layers, cache, embed([pending]), step=s, verbose=False
+        )
+        tok = int(logits[0, -1].argmax())
+        spec_decode.record(0, 0, 1)
+        return [tok], " spec-nodraft"
+    new, tag, _accepted = _verify_draft_tokens_exact(
+        layers,
+        cache,
+        embed,
+        pending,
+        drafts,
+        s,
+        remaining=(len(drafts) + 1 if remaining is None else remaining),
+        source="spec",
+        record_spec_stats=True,
+    )
+    return new, tag
 
 
 def _generation_runtime(fn):
@@ -1882,8 +2301,18 @@ def _generation_runtime(fn):
 
 
 @_generation_runtime
-def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
-             verbose_prefill=False, log=lambda *a: None):
+def generate(
+    layers,
+    cache,
+    embed,
+    ids,
+    max_new,
+    spec=None,
+    on_token=None,
+    verbose_prefill=False,
+    log=None,
+    universal_drafter=None,
+):
     """Greedy generation (+ certified-lossless n-gram speculation).
 
     Shared by the CLI and the OpenAI-compatible server. Calls on_token(token_id)
@@ -1894,53 +2323,243 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
     if max_new <= 0:
         return []
     generated = []
+    # Speculation needs the complete prompt+output history. Keep one private
+    # rolling list instead of rebuilding ``ids + generated`` every pass, but
+    # do not add even this one copy to the ordinary non-speculative path.
+    history = list(ids) if spec else None
 
     def emit(t):
         generated.append(t)
+        if history is not None:
+            history.append(t)
         if on_token:
             on_token(t)
 
     _step_ctx["step"] = 0
-    logits = forward_pass(layers, cache, embed(ids), step=0, verbose=verbose_prefill)
+    logits = forward_pass(
+        layers,
+        cache,
+        embed(ids),
+        step=0,
+        verbose=verbose_prefill,
+    )
     first = int(logits[0, -1].argmax())
     emit(first)
     if first == EOS_ID:
         return generated
     for _k in EXPERT_SEL:      # the union factor that matters is the decode one
         EXPERT_SEL[_k] = 0
+    if len(generated) >= max_new:
+        return generated
     s = 1
-    deep = spec and spec_decode.enabled()
+    uag_active = bool(spec and universal_drafter is not None)
+    uag_qualified = False
+    uag_consecutive_misses = 0
+    uag_probe_drafts = 2
+    uag_max_drafts = 8
+    uag_width = uag_probe_drafts
+    if uag_active:
+        try:
+            uag_probe_drafts = min(
+                MAX_EXACT_DRAFTS,
+                max(
+                    1,
+                    int(os.environ.get("K3_UAG_PROBE_DRAFTS", "2")),
+                ),
+            )
+            uag_max_drafts = min(
+                MAX_EXACT_DRAFTS,
+                max(
+                    uag_probe_drafts,
+                    int(os.environ.get("K3_UAG_MAX_DRAFTS", "8")),
+                ),
+            )
+            uag_width = uag_probe_drafts
+        except ValueError as exc:
+            raise ValueError(
+                "K3_UAG draft policy values must be integers"
+            ) from exc
+    deep = (
+        spec
+        and spec_decode.enabled()
+        and not uag_active
+    )
+    # The default threaded-pread reader intentionally handles prefetch at the
+    # layer boundary; its whole-token helper is a guaranteed no-op. Avoid both
+    # the Python call and even the environment lookup in that configuration.
+    prefetch_enabled = (
+        not PREAD and os.environ.get("K3_PREFETCH", "1") == "1"
+    )
     while len(generated) < max_new:
         _step_ctx["step"] = s
-        if os.environ.get("K3_PREFETCH", "1") == "1":
+        if prefetch_enabled:
             prefetch_prev_token()
-        t0 = time.perf_counter_ns()
+        # The server does not request step logs. Avoid a clock read on every
+        # pass when no consumer can observe it.
+        t0 = time.perf_counter_ns() if log is not None else 0
         tag = ""
-        if deep:
-            new, tag = _spec_step_deep(layers, cache, embed,
-                                       ids + generated, generated[-1], s)
-            if EOS_ID in new:   # never stream past EOS (a pass emits up to D+1)
-                new = new[:new.index(EOS_ID) + 1]
-        else:
-            draft = ngram_draft(ids + generated) if spec else None
-            if draft is not None:
-                snap = snapshot_states(cache)
-                logits = forward_pass(layers, cache, embed([generated[-1], draft]),
-                                      step=s, verbose=False)
-                # Read both verifier decisions in one device-to-host transfer.
-                # The first position decides accept/rollback; on acceptance the
-                # second ID is already present instead of forcing another sync.
-                verified = logits[0].argmax(-1).tolist()
-                n1 = verified[0]
-                if n1 == draft:
-                    new = verified[:2]
-                    tag = " spec+2"
-                else:
-                    restore_states(cache, snap)
-                    logits = forward_pass(layers, cache, embed([generated[-1]]),
-                                          step=s, verbose=False)
+        remaining = max_new - len(generated)
+        if uag_active and remaining >= 2:
+            width = min(remaining - 1, uag_width)
+            try:
+                proposal = universal_drafter.propose(history, width)
+                drafts = list(proposal.token_ids)
+                confidence_skip = (
+                    not drafts
+                    and bool(getattr(
+                        proposal, "confidence_stopped", False
+                    ))
+                )
+                if not drafts and not confidence_skip:
+                    raise RuntimeError("assistant proposed no target tokens")
+            except Exception as exc:
+                universal_drafter.failures += 1
+                uag_active = False
+                print(
+                    f"[uag] proposal failed safely "
+                    f"({type(exc).__name__}: {exc}); using target-only decode "
+                    "for the rest of this request",
+                    flush=True,
+                )
+                logits = forward_pass(
+                    layers,
+                    cache,
+                    embed([generated[-1]]),
+                    step=s,
+                    verbose=False,
+                )
+                new = [int(logits[0, -1].argmax())]
+                tag = " uag-off"
+            else:
+                if confidence_skip:
+                    # A low-confidence assistant token is evidence *against*
+                    # paying for a wide verifier. Decode one ordinary target
+                    # token, but retain request-local qualification: the next
+                    # position can immediately use a wide proposal again.
+                    logits = forward_pass(
+                        layers,
+                        cache,
+                        embed([generated[-1]]),
+                        step=s,
+                        verbose=False,
+                    )
                     new = [int(logits[0, -1].argmax())]
-                    tag = " spec-miss"
+                    tag = " uag-confidence-skip"
+                else:
+                    try:
+                        new, tag, accepted = _verify_draft_tokens_exact(
+                            layers,
+                            cache,
+                            embed,
+                            generated[-1],
+                            drafts,
+                            s,
+                            remaining=remaining,
+                            source="uag",
+                        )
+                    except ExactVerifierRestoreError:
+                        raise
+                    except Exception as exc:
+                        universal_drafter.failures += 1
+                        uag_active = False
+                        print(
+                            f"[uag] verifier failed safely "
+                            f"({type(exc).__name__}: {exc}); restored target "
+                            "state and disabled drafts for this request",
+                            flush=True,
+                        )
+                        logits = forward_pass(
+                            layers,
+                            cache,
+                            embed([generated[-1]]),
+                            step=s,
+                            verbose=False,
+                        )
+                        new = [int(logits[0, -1].argmax())]
+                        tag = " uag-off"
+                    else:
+                        # The target cache and ``new`` are committed now.
+                        # Optional bookkeeping may disable later proposals,
+                        # but it must never re-feed the old pending token.
+                        try:
+                            universal_drafter.record_verified(
+                                accepted, len(new)
+                            )
+                            if accepted == 0:
+                                uag_consecutive_misses += 1
+                            else:
+                                uag_consecutive_misses = 0
+                            if not uag_qualified:
+                                if (
+                                    accepted == len(drafts)
+                                    and accepted >= 2
+                                ):
+                                    uag_qualified = True
+                                    uag_width = uag_max_drafts
+                                    tag += " qualified"
+                                elif accepted == 0:
+                                    uag_active = False
+                                    tag += " disabled"
+                                else:
+                                    uag_width = uag_probe_drafts
+                                    tag += " probing"
+                            elif accepted == len(drafts):
+                                uag_width = uag_max_drafts
+                            elif accepted == 0:
+                                if uag_consecutive_misses >= 2:
+                                    uag_active = False
+                                    tag += " disabled"
+                                else:
+                                    uag_width = uag_probe_drafts
+                                    tag += " reprobe"
+                            else:
+                                uag_width = max(
+                                    uag_probe_drafts,
+                                    min(uag_max_drafts, 2 * accepted),
+                                )
+                        except Exception as exc:
+                            universal_drafter.failures += 1
+                            uag_active = False
+                            tag += " bookkeeping-off"
+                            print(
+                                f"[uag] post-verifier bookkeeping failed "
+                                f"({type(exc).__name__}: {exc}); keeping "
+                                "certified tokens and disabling future drafts",
+                                flush=True,
+                            )
+        elif uag_active:
+            # There is no room for a draft plus a verifier bonus. Finish with
+            # the ordinary target and leave the reusable assistant resident.
+            logits = forward_pass(
+                layers,
+                cache,
+                embed([generated[-1]]),
+                step=s,
+                verbose=False,
+            )
+            new = [int(logits[0, -1].argmax())]
+            tag = " uag-tail"
+        elif deep:
+            new, tag = _spec_step_deep(layers, cache, embed,
+                                       history, generated[-1], s, remaining)
+        else:
+            draft = (
+                ngram_draft(history)
+                if spec and remaining >= 2
+                else None
+            )
+            if draft is not None:
+                new, tag, _accepted = _verify_draft_tokens_exact(
+                    layers,
+                    cache,
+                    embed,
+                    generated[-1],
+                    [draft],
+                    s,
+                    remaining=remaining,
+                    source="spec",
+                    record_spec_stats=True,
+                )
             else:
                 logits = forward_pass(layers, cache, embed([generated[-1]]),
                                       step=s, verbose=False)
@@ -1948,10 +2567,16 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
         # A verifier can accept several tokens in one pass. Bound the burst
         # before invoking callbacks or structured logging so max_new remains a
         # real API contract and throughput cannot be inflated by over-emission.
+        if EOS_ID in new:
+            new = new[:new.index(EOS_ID) + 1]
         new = new[:max_new - len(generated)]
         for t in new:
             emit(t)
-        log(s, tag, t0, list(generated))
+        if log is not None:
+            # A callback may retain or mutate its argument; keep the generation
+            # state private while avoiding this snapshot entirely when no
+            # logger was requested (the OpenAI server's normal path).
+            log(s, tag, t0, list(generated))
         s += 1
         if EOS_ID in new:
             break
@@ -1997,20 +2622,32 @@ def check_expert_pool():
     print("=" * 72, flush=True)
 
 
-def main():
+def _build_cli_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--max-new", type=int, default=None,
                     help="cap on generated tokens; default: run until the model "
                          "finishes (chat mode) or until Ctrl-C — both stop cleanly")
     ap.add_argument("--chat", action="store_true", help="use the K3 chat template")
+    ap.add_argument(
+        "--stats",
+        action="store_true",
+        help="show live cumulative decode speed and draft acceptance",
+    )
     ap.add_argument("--events-jsonl",
                     help="write an exclusive, flushed JSONL run-event stream "
                          "(used by tools/bench.py)")
+    return ap
+
+
+def main():
+    ap = _build_cli_parser()
     args = ap.parse_args()
     events = EventLog(args.events_jsonl)
 
     from transformers import AutoTokenizer
+    import universal_draft
+
     tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "k3-meta"), trust_remote_code=True)
     if args.chat:
         ids = tok.apply_chat_template([{"role": "user", "content": args.prompt}],
@@ -2022,6 +2659,9 @@ def main():
     max_new = (
         args.max_new if args.max_new is not None else 1_000_000
     )  # effectively: until EOS or Ctrl-C
+    universal_drafter = universal_draft.load_local_drafter(
+        ROOT, tok, DEV
+    )
     run_started_ns = time.perf_counter_ns()
     events.emit(
         "run_start",
@@ -2043,10 +2683,21 @@ def main():
             "int8_kda_stage_sync": _INT8_KDA_STAGE_SYNC_MODE,
             "int8_lm_head_requested": _INT8_LM_HEAD_REQUESTED,
             "int8_lm_head_eligible": INT8_LM_HEAD,
+            "universal_draft_requested": universal_draft.requested(),
+            "universal_draft_loaded": universal_drafter is not None,
             "packed_q8_backend": _PACKED_Q8_BACKEND.status(),
             "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
             "preload": PRELOAD,
             "pin_layers": PIN_N,
+            "spine_stream_nocache": _SPINE_STREAM_NOCACHE,
+            "spine_resident_layers": len(_rset),
+            "spine_resident_bytes": _rbytes,
+            "spine_cache_policy": _SPINE_CACHE_POLICY,
+            "spine_reader_threads": spine_fast.READ_THREADS,
+            "spine_reader_fdcache": spine_io.FDCACHE,
+            "spine_reader_chunk_bytes": spine_io.CHUNK,
+            "spine_reader_auto_tuned": _SPINE_READER_AUTO_TUNED,
+            "spine_reader_policy": _SPINE_READER_POLICY,
             "fast_moe": FAST_MOE,
             "moe_backend": MOE_BACKEND,
             "moe_top_k": MOE_TOP_K,
@@ -2072,6 +2723,9 @@ def main():
     generated = []   # mirrored via on_token so Ctrl-C still has the text
     stream_decoder = IncrementalTokenDecoder(tok)
     step_deltas = []
+    # Keep the ordinary benchmark path free of formatter calls and status
+    # snapshots; the display is strictly opt-in.
+    live_stats = LiveDecodeStats(True) if args.stats else None
 
     def on_token(t):
         generated.append(t)
@@ -2086,6 +2740,11 @@ def main():
                         emitted_token_ids=[t], emitted_token_text=[text])
             print(f"[prefill done in {duration_ns/1e9:.6f}s] "
                   f"first token: {t!r} = {delta!r}", flush=True)
+            if live_stats is not None:
+                print(
+                    live_stats.record_prefill(duration_ns, len(ids)),
+                    flush=True,
+                )
             step_deltas.clear()
 
     def log(s, tag, t0, gen):
@@ -2104,12 +2763,33 @@ def main():
                         cumulative_token_ids=gen, cumulative_text=tok.decode(gen))
         print(f"[token {s}: {duration_ns/1e9:.6f}s{tag}] "
               f"+{delta!r}", flush=True)
+        if live_stats is not None:
+            print(
+                live_stats.record_decode(
+                    duration_ns,
+                    len(emitted),
+                    (
+                        universal_drafter.status()
+                        if universal_drafter is not None else None
+                    ),
+                ),
+                flush=True,
+            )
         print("   ", k3loader.cache_report(), flush=True)
 
     status = "ok"
     try:
-        generate(layers, cache, embed, ids, max_new,
-                 on_token=on_token, verbose_prefill=True, log=log)
+        generate(
+            layers,
+            cache,
+            embed,
+            ids,
+            max_new,
+            on_token=on_token,
+            verbose_prefill=True,
+            log=log,
+            universal_drafter=universal_drafter,
+        )
     except KeyboardInterrupt:
         status = "interrupted"
         print("\n[stopped by Ctrl-C]", flush=True)
@@ -2137,6 +2817,21 @@ def main():
     rep = spec_decode.report()
     if rep:
         print(rep)
+    if universal_drafter is not None:
+        uag = universal_drafter.status()
+        draft_rate = (
+            uag["accepted_drafts"] / uag["target_drafts"]
+            if uag["target_drafts"]
+            else 0.0
+        )
+        print(
+            f"[uag] proposals {uag['proposals']} | "
+            f"tokens {uag['emitted_tokens']} | drafts "
+            f"{uag['accepted_drafts']}/{uag['target_drafts']} accepted "
+            f"({draft_rate*100:.0f}%) | assistant "
+            f"{uag['assistant_tokens']} tokens in {uag['seconds']:.2f}s | "
+            f"failures {uag['failures']}"
+        )
     es = EXPERT_SEL
     if es["layer_calls"]:
         tk = config.num_experts_per_token
@@ -2153,10 +2848,17 @@ def main():
                 runtime={
                     "int8_kda_qkv": _int8_kda_qkv_runtime_status(),
                     "int8_lm_head": _lm_head_runtime_status(),
+                    "universal_draft": (
+                        universal_drafter.status()
+                        if universal_drafter is not None
+                        else None
+                    ),
                     "mla_cpu_sdpa": attn_fast.cpu_sdpa_status(),
                 })
     events.close()
     print(f"total {duration_ns/1e9:.6f}s | times {TIMES}")
+    if live_stats is not None:
+        print(live_stats.final_line(duration_ns), flush=True)
     print(k3loader.cache_report())
     TRACE.close()
 
