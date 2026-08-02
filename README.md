@@ -2,10 +2,10 @@
 
 ```
  ____       _ _         __ _
-  |  _ \  ___| | |_ __ _ / _(_)_ __
-  | | | |/ _ \ | __/ _` | |_| | '_ \
-  | |_| |  __/ | || (_| |  _| | | | |
-  |____/ \___|_|\__\__,_|_| |_|_| |_|
+   |  _ \  ___| | |_ __ _ / _(_)_ __
+   | | | |/ _ \ | __/ _` | |_| | '_ \
+   | |_| |  __/ | || (_| |  _| | | | |
+   |____/ \___|_|\__\__,_|_| |_|_| |_|
 ```
 
 ## Run the *full, never-pruned* 2.8-trillion-parameter [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) on consumer hardware, as "fast" as possible
