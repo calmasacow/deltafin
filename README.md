@@ -1,7 +1,7 @@
 <div align="center">
 
 ```
-  ____       _ _         __ _
+ ____       _ _         __ _
  |  _ \  ___| | |_ __ _ / _(_)_ __
  | | | |/ _ \ | __/ _` | |_| | '_ \
  | |_| |  __/ | || (_| |  _| | | | |
@@ -10,17 +10,17 @@
 
 ## Run the *full, never-pruned* 2.8-trillion-parameter [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) on consumer hardware, as "fast" as possible
 
+</div>
+
 Deltafin is a single native binary that runs full Kimi K3. Nothing pruned. Nothing skipped. K3 decides every token.
 
 All 16 experts, every single token. No shortcuts, no "close enough." The expert bank is nearly the whole model, and it's exactly what Moonshot shipped.
 
 The quality rule is simple: **K3 itself decides every token**, and nobody else. Small draft models are allowed to guess ahead (that's where much of the speed comes from), but K3 checks every guess, and nothing reaches you without its official sign-off.
 
-</div>
-
 ### Latest Benchmarks on an M1 Max laptop
 
-* 0.2847 token/s (3.512 s/token) — 7.0% higher throughput
+* 0.2847 token/s (3.512 s/token) — 7.0% higher throughput than last update
 
 #### Historical M1 benchmarks:
 
