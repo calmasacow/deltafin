@@ -16,6 +16,8 @@ All 16 experts, every single token. No shortcuts, no "close enough." The expert 
 
 The quality rule is simple: **K3 itself decides every token**, and nobody else. Small draft models are allowed to guess ahead (that's where much of the speed comes from), but K3 checks every guess, and nothing reaches you without its official sign-off.
 
+</div>
+
 ### Latest Benchmarks on an M1 Max laptop
 
 * 0.2847 token/s (3.512 s/token) — 7.0% higher throughput
@@ -26,6 +28,8 @@ The quality rule is simple: **K3 itself decides every token**, and nobody else. 
 * 0.1311 token/s (July 28, 2026) — 829.8% higher throughput
 * 0.0141 token/s (July 27, 2026)
 
+
+<div align="center">
 
 ![model](https://img.shields.io/badge/model-Kimi_K3_·_2.8T_MoE-blueviolet)
 ![platforms](https://img.shields.io/badge/platforms-macOS_arm64_·_Linux_x86--64%2Faarch64-informational)
