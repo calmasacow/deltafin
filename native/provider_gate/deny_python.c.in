@@ -1,0 +1,21 @@
+#include <stdio.h>
+
+/*
+ * This tiny native executable is deliberately installed under every standard
+ * Python interpreter name in the provider build's private PATH. The native
+ * Rust build owns this guard directly; the optional development CMake graph
+ * reuses the same source. Any attempted interpreter launch leaves an auditable
+ * marker even when the caller ignores the child exit status.
+ */
+int main(void) {
+  FILE* marker = fopen("@DELTAFIN_PYTHON_DENY_MARKER_C@", "wb");
+  if (marker != NULL) {
+    (void)fputs("forbidden-python-build-invocation\n", marker);
+    (void)fclose(marker);
+  }
+  (void)fputs(
+      "Deltafin forbids Python execution while configuring or compiling the "
+      "native provider.\n",
+      stderr);
+  return 86;
+}

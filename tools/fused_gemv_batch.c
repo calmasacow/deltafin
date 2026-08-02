@@ -13,7 +13,9 @@
 //
 // Build:
 //   clang -O3 -mcpu=native -shared -DNO_MAIN -o libmxfp4batch.dylib fused_gemv_batch.c -lpthread
-//   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4batch.so fused_gemv_batch.c -lpthread -lm
+//   cc -O3 -mcpu=native -fPIC -shared -DNO_MAIN -o libmxfp4batch.so fused_gemv_batch.c -lpthread -lm  # Linux arm64
+//   Linux x86-64 adds: -march=x86-64 -mtune=generic -mssse3 -mavx -mfma
+//   cc -O3 [flags above] -fPIC -shared -DNO_MAIN -o libmxfp4batch.so fused_gemv_batch.c -lpthread -lm
 //
 // Exports:
 //   int  mxfp4_pool_init(int nthreads)      // idempotent; rebuilds if size changed
@@ -45,12 +47,14 @@ typedef struct {
     // --- K3_JOB_GEMV ---
     const uint8_t *const *P;
     const uint8_t *const *S;
+    const uint32_t *const *T; // scale-table-v2 tables; NULL for raw E8M0
     const float   *const *X;
     const float *XP[K3_MAX_MATS]; // AVX2-prepared activations, owned by batch scratch
     float        *const *Y;
     const int *rows, *cols;
     int n_mats;
     int use_avx2;
+    int scale4;
     int cum[K3_MAX_MATS + 1];   // cum[m] = first unit index of matrix m
     // --- K3_JOB_SITU ---
     const float *gu;            // [n_ex][2][d_ff] interleaved gate,up
@@ -188,13 +192,27 @@ static void k3_run_units(void) {
             k3_unit_gemv(j, u, &m, &r0, &r1);
 #if MXFP4_CAN_BUILD_AVX2
             if (j->use_avx2) {
-                mxfp4_gemv_rows2_avx2_prepared(
-                    j->P[m], j->S[m], j->XP[m], j->Y[m],
-                    r0, r1, j->cols[m]);
+                if (j->scale4) {
+                    mxfp4_gemv_rows2_scale4_avx2_prepared(
+                        j->P[m], j->S[m], j->T[m], j->XP[m], j->Y[m],
+                        r0, r1, j->cols[m]);
+                } else {
+                    mxfp4_gemv_rows2_avx2_prepared(
+                        j->P[m], j->S[m], j->XP[m], j->Y[m],
+                        r0, r1, j->cols[m]);
+                }
                 continue;
             }
 #endif
-            mxfp4_gemv_rows2(j->P[m], j->S[m], j->X[m], j->Y[m], r0, r1, j->cols[m]);
+            if (j->scale4) {
+                mxfp4_gemv_rows2_scale4(
+                    j->P[m], j->S[m], j->T[m], j->X[m], j->Y[m],
+                    r0, r1, j->cols[m]);
+            } else {
+                mxfp4_gemv_rows2(
+                    j->P[m], j->S[m], j->X[m], j->Y[m],
+                    r0, r1, j->cols[m]);
+            }
         }
     } else {
         while ((u = atomic_fetch_add_explicit(&g_cursor, 1, memory_order_relaxed)) < n) {
@@ -347,17 +365,21 @@ static void k3_dispatch(void) {
 // Matrix m computes ys[m][r] = dot(W_m[r,:], xs[m]) for r in [0, rows[m]).
 // One dispatch for the whole batch; rows are work-stolen across all matrices, so a
 // short matrix cannot leave a thread idle at the tail.
-void mxfp4_gemv_batch(const uint8_t *const *packed, const uint8_t *const *scales,
-                      const float *const *xs, float *const *ys,
-                      const int *rows, const int *cols, int n_mats, int nthreads) {
+static void k3_gemv_batch_impl(
+        const uint8_t *const *packed, const uint8_t *const *scales,
+        const uint32_t *const *tables, int scale4,
+        const float *const *xs, float *const *ys,
+        const int *rows, const int *cols, int n_mats, int nthreads) {
     if (n_mats <= 0) return;
     if (n_mats > K3_MAX_MATS) n_mats = K3_MAX_MATS;
     mxfp4_pool_init(nthreads);
     pthread_mutex_lock(&g_api);
     g_job.kind = K3_JOB_GEMV;
-    g_job.P = packed; g_job.S = scales; g_job.X = xs; g_job.Y = ys;
+    g_job.P = packed; g_job.S = scales; g_job.T = tables;
+    g_job.X = xs; g_job.Y = ys;
     g_job.rows = rows; g_job.cols = cols; g_job.n_mats = n_mats;
     g_job.use_avx2 = 0;
+    g_job.scale4 = scale4;
     g_last_x_permutations = 0;
 #if MXFP4_CAN_BUILD_AVX2
     if (mxfp4_have_avx2())
@@ -372,6 +394,27 @@ void mxfp4_gemv_batch(const uint8_t *const *packed, const uint8_t *const *scales
     g_job.n_units = c;
     k3_dispatch();
     pthread_mutex_unlock(&g_api);
+}
+
+void mxfp4_gemv_batch(const uint8_t *const *packed, const uint8_t *const *scales,
+                      const float *const *xs, float *const *ys,
+                      const int *rows, const int *cols, int n_mats, int nthreads) {
+    k3_gemv_batch_impl(
+        packed, scales, NULL, 0,
+        xs, ys, rows, cols, n_mats, nthreads);
+}
+
+// Additive compact-scale batch entry point. Every table points at 16 canonical
+// uint32 exponent-bit words from that matrix's scale-table-v2 descriptor.
+void mxfp4_gemv_batch_scale4(
+        const uint8_t *const *packed, const uint8_t *const *scales4,
+        const uint32_t *const *tables,
+        const float *const *xs, float *const *ys,
+        const int *rows, const int *cols, int n_mats, int nthreads) {
+    if (!tables) return;
+    k3_gemv_batch_impl(
+        packed, scales4, tables, 1,
+        xs, ys, rows, cols, n_mats, nthreads);
 }
 
 // Requested shape: n_mats matrices that all consume the SAME x (this is exactly the

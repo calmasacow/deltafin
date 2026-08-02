@@ -31,3 +31,6 @@ Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li, MIT License.
 The Kimi K3 modeling code (fetched at setup into tools/k3pkg/ and k3-meta/,
 never vendored in this repository) is Copyright Moonshot AI and distributed
 under Moonshot AI's own license via https://huggingface.co/moonshotai/Kimi-K3.
+
+Additional dependency, model-checkpoint, source-reference, and distribution
+boundaries are recorded in docs/THIRD_PARTY_NOTICES.md.

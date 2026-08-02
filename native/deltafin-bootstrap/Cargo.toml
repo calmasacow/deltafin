@@ -1,0 +1,14 @@
+[package]
+name = "deltafin-bootstrap"
+version = "0.1.0"
+description = "Python-free installer for Deltafin's pinned native PyTorch runtime"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+curl = { version = "=0.4.50", default-features = false, features = ["force-system-lib-on-osx"] }
+sha2 = "=0.10.9"
+zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

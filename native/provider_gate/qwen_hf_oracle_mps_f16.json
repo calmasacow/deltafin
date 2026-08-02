@@ -1,0 +1,482 @@
+{
+  "schema": "deltafin.qwen-hf-oracle.v1",
+  "authority": "Transformers generate; not the native provider under test",
+  "repository": "Qwen/Qwen3-0.6B-Base",
+  "revision": "da87bfb608c14b7cf20ba1ce41287e8de496c0cd",
+  "digests": {
+    "model.safetensors": "cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba",
+    "config.json": "504a6b58c4271583724e66584b6b7698aea18450209df6b2f7582df0e89cee59",
+    "tokenizer.json": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+  },
+  "transformers": "4.56.2",
+  "torch": "2.13.0",
+  "device": "mps",
+  "dtype": "float16",
+  "attention_implementation": "sdpa",
+  "generation": {
+    "do_sample": false,
+    "use_cache": true,
+    "pad_token_id": 151643,
+    "return_dict_in_generate": true,
+    "output_scores": true
+  },
+  "cases": [
+    {
+      "name": "paris",
+      "text": "The capital of France is Paris",
+      "input_ids": [
+        785,
+        6722,
+        315,
+        9625,
+        374,
+        12095
+      ],
+      "maximum_new_tokens": 4,
+      "generated_ids": [
+        13,
+        576,
+        6722,
+        315
+      ],
+      "probabilities": [
+        0.4268966019153595,
+        0.1413777619600296,
+        0.6068952083587646,
+        0.9655061364173889
+      ],
+      "probability_f32_bits": [
+        "0x3eda9231",
+        "0x3e10c555",
+        "0x3f1b5d7c",
+        "0x3f772b69"
+      ],
+      "top2_ids": [
+        [
+          13,
+          11
+        ],
+        [
+          576,
+          1084
+        ],
+        [
+          6722,
+          7772
+        ],
+        [
+          315,
+          3283
+        ]
+      ],
+      "top2_logit_f32_bits": [
+        [
+          "0x41b5c000",
+          "0x41b4c000"
+        ],
+        [
+          "0x41934000",
+          "0x41902000"
+        ],
+        [
+          "0x41c3a000",
+          "0x41aca000"
+        ],
+        [
+          "0x41cda000",
+          "0x41ad6000"
+        ]
+      ],
+      "top1_minus_top2_f32_bits": [
+        "0x3e000000",
+        "0x3ec80000",
+        "0x40380000",
+        "0x40810000"
+      ]
+    },
+    {
+      "name": "single_token",
+      "text": "Hello",
+      "input_ids": [
+        9707
+      ],
+      "maximum_new_tokens": 4,
+      "generated_ids": [
+        11,
+        358,
+        1079,
+        264
+      ],
+      "probabilities": [
+        0.1447768211364746,
+        0.3617859184741974,
+        0.23142729699611664,
+        0.20035088062286377
+      ],
+      "probability_f32_bits": [
+        "0x3e144060",
+        "0x3eb93c01",
+        "0x3e6cfb47",
+        "0x3e4d28c8"
+      ],
+      "top2_ids": [
+        [
+          11,
+          0
+        ],
+        [
+          358,
+          847
+        ],
+        [
+          1079,
+          2776
+        ],
+        [
+          264,
+          4460
+        ]
+      ],
+      "top2_logit_f32_bits": [
+        [
+          "0x4136c000",
+          "0x41290000"
+        ],
+        [
+          "0x419e4000",
+          "0x418fa000"
+        ],
+        [
+          "0x41ab4000",
+          "0x41aa0000"
+        ],
+        [
+          "0x41ae6000",
+          "0x41a5a000"
+        ]
+      ],
+      "top1_minus_top2_f32_bits": [
+        "0x3f5c0000",
+        "0x3fea0000",
+        "0x3e200000",
+        "0x3f8c0000"
+      ]
+    },
+    {
+      "name": "unicode_multiline_code",
+      "text": "Explain π briefly.\n```rust\nfn main() { println!(\"hello\"); }\n```",
+      "input_ids": [
+        840,
+        20772,
+        51745,
+        26753,
+        624,
+        73594,
+        35788,
+        198,
+        8822,
+        1887,
+        368,
+        314,
+        13751,
+        17223,
+        14990,
+        5038,
+        456,
+        73594
+      ],
+      "maximum_new_tokens": 4,
+      "generated_ids": [
+        151643
+      ],
+      "probabilities": [
+        0.43895745277404785
+      ],
+      "probability_f32_bits": [
+        "0x3ee0bf08"
+      ],
+      "top2_ids": [
+        [
+          151643,
+          198
+        ]
+      ],
+      "top2_logit_f32_bits": [
+        [
+          "0x418fc000",
+          "0x418d6000"
+        ]
+      ],
+      "top1_minus_top2_f32_bits": [
+        "0x3e980000"
+      ]
+    },
+    {
+      "name": "long_batched_prefill",
+      "text": "Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet. Paris is in France; Jupiter is a planet.",
+      "input_ids": [
+        59604,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13,
+        12095,
+        374,
+        304,
+        9625,
+        26,
+        49689,
+        374,
+        264,
+        11580,
+        13
+      ],
+      "maximum_new_tokens": 4,
+      "generated_ids": [
+        12095,
+        374,
+        304,
+        9625
+      ],
+      "probabilities": [
+        0.9892511367797852,
+        0.9997501969337463,
+        0.9997521042823792,
+        0.9993174076080322
+      ],
+      "probability_f32_bits": [
+        "0x3f7d3f90",
+        "0x3f7fefa1",
+        "0x3f7fefc1",
+        "0x3f7fd344"
+      ],
+      "top2_ids": [
+        [
+          12095,
+          151643
+        ],
+        [
+          374,
+          151643
+        ],
+        [
+          304,
+          151643
+        ],
+        [
+          9625,
+          8585
+        ]
+      ],
+      "top2_logit_f32_bits": [
+        [
+          "0x41c44000",
+          "0x41972000"
+        ],
+        [
+          "0x41e82000",
+          "0x419ba000"
+        ],
+        [
+          "0x41ebe000",
+          "0x419cc000"
+        ],
+        [
+          "0x41ee4000",
+          "0x41b00000"
+        ]
+      ],
+      "top1_minus_top2_f32_bits": [
+        "0x40b48000",
+        "0x41190000",
+        "0x411e4000",
+        "0x40f90000"
+      ]
+    }
+  ]
+}

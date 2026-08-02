@@ -1,0 +1,53 @@
+name: Native source policy
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-source-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publication-policy:
+    name: Compiled-only source archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit tracked inputs and interpreter boundary
+        run: >-
+          cargo test --locked -p deltafin --no-default-features
+          --test publication_policy
+          --test interpreter_boundary_policy
+          --test release_policy
+
+  native-build:
+    name: Native build (${{ matrix.os }})
+    needs: publication-policy
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the offline Metal compiler
+        if: runner.os == 'macOS'
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Build the complete native product from the checked-out archive
+        run: cargo build --locked --release
+      - name: Execute the compiled CLI
+        run: ./target/release/deltafin --version
+      - name: Audit the linked runtime and provider canaries
+        run: ./target/release/deltafin doctor --runtime-only
+      - name: Run the complete native Rust runtime suite
+        run: cargo test --locked --release -p deltafin --lib
+      - name: Exercise every compiled CLI help surface
+        run: cargo test --locked --release -p deltafin --test cli_command_matrix
+      - name: Run the declarative compiled-provider gate
+        run: cargo run --locked --release -p deltafin-xtask -- native-test all

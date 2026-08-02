@@ -10,8 +10,7 @@
 // Linux aarch64:
 //   cc -O3 -march=native -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
 // Linux x86-64 (runtime AVX2 dispatch, exact AVX/FMA3/SSSE3 baseline):
-//   cc -O3 -march=x86-64 -mtune=native -msse3 -mssse3 -mavx -mfma \
-//      -fPIC -shared -DNO_MAIN -o libmxfp4gemv.so fused_gemv.c -lpthread -lm
+//   add -march=x86-64 -mtune=generic -mssse3 -mavx -mfma to the command above
 
 #if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -55,7 +54,7 @@
 // x86 builds deliberately keep AVX2 inside target-attributed functions.  The
 // rest of the shared object needs only the exact 128-bit compatibility ISA, so
 // one binary can run on pre-AVX2 FMA hosts and select AVX2 at runtime.  This
-// requires GCC/Clang, which are also the compilers supported by build_native.py.
+// requires GCC/Clang, which are admitted by the shared Rust native build graph.
 #if defined(MXFP4_ARCH_X86_64) \
         && (defined(__GNUC__) || defined(__clang__))
 #define MXFP4_CAN_BUILD_AVX2 1
@@ -414,6 +413,72 @@ void mxfp4_gemv_rows2(const uint8_t *restrict p, const uint8_t *restrict s,
     if (r < row1) mxfp4_gemv_rows(p, s, x, y, r, row1, cols);
 }
 
+// Compact scale-table-v2 stores two four-bit scale-table indices per byte.
+// Decode only the row pair being consumed, then reuse the established raw-E8M0
+// kernel. This leaves the raw ABI and its arithmetic completely unchanged and
+// avoids materializing an expanded scale plane for the whole expert.
+#define MXFP4_SCALE4_STACK_GROUPS 112
+
+typedef void (*gemv_fn)(
+    const uint8_t *, const uint8_t *, const float *, float *,
+    int, int, int);
+
+static inline void mxfp4_expand_scale4_row(
+        const uint8_t *restrict s4, const uint32_t *restrict scale_bits,
+        uint8_t *restrict expanded, int groups) {
+    for (int g = 0; g < groups; g++) {
+        const uint8_t pair = s4[g >> 1];
+        const unsigned index = (pair >> ((g & 1) * 4)) & 0x0Fu;
+        expanded[g] = (uint8_t)(scale_bits[index] >> 23);
+    }
+}
+
+static void mxfp4_gemv_rows2_scale4_k(
+        gemv_fn fn,
+        const uint8_t *restrict p, const uint8_t *restrict s4,
+        const uint32_t *restrict scale_bits,
+        const float *restrict x, float *restrict y,
+        int row0, int row1, int cols) {
+    const int cp = cols / 2, groups = cols / 32;
+    const int s4_stride = (groups + 1) / 2;
+    uint8_t stack_scales[2 * MXFP4_SCALE4_STACK_GROUPS];
+    uint8_t *expanded = stack_scales;
+    if (groups > MXFP4_SCALE4_STACK_GROUPS) {
+        expanded = (uint8_t *)malloc((size_t)2 * groups);
+        if (!expanded) {
+            for (int r = row0; r < row1; r++) y[r] = NAN;
+            return;
+        }
+    }
+    int r = row0;
+    for (; r + 1 < row1; r += 2) {
+        mxfp4_expand_scale4_row(
+            s4 + (size_t)r * s4_stride, scale_bits, expanded, groups);
+        mxfp4_expand_scale4_row(
+            s4 + (size_t)(r + 1) * s4_stride, scale_bits,
+            expanded + groups, groups);
+        fn(
+            p + (size_t)r * cp, expanded, x, y + r, 0, 2, cols);
+    }
+    if (r < row1) {
+        mxfp4_expand_scale4_row(
+            s4 + (size_t)r * s4_stride, scale_bits, expanded, groups);
+        fn(
+            p + (size_t)r * cp, expanded, x, y + r, 0, 1, cols);
+    }
+    if (expanded != stack_scales) free(expanded);
+}
+
+static void mxfp4_gemv_rows2_scale4(
+        const uint8_t *restrict p, const uint8_t *restrict s4,
+        const uint32_t *restrict scale_bits,
+        const float *restrict x, float *restrict y,
+        int row0, int row1, int cols) {
+    mxfp4_gemv_rows2_scale4_k(
+        mxfp4_gemv_rows2,
+        p, s4, scale_bits, x, y, row0, row1, cols);
+}
+
 #if MXFP4_CAN_BUILD_AVX2
 // ================= native 256-bit AVX2 kernel =================
 //
@@ -579,6 +644,16 @@ static MXFP4_TARGET_AVX2 void mxfp4_gemv_rows2_avx2_prepared(
     }
 }
 
+static MXFP4_TARGET_AVX2 void mxfp4_gemv_rows2_scale4_avx2_prepared(
+        const uint8_t *restrict p, const uint8_t *restrict s4,
+        const uint32_t *restrict scale_bits,
+        const float *restrict xp, float *restrict y,
+        int row0, int row1, int cols) {
+    mxfp4_gemv_rows2_scale4_k(
+        mxfp4_gemv_rows2_avx2_prepared,
+        p, s4, scale_bits, xp, y, row0, row1, cols);
+}
+
 #undef MXFP4_AVX2_GROUP
 #undef MXFP4_AVX2_TABLE
 #endif
@@ -622,7 +697,9 @@ static void dequant_neon_a(const uint8_t *restrict p, const uint8_t *restrict s,
 }
 
 // ---------------- threading ----------------
-typedef void (*gemv_fn)(const uint8_t *, const uint8_t *, const float *, float *, int, int, int);
+typedef void (*gemv_scale4_fn)(
+    const uint8_t *, const uint8_t *, const uint32_t *,
+    const float *, float *, int, int, int);
 
 typedef struct { // generic row-partition job for one gemv
     gemv_fn fn;
@@ -635,6 +712,22 @@ static void *gworker(void *arg) {
     gjob_t *j = (gjob_t *)arg;
     for (int it = 0; it < j->iters; it++)
         j->fn(j->p, j->s, j->x, j->y, j->row0, j->row1, j->cols);
+    return NULL;
+}
+
+typedef struct { // row-partition job for one compact scale-table-v2 gemv
+    gemv_scale4_fn fn;
+    const uint8_t *p, *s4; const uint32_t *scale_bits;
+    const float *x; float *y;
+    int row0, row1, cols, iters;
+} g4job_t;
+
+static void *g4worker(void *arg) {
+    mxfp4_qos_self();
+    g4job_t *j = (g4job_t *)arg;
+    for (int it = 0; it < j->iters; it++)
+        j->fn(j->p, j->s4, j->scale_bits, j->x, j->y,
+              j->row0, j->row1, j->cols);
     return NULL;
 }
 
@@ -675,6 +768,34 @@ static double run_gemv_mt_k(gemv_fn fn, const uint8_t *p, const uint8_t *s, cons
 static double run_gemv_mt(const uint8_t *p, const uint8_t *s, const float *x, float *y,
                           int rows, int cols, int nthreads, int iters) {
     return run_gemv_mt_k(mxfp4_gemv_rows2, p, s, x, y, rows, cols, nthreads, iters);
+}
+
+static double run_gemv_mt_scale4_k(
+        gemv_scale4_fn fn, const uint8_t *p, const uint8_t *s4,
+        const uint32_t *scale_bits, const float *x, float *y,
+        int rows, int cols, int nthreads, int iters) {
+    pthread_t th[MXFP4_MAX_THREADS];
+    g4job_t jobs[MXFP4_MAX_THREADS];
+    nthreads = mxfp4_clamp_threads(nthreads);
+    int per = (rows + nthreads - 1) / nthreads;
+    per = (per + 1) & ~1;
+    double t0 = now_s();
+    int made = 0;
+    for (int t = 0; t < nthreads; t++) {
+        jobs[t] = (g4job_t){
+            fn, p, s4, scale_bits, x, y, t * per,
+            (t + 1) * per > rows ? rows : (t + 1) * per, cols, iters
+        };
+        if (mxfp4_pthread_create(
+                &th[t], NULL, g4worker, &jobs[t]) != 0) break;
+        made++;
+    }
+    for (int t = 0; t < made; t++) pthread_join(th[t], NULL);
+    if (made != nthreads) {
+        for (int it = 0; it < iters; it++)
+            fn(p, s4, scale_bits, x, y, 0, rows, cols);
+    }
+    return now_s() - t0;
 }
 
 // ---- expert triple: y1=W1@x, y3=W3@x, [barrier], y2=W2@h  (h supplied; activation omitted)
@@ -785,17 +906,50 @@ void mxfp4_gemv_mt_compat(
     run_gemv_mt(p, s, x, y, rows, cols, nthreads, 1);
 }
 
+// Additive compact-scale exports. The 16 uint32 entries are canonical IEEE
+// exponent-bit words ((base + delta) << 23) from the scale-table-v2 header.
+void mxfp4_gemv_scale4_compat(
+        const uint8_t *p, const uint8_t *s4, const uint32_t *scale_bits,
+        const float *x, float *y, int rows, int cols) {
+    mxfp4_gemv_rows2_scale4(
+        p, s4, scale_bits, x, y, 0, rows, cols);
+}
+
+void mxfp4_gemv_mt_scale4_compat(
+        const uint8_t *p, const uint8_t *s4, const uint32_t *scale_bits,
+        const float *x, float *y, int rows, int cols, int nthreads) {
+    run_gemv_mt_scale4_k(
+        mxfp4_gemv_rows2_scale4,
+        p, s4, scale_bits, x, y, rows, cols, nthreads, 1);
+}
+
 // The disable-only override makes dispatch tests deterministic and provides a
 // safe diagnostic fallback.  It can never force an unsupported instruction.
+//
+// The 128-bit x86 compatibility path has its own SSSE3/AVX/FMA3 floor.  Report
+// that separately from AVX2 so the native provider can fail closed before its
+// first expert dispatch on an older x86-64 CPU. GCC/Clang's CPU feature table
+// includes the operating-system AVX state, not merely the hardware CPUID bit.
 #if MXFP4_CAN_BUILD_AVX2
 static pthread_once_t mxfp4_dispatch_once = PTHREAD_ONCE_INIT;
+static int mxfp4_dispatch_compatible = 0;
 static int mxfp4_dispatch_avx2 = 0;
 
 static void mxfp4_detect_dispatch(void) {
+    __builtin_cpu_init();
+    mxfp4_dispatch_compatible =
+        !!__builtin_cpu_supports("ssse3")
+        && !!__builtin_cpu_supports("avx")
+        && !!__builtin_cpu_supports("fma");
+    if (!mxfp4_dispatch_compatible) return;
     const char *disable = getenv("K3_MXFP4_DISABLE_AVX2");
     if (disable && disable[0] && strcmp(disable, "0") != 0) return;
-    __builtin_cpu_init();
     mxfp4_dispatch_avx2 = !!__builtin_cpu_supports("avx2");
+}
+
+int mxfp4_cpu_compatible(void) {
+    pthread_once(&mxfp4_dispatch_once, mxfp4_detect_dispatch);
+    return mxfp4_dispatch_compatible;
 }
 
 int mxfp4_have_avx2(void) {
@@ -828,7 +982,37 @@ MXFP4_TARGET_AVX2 void mxfp4_gemv_mt_avx2(
         p, s, xp, y, rows, cols, nthreads, 1);
     free(xp);
 }
+
+MXFP4_TARGET_AVX2 void mxfp4_gemv_scale4_avx2(
+        const uint8_t *p, const uint8_t *s4, const uint32_t *scale_bits,
+        const float *x, float *y, int rows, int cols) {
+    float *xp = mxfp4_prepare_x_avx2(x, cols);
+    if (!xp) {
+        mxfp4_gemv_scale4_compat(
+            p, s4, scale_bits, x, y, rows, cols);
+        return;
+    }
+    mxfp4_gemv_rows2_scale4_avx2_prepared(
+        p, s4, scale_bits, xp, y, 0, rows, cols);
+    free(xp);
+}
+
+MXFP4_TARGET_AVX2 void mxfp4_gemv_mt_scale4_avx2(
+        const uint8_t *p, const uint8_t *s4, const uint32_t *scale_bits,
+        const float *x, float *y, int rows, int cols, int nthreads) {
+    float *xp = mxfp4_prepare_x_avx2(x, cols);
+    if (!xp) {
+        mxfp4_gemv_mt_scale4_compat(
+            p, s4, scale_bits, x, y, rows, cols, nthreads);
+        return;
+    }
+    run_gemv_mt_scale4_k(
+        mxfp4_gemv_rows2_scale4_avx2_prepared,
+        p, s4, scale_bits, xp, y, rows, cols, nthreads, 1);
+    free(xp);
+}
 #else
+int mxfp4_cpu_compatible(void) { return 1; }
 int mxfp4_have_avx2(void) { return 0; }
 #endif
 
@@ -856,6 +1040,34 @@ void mxfp4_gemv_mt(
     }
 #endif
     mxfp4_gemv_mt_compat(p, s, x, y, rows, cols, nthreads);
+}
+
+void mxfp4_gemv_scale4(
+        const uint8_t *p, const uint8_t *s4, const uint32_t *scale_bits,
+        const float *x, float *y, int rows, int cols) {
+#if MXFP4_CAN_BUILD_AVX2
+    if (mxfp4_have_avx2()) {
+        mxfp4_gemv_scale4_avx2(
+            p, s4, scale_bits, x, y, rows, cols);
+        return;
+    }
+#endif
+    mxfp4_gemv_scale4_compat(
+        p, s4, scale_bits, x, y, rows, cols);
+}
+
+void mxfp4_gemv_mt_scale4(
+        const uint8_t *p, const uint8_t *s4, const uint32_t *scale_bits,
+        const float *x, float *y, int rows, int cols, int nthreads) {
+#if MXFP4_CAN_BUILD_AVX2
+    if (mxfp4_have_avx2()) {
+        mxfp4_gemv_mt_scale4_avx2(
+            p, s4, scale_bits, x, y, rows, cols, nthreads);
+        return;
+    }
+#endif
+    mxfp4_gemv_mt_scale4_compat(
+        p, s4, scale_bits, x, y, rows, cols, nthreads);
 }
 
 #ifndef NO_MAIN

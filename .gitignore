@@ -9,7 +9,10 @@
 /k3-resident*/
 /k3-draft*/
 /.k3-draft*/
+/k3-dspark/
+/k3-draft*.install.lock
 /k3-experts/
+/k3-experts-scale4/
 /k3-model/
 /k3-cache*/
 /models/
@@ -26,6 +29,7 @@
 *.sc
 *.i4
 *.s4
+*.sc4
 *.i[0-9]*
 *.s[0-9]*
 *.bf16
@@ -66,10 +70,20 @@ tools/libmxfp4gemv.dylib
 *.o
 
 # --- environments & tooling ---------------------------------
+# Downloaded native runtime toolchains; preserved across upgrades.
+/.deltafin/
 venv/
 .venv/
 __pycache__/
 *.pyc
+# The supported product and release tests are native. Historical Python
+# oracles, probes, and migration references may remain locally, but must not
+# re-enter the published source graph.
+/tools/**/*.py
+# Retired Python now lives here, out of the product tree entirely. The k3-*
+# entries inside are symlinks back to the real model directories, so the
+# historical oracles still resolve their data paths when run in place.
+/.legacy/
 .claude/
 .codex/
 .agents/
@@ -86,6 +100,7 @@ __pycache__/
 htmlcov/
 build/
 dist/
+/target/
 *.egg-info/
 *.dSYM/
 *.air
@@ -97,6 +112,7 @@ dist/
 /BRAINSTORM-SPEED.md
 /PLAN.md
 /experiments/
+/native/experiments/
 
 # --- logs, profiles & generated benchmark output ------------
 *.log
@@ -137,6 +153,7 @@ nohup.out
 /tools/test_backend_layer_bakeoff.py
 /tools/test_batch_topk_composition.py
 /tools/test_cache_route_surrogate.py
+/tools/test_c119_scale4.py
 /tools/test_coreml_pilot_gate.py
 /tools/test_forked_response.py
 /tools/test_lut_codecs.py

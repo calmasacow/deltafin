@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "native/deltafin",
+    "native/deltafin-bootstrap",
+    "native/deltafin-curl-sys-direct",
+    "native/deltafin-native-build",
+    "native/deltafin-xtask",
+]
+default-members = ["native/deltafin"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/gavamedia/deltafin"
+rust-version = "1.85"
+
+[patch.crates-io]
+# Deltafin keeps curl-rust's reviewed FFI surface but replaces curl-sys's
+# generic helper-driven discovery/build script with a bounded, Rust-only
+# system-libcurl selector for the supported native targets.
+curl-sys = { path = "native/deltafin-curl-sys-direct" }
+
+# The production binary is latency-sensitive. Keep one optimized
+# code-generation unit so Rust can inline across scheduler/configuration module
+# boundaries, and abort rather than unwind across C/ATen/Metal/CUDA boundaries.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"

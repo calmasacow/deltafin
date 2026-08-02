@@ -1,0 +1,16 @@
+[package]
+name = "deltafin-xtask"
+version = "0.1.0"
+description = "Compiled native build and test driver for Deltafin"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "deltafin-xtask"
+path = "src/main.rs"
+
+[dependencies]
+deltafin-native-build = { path = "../deltafin-native-build" }

@@ -2,14 +2,15 @@
 //
 // This translation unit is deliberately stateless.  It never calls cudaMalloc,
 // owns no device buffers, and does not retain a pointer after an API call.  The
-// Python bridge owns every allocation and passes PyTorch's current CUDA stream
-// explicitly.  That makes device, stream, allocator, and lifetime ownership
-// visible at the language boundary instead of hiding them in process globals.
+// The native provider owns every allocation and passes LibTorch's current CUDA
+// stream explicitly. That makes device, stream, allocator, and lifetime
+// ownership visible at the native boundary instead of hiding them in process
+// globals.
 //
 // Expert layout version 1 is the 17,547,264-byte on-disk span:
 //   w1 packed, w1 scale, w2 packed, w2 scale, w3 packed, w3 scale.
 //
-// Build integration lives in tools/build_native.py.  Keep every exported
+// Build integration lives in native/deltafin-native-build. Keep every exported
 // function returning a checked status except the side-effect-free handshake.
 
 #include <cuda_fp16.h>
@@ -32,8 +33,8 @@ constexpr int64_t kExpertSpan = 17'547'264;
 constexpr int kThreads = 128;
 
 // An error message is diagnostic state, not an allocation or a retained CUDA
-// resource.  thread_local prevents concurrent Python callers from trampling one
-// another's message.
+// resource. thread_local prevents concurrent native provider calls from
+// trampling one another's message.
 thread_local char g_last_error[512] = "no error";
 
 enum Status : int {

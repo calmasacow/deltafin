@@ -1,0 +1,46 @@
+[package]
+name = "deltafin"
+version = "0.1.0"
+description = "Python-free native Deltafin runtime"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "deltafin"
+path = "src/main.rs"
+required-features = ["runtime"]
+
+[lib]
+name = "deltafin"
+path = "src/lib.rs"
+
+[features]
+default = ["runtime"]
+# The complete executable/provider build. Consumers that only need the exact
+# tokenizer deliberately disable this so Cargo never configures LibTorch or
+# the spine/expert provider.
+runtime = ["dep:sha2"]
+
+[dependencies]
+base64 = "=0.22.1"
+curl = { version = "=0.4.50", default-features = false, features = ["force-system-lib-on-osx"] }
+half = "=2.7.1"
+libc = "=0.2.189"
+regex = "=1.13.0"
+rustc-hash = "=2.1.3"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.145", features = ["preserve_order"] }
+sha2 = { version = "=0.10.9", optional = true }
+tiny_http = "=0.12.0"
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[build-dependencies]
+deltafin-native-build = { path = "../deltafin-native-build" }
+
+[dev-dependencies]
+deltafin-native-build = { path = "../deltafin-native-build" }
+syn = { version = "=2.0.119", features = ["full", "visit"] }

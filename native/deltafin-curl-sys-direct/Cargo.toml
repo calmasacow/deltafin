@@ -1,0 +1,47 @@
+[package]
+name = "curl-sys"
+version = "0.4.90+curl-8.21.0"
+authors = ["Alex Crichton <alex@alexcrichton.com>"]
+edition = "2018"
+license = "MIT"
+repository = "https://github.com/alexcrichton/curl-rust"
+description = "Native bindings to a validated system libcurl for Deltafin"
+publish = false
+links = "curl"
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "curl_sys"
+path = "lib.rs"
+
+[[test]]
+name = "build_support"
+path = "tests/build_support.rs"
+
+[dependencies]
+libc = "=0.2.189"
+
+# Keep the public feature vocabulary accepted by curl 0.4.50. Features which
+# require building/configuring a private libcurl remain intentionally empty at
+# dependency-resolution time and are rejected with a precise error by build.rs.
+[features]
+default = ["ssl"]
+force-system-lib-on-osx = []
+http2 = []
+mesalink = []
+ntlm = []
+poll_7_68_0 = []
+protocol-ftp = []
+rustls = []
+spnego = []
+ssl = []
+static-curl = []
+static-ssl = []
+upkeep_7_62_0 = []
+windows-static-ssl = []
+zlib-ng-compat = []
