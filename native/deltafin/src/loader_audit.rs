@@ -691,6 +691,11 @@ fn system_elf_soname(path: &[u8]) -> bool {
         b"libresolv.so".as_slice(),
         b"libgomp.so".as_slice(),
         b"libnuma.so".as_slice(),
+        // Authenticated downloads link the distribution's libcurl by design:
+        // deltafin-curl-sys-direct selects the system library and requires the
+        // exact libcurl.so.4 SONAME. Apple resolves it from an allowed system
+        // root, so only the glibc closure reaches this allowlist.
+        b"libcurl.so".as_slice(),
         b"libcuda.so".as_slice(),
         b"libnvidia-ml.so".as_slice(),
     ]
@@ -1362,6 +1367,20 @@ mod tests {
                 .to_string()
                 .contains("unresolved non-system dependency")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glibc_system_libcurl_satisfies_the_dependency_closure() {
+        // deltafin-curl-sys-direct links the distribution's libcurl and
+        // requires the exact libcurl.so.4 SONAME, so the ELF closure must
+        // accept it as a platform library rather than an unaudited payload.
+        let fixture = Fixture::new();
+        let executable = fixture.0.join("deltafin");
+        write_elf(&executable, &[b"libcurl.so.4"], None);
+
+        audit_loader_closure(&executable, &LoaderAuditPolicy::bootstrap())
+            .expect("system libcurl must satisfy the ELF dependency closure");
     }
 
     #[cfg(unix)]
