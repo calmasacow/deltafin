@@ -2467,7 +2467,12 @@ deltafin::provider_internal::MoeSpineT1 target_moe_from_spine(
       .routed_up = std::move(routed_up),
       .shared_gate = std::move(shared_gate),
       .shared_up = std::move(shared_up),
-      .shared_down = std::move(shared_down)};
+      .shared_down = std::move(shared_down),
+      // The optional shared gate/up super-view is qualified separately after
+      // construction. State the empty initializer explicitly: GCC rejects the
+      // omission under -Werror=missing-field-initializers while Clang accepts
+      // it, so leaving it implicit fails only the Linux provider build.
+      .shared_gate_up = {}};
 }
 
 void require_target_packed_shape(
@@ -2963,6 +2968,9 @@ void maybe_bundle_mla_input_weights(
             deltafin::provider_internal::MlaLinearEncoding::RowI8F32Scale,
         .data = bundle->projection.data.narrow(0, row, count),
         .row_scale = bundle->projection.row_scale.narrow(0, row, count),
+        // This view carries no original bf16 matrix. State it explicitly:
+        // GCC rejects the omission under -Werror=missing-field-initializers.
+        .original_bf16 = {},
     };
     row += count;
     return result;

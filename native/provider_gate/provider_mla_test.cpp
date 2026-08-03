@@ -83,6 +83,8 @@ MlaLinearWeight dense_weight(const std::int64_t rows,
       .encoding = MlaLinearEncoding::DenseF32,
       .data = deterministic_tensor({rows, columns}, device, salt, 0.0078125F),
       .row_scale = {},
+      // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+      .original_bf16 = {},
   };
 }
 
@@ -113,6 +115,8 @@ MlaLinearWeight packed_weight(const std::int64_t rows,
       .encoding = MlaLinearEncoding::RowI8F32Scale,
       .data = data.to(device),
       .row_scale = scales.to(device),
+      // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+      .original_bf16 = {},
   };
 }
 
@@ -551,6 +555,8 @@ void run_live_shape_schedule(const at::Device& device) {
                    shape.qk_rope_head_dim +
                    shape.num_heads * shape.value_head_dim},
                   hidden.options().dtype(at::kFloat)),
+          // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+          .original_bf16 = {},
           },
           .query_a_rows = shape.q_lora_rank,
           .key_value_a_rows =

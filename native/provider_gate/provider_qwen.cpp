@@ -254,8 +254,13 @@ QwenWeights bind_qwen_roster(const DeltafinProviderQwenCreateV1& request,
     torch::mps::synchronize();
   }
 #endif
+  // `layers` is populated by the loop below. State the empty initializer
+  // rather than leaving it implicit: GCC rejects the omission under
+  // -Werror=missing-field-initializers while Clang accepts it, so an implicit
+  // member builds on macOS and fails the Linux provider build.
   QwenWeights weights{.embedding = std::move(slots[0]),
-                      .final_norm = std::move(slots[1])};
+                      .final_norm = std::move(slots[1]),
+                      .layers = {}};
   for (std::size_t layer = 0; layer < QwenShape::layers; ++layer) {
     const std::size_t base = 2 + layer * 11;
     weights.layers[layer] = {

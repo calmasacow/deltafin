@@ -137,6 +137,8 @@ MlaLinearWeight mla_weight(const std::int64_t rows, const std::int64_t columns,
       .encoding = MlaLinearEncoding::RowI8F32Scale,
       .data = std::move(matrix.quantized),
       .row_scale = std::move(matrix.row_scales),
+      // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+      .original_bf16 = {},
   };
 }
 
@@ -199,6 +201,8 @@ MoeSpineT1 make_moe_spine(const std::uint32_t layer_index) {
       .shared_gate = row_int8(kMoeGeometry.shared_intermediate, kHidden, 505),
       .shared_up = row_int8(kMoeGeometry.shared_intermediate, kHidden, 506),
       .shared_down = row_int8(kHidden, kMoeGeometry.shared_intermediate, 507),
+      // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+      .shared_gate_up = {},
   };
 }
 

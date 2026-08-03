@@ -146,6 +146,8 @@ MlaLinearWeight mla_weight(const std::int64_t rows,
       .encoding = MlaLinearEncoding::DenseF32,
       .data = std::move(matrix.dense_f32),
       .row_scale = at::Tensor(),
+      // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+      .original_bf16 = {},
   };
 }
 
@@ -212,6 +214,8 @@ MoeSpineT1 make_moe_spine(const std::uint32_t layer_index) {
           original_bf16_linear(kMoeGeometry.shared_intermediate, kHidden, 506),
       .shared_down =
           original_bf16_linear(kHidden, kMoeGeometry.shared_intermediate, 507),
+      // Explicit: GCC errors on omitted members under -Werror; Clang does not.
+      .shared_gate_up = {},
   };
 }
 
@@ -407,6 +411,9 @@ struct Caches {
 const MoeRunOptions kCpuOptions{
     .expert_backend = MoeExpertBackend::CpuMxfp4,
     .cpu_threads = 1,
+    // This CPU fixture selects no embedded metallib. State it explicitly:
+    // GCC errors on omitted members under -Werror; Clang does not.
+    .metal_shader_path = {},
 };
 
 struct FirstMoeReference {
