@@ -2411,6 +2411,33 @@ pub enum ReadPriority {
     Prefetch,
 }
 
+// Split out from Batch so a worker can hand off its own strong reference to
+// the lease-holding Batch before publishing completion. Batch::run_quantum
+// used to notify from inside its own `&self` call, while the caller
+// (worker_main) kept its Arc<Batch> -- and therefore the batch's arena lease
+// -- alive until the *next* loop iteration. A waiter woken by that notify
+// could observe the lease still held. Cloning this handle costs nothing (it
+// never touches the lease) and lets worker_main drop its Arc<Batch> first.
+struct BatchCompletion {
+    remaining: AtomicUsize,
+    cancelled: AtomicBool,
+    first_error: Mutex<Option<DeltafinError>>,
+    lock: Mutex<()>,
+    condvar: Condvar,
+}
+
+impl BatchCompletion {
+    fn new(jobs: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(jobs),
+            cancelled: AtomicBool::new(false),
+            first_error: Mutex::new(None),
+            lock: Mutex::new(()),
+            condvar: Condvar::new(),
+        }
+    }
+}
+
 struct Batch {
     sources: BatchSources,
     jobs: BatchJobs,
@@ -2419,11 +2446,17 @@ struct Batch {
     lease: Arc<BufferLeaseInner>,
     priority: ReadPriority,
     next_job: AtomicUsize,
-    remaining: AtomicUsize,
-    cancelled: AtomicBool,
-    first_error: Mutex<Option<DeltafinError>>,
-    completion_lock: Mutex<()>,
-    completion: Condvar,
+    completion: Arc<BatchCompletion>,
+}
+
+/// Requeue: unclaimed jobs remain, push this Arc<Batch> back onto the queue.
+/// Idle: nothing left to claim right now (someone else may still be finishing
+/// it). Finished: this call's last job made `remaining` hit zero; the caller
+/// must drop its own Arc<Batch> before notifying the enclosed handle.
+enum QuantumOutcome {
+    Requeue,
+    Idle,
+    Finished(Arc<BatchCompletion>),
 }
 
 impl Batch {
@@ -2450,11 +2483,7 @@ impl Batch {
             lease,
             priority,
             next_job: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(plan.jobs.len()),
-            cancelled: AtomicBool::new(false),
-            first_error: Mutex::new(None),
-            completion_lock: Mutex::new(()),
-            completion: Condvar::new(),
+            completion: Arc::new(BatchCompletion::new(plan.jobs.len())),
         }
     }
 
@@ -2492,34 +2521,35 @@ impl Batch {
             lease,
             priority,
             next_job: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(source_indices.len()),
-            cancelled: AtomicBool::new(false),
-            first_error: Mutex::new(None),
-            completion_lock: Mutex::new(()),
-            completion: Condvar::new(),
+            completion: Arc::new(BatchCompletion::new(source_indices.len())),
         }
     }
 
-    /// Run at most one scheduling quantum. The return value says that this
-    /// worker token should be queued again because unclaimed jobs remain.
-    fn run_quantum(&self) -> bool {
+    /// Run at most one scheduling quantum. `Finished` carries the completion
+    /// handle the caller must notify -- but only after it has dropped its own
+    /// Arc<Batch>, so the notified waiter never observes this batch's arena
+    /// lease still held by the worker that just finished it.
+    fn run_quantum(&self) -> QuantumOutcome {
         for _ in 0..WORK_QUANTUM {
             let index = self.next_job.fetch_add(1, Ordering::Relaxed);
             let Some(job) = self.jobs.get(index) else {
-                return false;
+                return QuantumOutcome::Idle;
             };
             if let Err(error) = self.run_job(job) {
-                let mut first_error = self.first_error.lock().unwrap();
+                let mut first_error = self.completion.first_error.lock().unwrap();
                 if first_error.is_none() {
                     *first_error = Some(error);
                 }
             }
-            if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                let _guard = self.completion_lock.lock().unwrap();
-                self.completion.notify_one();
+            if self.completion.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                return QuantumOutcome::Finished(Arc::clone(&self.completion));
             }
         }
-        self.next_job.load(Ordering::Relaxed) < self.jobs.len()
+        if self.next_job.load(Ordering::Relaxed) < self.jobs.len() {
+            QuantumOutcome::Requeue
+        } else {
+            QuantumOutcome::Idle
+        }
     }
 
     /// Atomically claim every job that no worker has started. Jobs already in
@@ -2528,7 +2558,7 @@ impl Batch {
     /// cancellation primitive needed by speculative I/O: no recycled buffer
     /// can race an in-flight kernel or read.
     fn cancel_unclaimed(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.completion.cancelled.store(true, Ordering::Release);
         let jobs = self.jobs.len();
         loop {
             let next = self.next_job.load(Ordering::Acquire);
@@ -2541,9 +2571,9 @@ impl Batch {
                 .is_ok()
             {
                 let cancelled = jobs - next;
-                if self.remaining.fetch_sub(cancelled, Ordering::AcqRel) == cancelled {
-                    let _guard = self.completion_lock.lock().unwrap();
-                    self.completion.notify_all();
+                if self.completion.remaining.fetch_sub(cancelled, Ordering::AcqRel) == cancelled {
+                    let _guard = self.completion.lock.lock().unwrap();
+                    self.completion.condvar.notify_all();
                 }
                 break;
             }
@@ -2931,9 +2961,9 @@ impl Batch {
     }
 
     fn wait_for_completion(&self) {
-        let mut guard = self.completion_lock.lock().unwrap();
-        while self.remaining.load(Ordering::Acquire) != 0 {
-            guard = self.completion.wait(guard).unwrap();
+        let mut guard = self.completion.lock.lock().unwrap();
+        while self.completion.remaining.load(Ordering::Acquire) != 0 {
+            guard = self.completion.condvar.wait(guard).unwrap();
         }
         drop(guard);
     }
@@ -2991,10 +3021,10 @@ impl Batch {
 
     fn wait(&self) -> Result<()> {
         self.wait_for_completion();
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.completion.cancelled.load(Ordering::Acquire) {
             return Err(DeltafinError::new("storage read ticket was cancelled"));
         }
-        if let Some(error) = self.first_error.lock().unwrap().clone() {
+        if let Some(error) = self.completion.first_error.lock().unwrap().clone() {
             return Err(error);
         }
         self.validate_deferred_source_identities()
@@ -3011,7 +3041,7 @@ pub struct ReadTicket {
 
 impl ReadTicket {
     pub fn is_ready(&self) -> bool {
-        self.batch.remaining.load(Ordering::Acquire) == 0
+        self.batch.completion.remaining.load(Ordering::Acquire) == 0
     }
 
     pub fn wait(self) -> Result<(LayerBuffers, ReadStats)> {
@@ -3353,13 +3383,25 @@ fn worker_main(state: Arc<PoolState>) {
             };
             batch
         };
-        if batch.run_quantum() {
-            let priority = batch.priority;
-            let mut inner = state.inner.lock().unwrap();
-            // Internal requeues remain valid during shutdown: Reader::drop
-            // drains admitted work before joining the workers.
-            inner.queues.push(priority, batch);
-            state.available.notify_one();
+        match batch.run_quantum() {
+            QuantumOutcome::Requeue => {
+                let priority = batch.priority;
+                let mut inner = state.inner.lock().unwrap();
+                // Internal requeues remain valid during shutdown: Reader::drop
+                // drains admitted work before joining the workers.
+                inner.queues.push(priority, batch);
+                state.available.notify_one();
+            }
+            QuantumOutcome::Idle => drop(batch),
+            QuantumOutcome::Finished(completion) => {
+                // Drop this worker's Arc<Batch> -- and with it, if this was
+                // the last reference, the batch's arena lease -- before
+                // publishing completion. A waiter woken by the notify below
+                // must never be able to observe this lease still held.
+                drop(batch);
+                let _guard = completion.lock.lock().unwrap();
+                completion.condvar.notify_one();
+            }
         }
     }
 }
@@ -5394,13 +5436,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let batch = Batch::new(&plan, Arc::clone(&lease), ReadPriority::Prefetch);
-        assert!(batch.run_quantum());
+        assert!(matches!(batch.run_quantum(), QuantumOutcome::Requeue));
         assert_eq!(batch.next_job.load(Ordering::Relaxed), WORK_QUANTUM);
         assert_eq!(
-            batch.remaining.load(Ordering::Relaxed),
+            batch.completion.remaining.load(Ordering::Relaxed),
             bytes.len() - WORK_QUANTUM
         );
-        while batch.run_quantum() {}
+        while matches!(batch.run_quantum(), QuantumOutcome::Requeue) {}
         batch.wait().unwrap();
         assert_eq!(
             lease
@@ -5429,10 +5471,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let batch = Batch::new(&plan, Arc::clone(&lease), ReadPriority::Prefetch);
-        assert!(batch.run_quantum());
+        assert!(matches!(batch.run_quantum(), QuantumOutcome::Requeue));
         batch.cancel_unclaimed();
-        assert_eq!(batch.remaining.load(Ordering::Acquire), 0);
-        assert!(!batch.run_quantum());
+        assert_eq!(batch.completion.remaining.load(Ordering::Acquire), 0);
+        assert!(matches!(batch.run_quantum(), QuantumOutcome::Idle));
         assert!(batch.wait().unwrap_err().to_string().contains("cancelled"));
         let stored = lease
             .buffers()

@@ -176,6 +176,7 @@ fn run() -> Result<()> {
         Command::Run(arguments) => {
             let host = Host::compiled().validate()?;
             let config = RuntimeConfig::from_process(arguments)?;
+            eprintln!("[config] resolved: {config}");
             let mut engine = NativeTargetEngine::bootstrap(&config)?;
             let status = engine.status();
             eprintln!(

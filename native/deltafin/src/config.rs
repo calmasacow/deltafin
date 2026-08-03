@@ -392,6 +392,62 @@ impl RuntimeConfig {
     }
 }
 
+/// Prints every resolved runtime knob on one line, independent of which of
+/// CLI flag, environment variable, or built-in default supplied it — a
+/// contributed log or an A/B pair should be auditable without access to the
+/// process that produced it.
+impl std::fmt::Display for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "surface={:?} device={:?} spine={:?} spine_read_threads={} spine_fd_cache={} \
+             spine_stream_nocache={} spine_resident_bytes={} provider_resident_layers={} \
+             expert_read_threads={} expert_backend={:?} expert_scale4={:?} quality={:?} \
+             dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
+             router_trace_mode={:?} router_trace_path={} chat={} stats={} max_new={}",
+            self.surface,
+            self.device,
+            self.spine,
+            describe_usize(self.spine_read_threads),
+            describe_bool(self.spine_fd_cache),
+            describe_bool(self.spine_stream_nocache),
+            describe_u64(self.spine_resident_bytes),
+            describe_usize(self.provider_resident_layers),
+            describe_usize(self.expert_read_threads),
+            self.expert_backend,
+            self.expert_scale4,
+            self.quality,
+            self.dspark,
+            describe_usize(self.dspark_max_context),
+            self.dspark_min_auto_speedup,
+            self.qwen,
+            self.router_trace_mode,
+            describe_path(&self.router_trace_path),
+            self.chat,
+            self.stats,
+            describe_u64(self.max_new),
+        )
+    }
+}
+
+fn describe_usize(value: Option<usize>) -> String {
+    value.map_or_else(|| "auto".to_string(), |v| v.to_string())
+}
+
+fn describe_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "auto".to_string(), |v| v.to_string())
+}
+
+fn describe_bool(value: Option<bool>) -> String {
+    value.map_or_else(|| "auto".to_string(), |v| v.to_string())
+}
+
+fn describe_path(value: &Option<PathBuf>) -> String {
+    value
+        .as_ref()
+        .map_or_else(|| "none".to_string(), |p| p.display().to_string())
+}
+
 fn parse_optional_positive_usize(
     value: Option<&str>,
     default: usize,
@@ -424,6 +480,40 @@ mod tests {
             spine: None,
             spine_read_threads: None,
             expert_backend: None,
+        }
+    }
+
+    #[test]
+    fn resolved_configuration_display_names_every_knob() {
+        let config = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
+        let line = config.to_string();
+        for key in [
+            "surface=",
+            "device=",
+            "spine=",
+            "spine_read_threads=",
+            "spine_fd_cache=",
+            "spine_stream_nocache=",
+            "spine_resident_bytes=",
+            "provider_resident_layers=",
+            "expert_read_threads=",
+            "expert_backend=",
+            "expert_scale4=",
+            "quality=",
+            "dspark=",
+            "dspark_max_context=",
+            "dspark_min_auto_speedup=",
+            "qwen=",
+            "router_trace_mode=",
+            "router_trace_path=",
+            "chat=",
+            "stats=",
+            "max_new=",
+        ] {
+            assert!(
+                line.contains(key),
+                "resolved-config line is missing {key}: {line}"
+            );
         }
     }
 
