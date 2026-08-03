@@ -2394,6 +2394,7 @@ mod tests {
             1,
             &[0],
             0,
+            CachePolicy::Streaming,
         )
         .unwrap();
         let identity = first.scale4_identity.unwrap();
@@ -2433,6 +2434,7 @@ mod tests {
             1,
             &[0],
             0,
+            CachePolicy::Streaming,
         )
         .unwrap();
         assert_eq!(reused.scale4_identity, Some(identity));
@@ -2473,6 +2475,7 @@ mod tests {
             1,
             &[0],
             0,
+            CachePolicy::Streaming,
         )
         .unwrap();
         assert_eq!(&*first.scale4_reader_verified, &[0]);
@@ -2502,6 +2505,7 @@ mod tests {
             1,
             &[0, 1],
             0,
+            CachePolicy::Streaming,
         )
         .unwrap();
         assert_eq!(mixed.scale4_identity, Some(identity));
@@ -2571,6 +2575,7 @@ mod tests {
             1,
             &[0],
             0,
+            CachePolicy::Streaming,
         )
         .unwrap();
         assert_eq!(&*plan.scale4_reader_verified, &[0]);

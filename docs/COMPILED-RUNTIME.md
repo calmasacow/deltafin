@@ -332,14 +332,31 @@ snapshot of device-resident hits. Only then does Rust open files for the exact
 ordered miss list. The finish call consumes that one plan and accepts one raw
 span per reported miss; an all-hit tile performs no expert file I/O.
 
-The cache allocates after resident model setup, when live free VRAM is known.
-Automatic mode keeps at least 2 GiB or 20% of current free space as reserve,
-whichever is larger, and distributes capacity over all 92 expert layers rather
-than letting early layers monopolize it. Pinned staging, CUDA events and stream
-guards ensure upload buffers cannot be recycled early. Recoverable allocation
-failure drains the stream and disables expert residency; terminal stream or
-ABI failure poisons the optional CUDA expert provider instead of continuing
-with uncertain ownership.
+The engine budgets the cache from the same discrete-memory snapshot that
+sizes spine residency and freezes that budget through the provider's
+configuration ABI before the first plan, charging it into residency's fixed
+provider costs so the resident spine prefix and the expert cache can never
+double-book VRAM. Experts take priority: their misses are demand reads on the
+routing-dependent critical path, while spine streaming prefetches ahead, so
+resident spine layers receive only the VRAM left after the cache's share (at
+most one entry per routed edge, `92 x 16`). The provider still clamps the
+frozen request against live free VRAM at first use. Sessions that skip the
+configuration ABI keep the older automatic mode: at least 2 GiB or 20% of
+current free space stays reserved.
+
+Eviction is a global least-recently-used policy across all 92 expert layers:
+per-layer lookup vectors keep local recency order and the globally coldest
+entry is dropped first, so heavily re-routed layers naturally hold more
+residents than layers whose routing churns. Two pinned staging slabs
+alternate so a miss upload's host copy overlaps the previous expert's DMA;
+CUDA events and stream guards still ensure no slab or upload buffer is
+recycled early. A recoverable allocation failure drains the stream, releases
+every cached expert, and re-measures the budget (bounded retries) instead of
+disabling residency for the rest of the session; exhausted retries, terminal
+stream, or ABI failure poison the optional CUDA expert provider instead of
+continuing with uncertain ownership. The per-pass phase summary reports
+`expert plans: N cache hits, M misses read+uploaded` so cache health is
+visible in any contributed log.
 
 ### Draft models remain proposal-only
 

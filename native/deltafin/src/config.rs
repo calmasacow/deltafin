@@ -100,9 +100,10 @@ fn parse_pilot_gate_threshold(raw: &str) -> Result<f64> {
 pub const MAX_PILOT_GATE_WARMUP: u32 = 100_000;
 
 fn parse_pilot_gate_warmup(raw: &str) -> Result<u32> {
-    let warmup = raw.trim().parse::<u32>().map_err(|_| {
-        DeltafinError::new("K3_PILOT_GATE_WARMUP must be an integer in 1..=100000")
-    })?;
+    let warmup = raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| DeltafinError::new("K3_PILOT_GATE_WARMUP must be an integer in 1..=100000"))?;
     if !(1..=MAX_PILOT_GATE_WARMUP).contains(&warmup) {
         return Err(DeltafinError::new(
             "K3_PILOT_GATE_WARMUP must be an integer in 1..=100000",

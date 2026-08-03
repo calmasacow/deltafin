@@ -1448,7 +1448,9 @@ impl NativeTargetEngine {
                     .provider_bytes
                     .checked_add(budget.charged_provider_bytes)
                     .ok_or_else(|| {
-                        DeltafinError::new("CUDA expert-cache reserve overflows fixed provider costs")
+                        DeltafinError::new(
+                            "CUDA expert-cache reserve overflows fixed provider costs",
+                        )
                     })?,
             },
             None => fixed,
@@ -5688,9 +5690,9 @@ fn finish_expert_mailbox(
             if let Some(profile) = profile.as_deref_mut() {
                 let misses = plan.missing_experts().len() as u64;
                 profile.expert_plan_misses = profile.expert_plan_misses.saturating_add(misses);
-                profile.expert_plan_hits = profile.expert_plan_hits.saturating_add(
-                    (tile.expert_ids().len() as u64).saturating_sub(misses),
-                );
+                profile.expert_plan_hits = profile
+                    .expert_plan_hits
+                    .saturating_add((tile.expert_ids().len() as u64).saturating_sub(misses));
             }
             let read_started = profile.as_ref().map(|_| Instant::now());
             let misses = if plan.missing_experts().is_empty() {
@@ -6985,7 +6987,12 @@ mod tests {
 
         // Non-CUDA devices have no CUDA cache to budget.
         assert_eq!(
-            plan_cuda_expert_cache_budget(Device::Cpu, snapshot(Some(32 * gib), Some(30 * gib)), 0, 0),
+            plan_cuda_expert_cache_budget(
+                Device::Cpu,
+                snapshot(Some(32 * gib), Some(30 * gib)),
+                0,
+                0
+            ),
             None,
         );
 
@@ -7018,10 +7025,7 @@ mod tests {
         assert_eq!(budget.policy.capacity_experts, expected);
         assert!(budget.policy.capacity_experts > 0);
         assert_eq!(budget.policy.reserve_bytes, reserve);
-        assert_eq!(
-            budget.charged_provider_bytes,
-            u64::from(expected) * span,
-        );
+        assert_eq!(budget.charged_provider_bytes, u64::from(expected) * span,);
         // The charge plus fixed costs stays inside the shared envelope, so
         // residency cannot select spine layers the cache will also claim.
         assert!(budget.charged_provider_bytes + fixed + transient <= envelope);
@@ -7037,17 +7041,29 @@ mod tests {
         .unwrap();
         assert_eq!(large.policy.capacity_experts, CUDA_EXPERT_CACHE_MAX_EXPERTS);
 
-        // A starved card configures an explicit zero instead of leaving the
-        // provider free to budget on its own.
+        // A card whose free VRAM sits inside the device reserve configures an
+        // explicit zero instead of leaving the provider free to budget later.
         let starved = plan_cuda_expert_cache_budget(
             Device::Cuda(0),
-            snapshot(Some(4 * gib), Some(3 * gib)),
+            snapshot(Some(3 * gib), Some(3 * gib / 2)),
             0,
             0,
         )
         .unwrap();
         assert_eq!(starved.policy.capacity_experts, 0);
         assert_eq!(starved.charged_provider_bytes, 0);
+
+        // Fixed provider charges below the envelope shrink capacity expert
+        // by expert rather than collapsing it.
+        let squeezed = plan_cuda_expert_cache_budget(
+            Device::Cuda(0),
+            snapshot(Some(32 * gib), Some(30 * gib)),
+            20 * gib,
+            gib,
+        )
+        .unwrap();
+        assert!(squeezed.policy.capacity_experts > 0);
+        assert!(squeezed.policy.capacity_experts < budget.policy.capacity_experts);
     }
 
     #[test]
@@ -7781,8 +7797,7 @@ mod tests {
         assert!(!ClientPresenceInterrupt(&ClientPresence::assumed_present()).requested());
         let departed = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&departed);
-        let client =
-            ClientPresence::from_probe(Box::new(move || observed.load(Ordering::Relaxed)));
+        let client = ClientPresence::from_probe(Box::new(move || observed.load(Ordering::Relaxed)));
         let interrupt = ClientPresenceInterrupt(&client);
         assert!(!interrupt.requested());
         departed.store(true, Ordering::Relaxed);

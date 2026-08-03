@@ -16,5 +16,6 @@ Normal operation needs no environment overrides. The most useful controls are:
 | `K3_PILOT_GATE_WARMUP` | `16` | scored samples per layer before the gate may suppress or redirect |
 | `--reasoning-effort` / `K3_REASONING_EFFORT` | template default (`max`) | chat thinking depth: `low`, `high` or `max`; the server's per-request `reasoning_effort` field overrides it |
 | `K3_TRACE` / `K3_TRACE_PATH` | `off` | native router trace mode and path; CLI flags are preferred |
+| `K3_EXPERT_STREAM_NOCACHE` | `auto` | page-cache treatment for streaming expert reads: `auto` purges on the memory-tight macOS reference host and keeps the kernel file cache warm elsewhere; `1`/`0` force either behavior |
 
 The quality guard rejects fewer than 16 experts, non-fp32 target activations and approximation switches. Original BF16 remains the automatic resident authority. Optional paths must validate their device, ABI, shapes, memory and correctness before activation.
