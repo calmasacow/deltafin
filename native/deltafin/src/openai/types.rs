@@ -228,6 +228,48 @@ impl TargetOutput {
     }
 }
 
+/// Liveness of the one HTTP client waiting on a generation.
+///
+/// A generation on this hardware can run for hours, so an adapter is told how
+/// to ask whether anyone is still listening and may stop cooperatively when
+/// the answer is provably no.  The probe contract is asymmetric: a false
+/// "still present" merely spends compute the old behavior also spent, while a
+/// false "disconnected" abandons a live client's request — so probes must
+/// report disconnection only on positive evidence that the connection has
+/// left its established state, never on doubt.  Fabricated test requests and
+/// transports without an observable socket use
+/// [`ClientPresence::assumed_present`].
+pub struct ClientPresence {
+    probe: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl ClientPresence {
+    /// A client that can never be observed to disconnect.
+    pub fn assumed_present() -> Self {
+        Self { probe: None }
+    }
+
+    /// A client observed through `probe`, which returns true only once the
+    /// client has provably gone away.  The probe runs on the generation
+    /// thread between decode transactions and must never block.
+    pub fn from_probe(probe: Box<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self { probe: Some(probe) }
+    }
+
+    pub fn disconnected(&self) -> bool {
+        self.probe.as_ref().is_some_and(|probe| probe())
+    }
+}
+
+impl fmt::Debug for ClientPresence {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientPresence")
+            .field("probed", &self.probe.is_some())
+            .finish()
+    }
+}
+
 /// The sole generation capability visible to the HTTP service.
 ///
 /// Implementations may internally use speculative work, but must return only
@@ -235,7 +277,17 @@ impl TargetOutput {
 /// also makes exclusive ownership explicit; [`super::OpenAiService`] adds a
 /// mutex so concurrent HTTP handlers cannot enter the target together.
 pub trait AuthoritativeTarget: Send {
-    fn generate_target(&mut self, request: &TargetRequest) -> Result<TargetOutput>;
+    /// Generate one complete K3-certified response.
+    ///
+    /// `client` reports whether the requesting HTTP client is still
+    /// connected.  An adapter that honors it must fail the request rather
+    /// than return partial text: a disconnect-truncated result is not a
+    /// certified response and must never be published or replayed.
+    fn generate_target(
+        &mut self,
+        request: &TargetRequest,
+        client: &ClientPresence,
+    ) -> Result<TargetOutput>;
 
     /// Resolve state staged by a non-streaming response after the HTTP body is
     /// completely written. Implementations must treat failure as rollback of
@@ -252,8 +304,9 @@ pub trait AuthoritativeTarget: Send {
         &mut self,
         request: &TargetRequest,
         sink: &mut dyn TargetDeltaSink,
+        client: &ClientPresence,
     ) -> std::result::Result<TargetStreamSummary, StreamGenerationError> {
-        let output = self.generate_target(request)?;
+        let output = self.generate_target(request, client)?;
         if let Some(reasoning) = output.reasoning_content().filter(|text| !text.is_empty()) {
             sink.publish_target_delta(TargetDelta::target_verified_reasoning(reasoning))?;
         }

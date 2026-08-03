@@ -42,6 +42,8 @@ Serve options:\n\
   --host ADDRESS         Listen address (default: 127.0.0.1)\n\
   --port N               Listen port (default: 8000)\n\
   --max-tokens N         Per-response server ceiling (default: 1000000)\n\
+  --queue N              Concurrent requests allowed to wait for the generation slot\n\
+                         (default: 0 = immediate 429; max: 64; K3_SERVER_QUEUE fallback)\n\
   --max-request-bytes N  Bounded JSON request size (default: 134217728; max: 1073741824)\n\
   --response-memo-entries N  Exact-response cache entries (default: 32; 0 disables)\n\
   --response-memo-bytes N    Exact-response cache bytes (default: 67108864; max: 1073741824; 0 disables)\n\
@@ -374,6 +376,9 @@ pub struct ServeArgs {
     pub host: String,
     pub port: u16,
     pub max_tokens: usize,
+    /// `--queue`; `None` defers to the `K3_SERVER_QUEUE` environment fallback
+    /// resolved at server startup.
+    pub queue_slots: Option<usize>,
     pub max_request_bytes: usize,
     pub response_memo_entries: usize,
     pub response_memo_bytes: usize,
@@ -392,6 +397,7 @@ impl Default for ServeArgs {
             host: "127.0.0.1".into(),
             port: 8000,
             max_tokens: 1_000_000,
+            queue_slots: None,
             max_request_bytes: crate::openai::DEFAULT_MAX_REQUEST_BODY_BYTES,
             response_memo_entries: crate::openai::DEFAULT_RESPONSE_MEMO_ENTRIES,
             response_memo_bytes: crate::openai::DEFAULT_RESPONSE_MEMO_BYTES,
@@ -1278,6 +1284,10 @@ fn parse_serve(values: &[String]) -> Result<ServeArgs> {
                     ));
                 }
             }
+            "--queue" => {
+                let raw = take_value(values, &mut index, option)?;
+                serve.queue_slots = Some(parse_generation_queue_slots(&raw)?);
+            }
             "--max-request-bytes" => {
                 let raw = take_value(values, &mut index, option)?;
                 serve.max_request_bytes = raw.parse::<usize>().map_err(|_| {
@@ -1346,6 +1356,38 @@ fn parse_serve(values: &[String]) -> Result<ServeArgs> {
         ));
     }
     Ok(serve)
+}
+
+fn parse_generation_queue_slots(raw: &str) -> Result<usize> {
+    let bounds_message = || {
+        DeltafinError::new(format!(
+            "the server generation queue must be an integer in 0..={} waiting slots",
+            crate::openai::MAX_GENERATION_QUEUE_SLOTS
+        ))
+    };
+    let slots = raw.parse::<usize>().map_err(|_| bounds_message())?;
+    if slots > crate::openai::MAX_GENERATION_QUEUE_SLOTS {
+        return Err(bounds_message());
+    }
+    Ok(slots)
+}
+
+/// Resolve the serve queue size: an explicit `--queue` wins, the
+/// `K3_SERVER_QUEUE` environment value is the fallback, and its absence means
+/// the documented immediate-429 behavior. A malformed environment value is an
+/// error rather than a silently ignored setting.
+pub(crate) fn resolve_generation_queue_slots(
+    flag: Option<usize>,
+    environment: Option<&str>,
+) -> Result<usize> {
+    if let Some(slots) = flag {
+        return Ok(slots);
+    }
+    match environment {
+        None => Ok(0),
+        Some(raw) => parse_generation_queue_slots(raw)
+            .map_err(|error| DeltafinError::new(format!("K3_SERVER_QUEUE: {error}"))),
+    }
 }
 
 fn parse_pack_spine(values: &[String]) -> Result<PackSpineArgs> {
@@ -1439,6 +1481,44 @@ mod tests {
             assert!(parse(["deltafin", "run", "--spine-read-threads", invalid]).is_err());
             assert!(parse(["deltafin", "serve", "--spine-read-threads", invalid]).is_err());
         }
+    }
+
+    #[test]
+    fn parses_and_bounds_the_serve_generation_queue() {
+        let Command::Serve(serve) = parse(["deltafin", "serve", "--queue", "3"]).unwrap() else {
+            panic!("expected serve command")
+        };
+        assert_eq!(serve.queue_slots, Some(3));
+
+        let Command::Serve(explicit_zero) = parse(["deltafin", "serve", "--queue", "0"]).unwrap()
+        else {
+            panic!("expected serve command")
+        };
+        assert_eq!(explicit_zero.queue_slots, Some(0));
+
+        let Command::Serve(unset) = parse(["deltafin", "serve"]).unwrap() else {
+            panic!("expected serve command")
+        };
+        assert_eq!(unset.queue_slots, None);
+
+        for invalid in ["-1", "many", "65"] {
+            assert!(parse(["deltafin", "serve", "--queue", invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn queue_slots_resolve_from_flag_then_environment_then_immediate_429_default() {
+        assert_eq!(resolve_generation_queue_slots(Some(2), Some("9")).unwrap(), 2);
+        assert_eq!(resolve_generation_queue_slots(None, Some("9")).unwrap(), 9);
+        assert_eq!(resolve_generation_queue_slots(None, None).unwrap(), 0);
+        assert!(resolve_generation_queue_slots(None, Some("many")).is_err());
+        assert!(resolve_generation_queue_slots(None, Some("65")).is_err());
+        // The explicit flag also wins over a malformed environment value:
+        // the operator asked for a specific admission policy on this run.
+        assert_eq!(
+            resolve_generation_queue_slots(Some(1), Some("many")).unwrap(),
+            1
+        );
     }
 
     #[test]

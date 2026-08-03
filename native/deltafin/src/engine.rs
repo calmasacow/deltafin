@@ -40,8 +40,9 @@ use crate::experts::{
 use crate::inventory::PINNED_INVENTORY_SHA256;
 use crate::model::ModelSpec;
 use crate::openai::{
-    AuthoritativeTarget, FinishReason, StreamGenerationError, StreamPublication, TargetDelta,
-    TargetDeltaSink, TargetOutput, TargetPrompt, TargetRequest, TargetStreamSummary, TokenUsage,
+    AuthoritativeTarget, ClientPresence, FinishReason, StreamGenerationError, StreamPublication,
+    TargetDelta, TargetDeltaSink, TargetOutput, TargetPrompt, TargetRequest, TargetStreamSummary,
+    TokenUsage,
 };
 use crate::output::IncrementalUtf8Decoder;
 use crate::platform::{
@@ -71,7 +72,7 @@ use crate::residency::{
 };
 use crate::router_trace::{ROUTER_TRACE_HOST_RESERVE_BYTES, RouterTrace, RouterTraceMode};
 use crate::run_events::RunEventLog;
-use crate::run_interrupt::{InterruptSource, NeverInterrupt};
+use crate::run_interrupt::InterruptSource;
 use crate::spine_runtime::SpinePipeline;
 use crate::storage::{
     BufferLengths, BufferRetireHook, CachePolicy, LOOSE_SPINE_DESCRIPTOR_RESERVE, Reader,
@@ -1136,8 +1137,10 @@ fn select_target_for_spine(
 impl NativeTargetEngine {
     pub fn bootstrap(config: &RuntimeConfig) -> Result<Self> {
         let representation = match config.spine {
-            SpineRequest::Auto | SpineRequest::Bf16 => SpineRepresentation::OriginalBf16,
-            SpineRequest::Int8 => SpineRepresentation::QuantizedInt8,
+            // The default resident spine is the measured row-int8 conversion;
+            // the original checkpoint remains selectable explicitly.
+            SpineRequest::Auto | SpineRequest::Int8 => SpineRepresentation::QuantizedInt8,
+            SpineRequest::Bf16 => SpineRepresentation::OriginalBf16,
         };
         let expected_authority = match representation {
             SpineRepresentation::OriginalBf16 => ResidentWeightAuthority::OriginalBf16,
@@ -2700,33 +2703,9 @@ fn qwen_residency_admitted(selection: &ResidencySelection) -> bool {
 impl NativeTargetEngine {
     /// Execute one independent exact target request into an arbitrary native
     /// byte sink. This is the shared compiled boundary for the CLI and the
-    /// forthcoming in-process OpenAI server; neither needs a Python bridge.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the native generation boundary keeps independent authority and publication controls explicit"
-    )]
-    pub fn generate_tokens_to<W: Write>(
-        &mut self,
-        prompt: &[u32],
-        maximum_new: Option<u64>,
-        stats: bool,
-        allow_dspark: bool,
-        reusable_target: bool,
-        events: Option<&mut RunEventLog>,
-        output: &mut W,
-    ) -> Result<NativeGeneration> {
-        self.generate_tokens_to_with_interrupt(
-            prompt,
-            maximum_new,
-            stats,
-            allow_dspark,
-            reusable_target,
-            &NeverInterrupt,
-            events,
-            output,
-        )
-    }
-
+    /// in-process OpenAI server; neither needs a Python bridge. The CLI
+    /// passes its SIGINT flag as the interrupt source; the server passes the
+    /// requesting client's socket liveness.
     #[expect(
         clippy::too_many_arguments,
         reason = "the native generation boundary keeps authority, publication, and cooperative-stop controls explicit"
@@ -3670,21 +3649,55 @@ impl NativeTargetEngine {
     }
 }
 
+/// Cooperative cancellation source for one server generation: an HTTP client
+/// that has provably disconnected is a standing request to stop spending
+/// hours of compute on a response nobody will receive.  The probe is checked
+/// at the same transaction boundaries as the CLI's SIGINT flag, so a
+/// disconnect can never unwind provider-owned state mid-mutation.
+struct ClientPresenceInterrupt<'a>(&'a ClientPresence);
+
+impl InterruptSource for ClientPresenceInterrupt<'_> {
+    fn requested(&self) -> bool {
+        self.0.disconnected()
+    }
+}
+
+/// A disconnect-interrupted generation is a *successful partial* result at
+/// the engine layer (the engine returns to `Ready`), but it is not a
+/// K3-certified response: publishing or memoizing it would replay truncated
+/// text for future identical requests.  The adapter therefore converts it
+/// into an error; the server's error path settles the target with `Aborted`,
+/// which is a no-op because the interrupt tail already discarded every staged
+/// reuse branch.
+fn client_disconnect_error() -> DeltafinError {
+    DeltafinError::new(
+        "client disconnected during native generation; the partial result was discarded",
+    )
+}
+
 impl AuthoritativeTarget for NativeTargetEngine {
-    fn generate_target(&mut self, request: &TargetRequest) -> Result<TargetOutput> {
+    fn generate_target(
+        &mut self,
+        request: &TargetRequest,
+        client: &ClientPresence,
+    ) -> Result<TargetOutput> {
         let encoded = self.encode_target_request(request)?;
         let mut bytes = Vec::new();
         let allow_dspark =
             encoded.chat_request || self.dspark.mode() == crate::dspark_runtime::Mode::On;
-        let generation = self.generate_tokens_to(
+        let generation = self.generate_tokens_to_with_interrupt(
             &encoded.prompt,
             Some(encoded.maximum_new),
             false,
             allow_dspark,
             encoded.chat_request,
+            &ClientPresenceInterrupt(client),
             None,
             &mut bytes,
         )?;
+        if generation.stop == StopReason::Interrupted {
+            return Err(client_disconnect_error());
+        }
         let raw_text = String::from_utf8(bytes).map_err(|_| {
             DeltafinError::new("native incremental output produced invalid UTF-8 at publication")
         })?;
@@ -3714,6 +3727,7 @@ impl AuthoritativeTarget for NativeTargetEngine {
         &mut self,
         request: &TargetRequest,
         sink: &mut dyn TargetDeltaSink,
+        client: &ClientPresence,
     ) -> std::result::Result<TargetStreamSummary, StreamGenerationError> {
         if self.stream_boundary != NativeStreamBoundary::None {
             return Err(StreamGenerationError::Target(DeltafinError::new(
@@ -3724,12 +3738,13 @@ impl AuthoritativeTarget for NativeTargetEngine {
         let mut writer = TargetStreamWriter::new(sink, encoded.chat_request);
         let allow_dspark =
             encoded.chat_request || self.dspark.mode() == crate::dspark_runtime::Mode::On;
-        let generated = self.generate_tokens_to(
+        let generated = self.generate_tokens_to_with_interrupt(
             &encoded.prompt,
             Some(encoded.maximum_new),
             false,
             allow_dspark,
             encoded.chat_request,
+            &ClientPresenceInterrupt(client),
             None,
             &mut writer,
         );
@@ -3748,6 +3763,12 @@ impl AuthoritativeTarget for NativeTargetEngine {
                 return Err(StreamGenerationError::Target(target_error));
             }
         };
+        if generation.stop == StopReason::Interrupted {
+            // Leave the stream boundary at `None`: the interrupt tail already
+            // discarded staged state, so `finish_target_stream(Aborted)` must
+            // resolve to a no-op rather than a second discard.
+            return Err(StreamGenerationError::Target(client_disconnect_error()));
+        }
 
         let (finish_reason, usage) = match target_generation_metadata(&encoded.prompt, &generation)
         {
@@ -3860,8 +3881,9 @@ const fn finish_reason_for_stop(stop: StopReason) -> FinishReason {
     match stop {
         StopReason::Eos => FinishReason::Stop,
         StopReason::MaxNew | StopReason::ContextFull => FinishReason::Length,
-        // The public server path is compiled with NeverInterrupt, but retain a
-        // total mapping for the shared result type.
+        // The server adapter rejects interrupted generations before mapping a
+        // finish reason, so this arm serves only the CLI's partial-result
+        // reporting; retain a total mapping for the shared result type.
         StopReason::Interrupted => FinishReason::Stop,
     }
 }
@@ -7169,6 +7191,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn low_headroom_mps_int8_replays_the_two_layer_clean_file_tier() {
         const SPINE_SOURCE_BYTES: u64 = 54_397_786_304;
         let gib = 1_u64 << 30;
@@ -7314,6 +7337,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn compact_accelerator_spines_charge_one_shared_fp32_execution_arena() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let model = ModelSpec::load_from_root(&root).unwrap();
@@ -7423,6 +7447,22 @@ mod tests {
         assert!(budget.admission(16, 16).is_err());
         assert!(budget.admission(4_369, 4_370).is_err());
         assert_eq!(budget.startup_growth_reserve().unwrap(), (256, 40_000));
+    }
+
+    #[test]
+    fn client_presence_interrupt_mirrors_the_probe() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        assert!(!ClientPresenceInterrupt(&ClientPresence::assumed_present()).requested());
+        let departed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&departed);
+        let client =
+            ClientPresence::from_probe(Box::new(move || observed.load(Ordering::Relaxed)));
+        let interrupt = ClientPresenceInterrupt(&client);
+        assert!(!interrupt.requested());
+        departed.store(true, Ordering::Relaxed);
+        assert!(interrupt.requested());
     }
 
     #[test]

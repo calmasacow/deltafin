@@ -813,6 +813,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn installed_k3_tokenizer_matches_tiktoken_gold_corpus() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         assert_eq!(tokenizer.vocab_size(), 163_840);
@@ -865,6 +866,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn special_tokens_are_explicit_and_user_text_cannot_inject_them() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let text = "a <|open|> b [BOS] c";
@@ -886,12 +888,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn decoder_rejects_ids_outside_the_validated_vocabulary() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         assert!(tokenizer.decode(&[163_840]).is_err());
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn long_input_safety_boundaries_match_tiktoken() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let cases = [
@@ -912,6 +916,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn combinatorial_boundary_corpus_matches_tiktoken() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let fragments = [
@@ -987,6 +992,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn native_segment_batch_is_bit_exact_for_large_deterministic_fuzz() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let fragments = [

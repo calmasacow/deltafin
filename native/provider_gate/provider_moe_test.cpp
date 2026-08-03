@@ -623,11 +623,13 @@ void shared_gate_up_bundle_test() {
             << bundled_us << " dispatches=2->1 dense=PASS\n";
 }
 
+#if defined(__APPLE__)
 void move_matrix(MoeRowInt8Matrix& matrix, const at::Device& device) {
   matrix.quantized = matrix.quantized.to(device).contiguous();
   matrix.row_scales = matrix.row_scales.to(device).contiguous();
   matrix.dense_f32 = matrix.dense_f32.to(device).contiguous();
 }
+#endif
 
 bool mps_parity_test() {
 #if !defined(__APPLE__)

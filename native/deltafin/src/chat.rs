@@ -919,6 +919,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn simple_public_chat_template_matches_python_gold() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let conversation = parse(r#"[{"role":"user","content":"Hello <|open|> & goodbye"}]"#);
@@ -943,6 +944,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn nonthinking_multimodal_template_matches_python_gold() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let conversation = parse(
@@ -981,6 +983,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn tools_arguments_and_result_reordering_match_python_gold() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let tools = parse(
@@ -1024,6 +1027,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn response_controls_and_deep_sorted_schema_match_python_gold() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         let conversation = parse(r#"[{"role":"user","name":"A&B\"","content":"Return JSON."}]"#);
@@ -1081,6 +1085,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an installed k3-meta fixture (deltafin setup); run with --include-ignored on a machine with K3 metadata present"]
     fn native_batched_chat_is_bit_exact_for_fuzzed_large_histories() {
         let tokenizer = K3Tokenizer::load_from_root(&repository_root()).unwrap();
         for (messages, fragments) in [(64, 160), (96, 192), (160, 192)] {

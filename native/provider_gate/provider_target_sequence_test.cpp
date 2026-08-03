@@ -991,6 +991,25 @@ void require_tensor_equal(const at::Tensor& actual,
   }
 }
 
+// Batched and per-row execution are algebraically equivalent but not
+// bit-exact: a batched matmul kernel can choose a different reduction/tiling
+// order per row than the unbatched kernel does, producing float32-ULP drift.
+void require_tensor_close(const at::Tensor& actual, const at::Tensor& expected,
+                          const char* name) {
+  if (!at::allclose(actual, expected, /*rtol=*/1.0e-5, /*atol=*/1.0e-6,
+                    /*equal_nan=*/true)) {
+    const double error =
+        at::max(at::abs(actual - expected)).item<double>();
+    const std::int64_t differing =
+        actual.ne(expected).sum().item<std::int64_t>();
+    std::ostringstream detail;
+    detail << name << " differs, max_abs=" << std::scientific
+           << std::setprecision(9) << error
+           << " differing=" << differing << '/' << actual.numel();
+    throw std::runtime_error(detail.str());
+  }
+}
+
 void require_caches_equal(const Caches& actual, const Caches& expected,
                           const std::uint64_t positions) {
   if (actual.kda.size() != expected.kda.size() ||
@@ -1088,7 +1107,7 @@ void test_batched_tail_equivalence(const Model& model) {
         TargetBlockResidual{anchor_rows.narrow(0, row, 1)}, model.tail,
         false));
   }
-  require_tensor_equal(batched, at::cat(canonical, 0).contiguous(),
+  require_tensor_close(batched, at::cat(canonical, 0).contiguous(),
                        "batched target tail logits");
 }
 

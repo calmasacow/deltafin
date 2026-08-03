@@ -11,10 +11,11 @@ mod types;
 
 pub use server::{
     DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_RESPONSE_MEMO_BYTES, DEFAULT_RESPONSE_MEMO_ENTRIES,
-    MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_MEMO_BYTES, OpenAiHttpServer, OpenAiService, ServerConfig,
+    MAX_GENERATION_QUEUE_SLOTS, MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_MEMO_BYTES, OpenAiHttpServer,
+    OpenAiService, ServerConfig,
 };
 pub use types::{
-    AuthoritativeTarget, ChatMessage, FinishReason, StreamGenerationError, StreamPublication,
-    TargetDelta, TargetDeltaChannel, TargetDeltaSink, TargetOutput, TargetPrompt, TargetRequest,
-    TargetStreamSummary, TokenUsage,
+    AuthoritativeTarget, ChatMessage, ClientPresence, FinishReason, StreamGenerationError,
+    StreamPublication, TargetDelta, TargetDeltaChannel, TargetDeltaSink, TargetOutput,
+    TargetPrompt, TargetRequest, TargetStreamSummary, TokenUsage,
 };

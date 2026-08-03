@@ -1884,13 +1884,16 @@ fn linux_loader_cache_directories(
     log_root: &Path,
     guard: &PythonGuard,
 ) -> NativeBuildResult<Vec<PathBuf>> {
+    // A candidate that is missing, or present but not a genuine native
+    // executable (a wrapper script on some distributions, for example),
+    // is treated identically: this enrichment is optional and already has
+    // a real fallback, so there is nothing to validate-and-panic over here.
     let Some(tool) = [Path::new("/sbin/ldconfig"), Path::new("/usr/sbin/ldconfig")]
         .into_iter()
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| candidate.is_file() && is_native_executable(candidate))
     else {
         return Ok(linux_system_library_directories());
     };
-    validate_native_executable(tool, "Linux loader-cache auditor");
     let mut command = Command::new(tool);
     command.arg("-p");
     sanitize_test_environment(&mut command, guard)?;
@@ -3230,6 +3233,21 @@ fn validate_native_executable(path: &Path, label: &str) {
     }
 }
 
+/// Non-panicking counterpart to `validate_native_executable`, for optional
+/// tools with an established fallback. A candidate that cannot be opened,
+/// cannot be read, or fails the magic check is simply not usable -- it is
+/// never treated as "close enough" and never executed either way.
+fn is_native_executable(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    is_native_magic(&magic)
+}
+
 fn is_native_magic(magic: &[u8; 4]) -> bool {
     matches!(
         *magic,
@@ -3806,6 +3824,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn is_native_executable_accepts_elf_and_rejects_scripts_or_absent_files() {
+        let root = TestDirectory::new("native-executable-check");
+        let elf = root.0.join("elf-tool");
+        fs::write(&elf, [0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
+        assert!(is_native_executable(&elf));
+
+        let script = root.0.join("script-tool");
+        fs::write(&script, "#!/bin/sh\necho not native\n").unwrap();
+        assert!(!is_native_executable(&script));
+
+        let missing = root.0.join("does-not-exist");
+        assert!(!is_native_executable(&missing));
+    }
+
+    #[test]
+    fn ldconfig_style_selection_falls_back_past_a_non_native_first_candidate() {
+        // Mirrors linux_loader_cache_directories's own selection predicate:
+        // a script at the first candidate path must not win over a genuine
+        // native binary at the second, and neither should panic.
+        let root = TestDirectory::new("ldconfig-candidate-selection");
+        let first = root.0.join("sbin-ldconfig");
+        fs::write(&first, "#!/bin/sh\necho wrapper\n").unwrap();
+        let second = root.0.join("usr-sbin-ldconfig");
+        fs::write(&second, [0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
+
+        let selected = [first.as_path(), second.as_path()]
+            .into_iter()
+            .find(|candidate| candidate.is_file() && is_native_executable(candidate));
+        assert_eq!(selected, Some(second.as_path()));
+
+        // Neither candidate being native must fall through cleanly, not panic.
+        fs::write(&second, "#!/bin/sh\necho also a wrapper\n").unwrap();
+        let selected = [first.as_path(), second.as_path()]
+            .into_iter()
+            .find(|candidate| candidate.is_file() && is_native_executable(candidate));
+        assert_eq!(selected, None);
     }
 
     #[test]

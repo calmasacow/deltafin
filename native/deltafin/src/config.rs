@@ -106,7 +106,7 @@ impl SpineRequest {
                 "K3_SPINE=mixed is unsupported because its research codecs change target weights",
             )),
             _ => Err(DeltafinError::new(
-                "spine must be auto/bf16 (original weights) or explicit int8 (quantized and non-weight-exact)",
+                "spine must be auto/int8 (quantized row-int8 default, non-weight-exact) or explicit bf16 (original weights)",
             )),
         }
     }
@@ -447,25 +447,38 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_bf16_preserve_original_checkpoint_authority() {
+    fn auto_resolves_the_default_int8_spine_and_baseline_settings() {
         let auto = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
         assert_eq!(auto.surface, RuntimeSurface::DirectRun);
         assert_eq!(auto.spine, SpineRequest::Auto);
         assert_eq!(auto.spine_fd_cache, None);
         assert_eq!(auto.provider_resident_layers, None);
         assert_eq!(auto.expert_read_threads, None);
-        assert!(auto.quality.is_weight_exact());
+        // The default resident spine is the measured row-int8 conversion;
+        // setup prepares it automatically, and it is not weight-exact.
+        assert!(!auto.quality.is_weight_exact());
+        assert_eq!(
+            auto.quality.resident_weights,
+            ResidentWeightAuthority::QuantizedInt8
+        );
         assert_eq!(auto.dspark, DSparkRequest::Auto);
         assert_eq!(auto.dspark_max_context, Some(8_192));
         assert_eq!(auto.dspark_min_auto_speedup, 0.03);
         assert_eq!(auto.router_trace_mode, RouterTraceMode::Off);
         assert!(auto.router_trace_path.is_none());
+    }
 
+    #[test]
+    fn explicit_bf16_preserves_original_checkpoint_authority() {
         let mut explicit = arguments();
         explicit.spine = Some("bf16".into());
         let bf16 = RuntimeConfig::resolve(explicit, |_| None).unwrap();
         assert_eq!(bf16.spine, SpineRequest::Bf16);
         assert!(bf16.quality.is_weight_exact());
+        assert_eq!(
+            bf16.quality.resident_weights,
+            ResidentWeightAuthority::OriginalBf16
+        );
     }
 
     #[test]

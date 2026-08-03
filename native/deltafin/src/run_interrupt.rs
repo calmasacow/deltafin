@@ -1,10 +1,12 @@
-//! Run-only cooperative SIGINT handling for the native command-line client.
+//! Cooperative cancellation sources for native target generation.
 //!
-//! The installed handler performs exactly one lock-free atomic store.  Target
-//! code observes the sticky flag only at transaction boundaries, so a signal
-//! can never unwind Rust, C++, Metal, or CUDA while provider-owned state is
-//! being mutated.  The OpenAI server never constructs this guard and retains
-//! the operating system's normal signal disposition.
+//! The CLI's SIGINT handler performs exactly one lock-free atomic store, and
+//! the OpenAI server adapts its client-liveness probe to the same
+//! [`InterruptSource`] trait.  Target code observes cancellation only at
+//! transaction boundaries, so neither a signal nor a client disconnect can
+//! ever unwind Rust, C++, Metal, or CUDA while provider-owned state is being
+//! mutated.  The server never constructs the SIGINT guard and retains the
+//! operating system's normal signal disposition.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,17 +25,6 @@ static RUN_HANDLER_ARMED: AtomicBool = AtomicBool::new(false);
 /// Read-only cancellation source used by the target transaction loop.
 pub(crate) trait InterruptSource {
     fn requested(&self) -> bool;
-}
-
-/// The server and reusable engine API compile against this zero-cost source.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct NeverInterrupt;
-
-impl InterruptSource for NeverInterrupt {
-    #[inline(always)]
-    fn requested(&self) -> bool {
-        false
-    }
 }
 
 /// A sticky atomic source. Tests use a local atomic; the CLI guard exposes the
@@ -149,8 +140,4 @@ mod tests {
         assert!(source.requested());
     }
 
-    #[test]
-    fn never_source_cannot_interrupt_server_style_generation() {
-        assert!(!NeverInterrupt.requested());
-    }
 }

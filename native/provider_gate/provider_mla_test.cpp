@@ -350,12 +350,13 @@ void require_trace(const MlaExecutionTrace& actual,
 }
 
 void require_close(const at::Tensor& actual, const at::Tensor& expected,
-                   const char* name) {
+                   const char* name, double rtol = 2.0e-5,
+                   double atol = 2.0e-6) {
   const at::Tensor actual_cpu = actual.to(at::kCPU);
   const at::Tensor expected_cpu = expected.to(at::kCPU);
   const double maximum =
       at::max(at::abs(actual_cpu - expected_cpu)).item<double>();
-  if (!at::allclose(actual_cpu, expected_cpu, 2.0e-5, 2.0e-6, true)) {
+  if (!at::allclose(actual_cpu, expected_cpu, rtol, atol, true)) {
     throw std::runtime_error(std::string(name) +
                              " parity failed; max_abs=" +
                              std::to_string(maximum));
@@ -484,8 +485,12 @@ void run_packed_parity(const at::Device& device) {
     require_close(candidate.output, expected, "row-int8 MLA decode");
     require_equal(candidate.output, fallback.output,
                   "same-input bundled MLA projection");
+    // packed_test_shape's kv_lora_rank/qk_rope_head_dim (32) are ~10x
+    // test_shape's, so the documented reassociation drift from moving kv_b
+    // across the score/value contractions (see prepare_mla_positions) grows
+    // past the default tolerance on some platforms' BLAS reduction order.
     require_close(compact.output, expected,
-                  "row-int8 absorbed compact MLA decode");
+                  "row-int8 absorbed compact MLA decode", 5.0e-5, 1.0e-5);
     deltafin::provider_internal::commit_mla_decode(fallback_cache, fallback);
     deltafin::provider_internal::commit_mla_decode(bundled_cache, candidate);
     deltafin::provider_internal::commit_mla_decode(compact_cache, compact);

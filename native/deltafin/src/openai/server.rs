@@ -1,18 +1,19 @@
+use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use super::response_memo::{DeterministicResponseMemo, ResponseMode};
 use super::types::{
-    AuthoritativeTarget, ChatMessage, StreamGenerationError, StreamPublication, TargetDelta,
-    TargetDeltaChannel, TargetDeltaSink, TargetOutput, TargetPrompt, TargetRequest,
+    AuthoritativeTarget, ChatMessage, ClientPresence, StreamGenerationError, StreamPublication,
+    TargetDelta, TargetDeltaChannel, TargetDeltaSink, TargetOutput, TargetPrompt, TargetRequest,
     TargetStreamSummary, TokenUsage,
 };
 
@@ -24,6 +25,9 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_RESPONSE_MEMO_ENTRIES: usize = 32;
 pub const DEFAULT_RESPONSE_MEMO_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RESPONSE_MEMO_BYTES: usize = 1024 * 1024 * 1024;
+/// Each waiting request holds one worker thread and one open connection for
+/// up to an entire generation, so the queue stays deliberately small.
+pub const MAX_GENERATION_QUEUE_SLOTS: usize = 64;
 const DEFAULT_MAX_NEW_TOKENS: usize = 1_000_000;
 const DEFAULT_COMPLETION_TOKENS: usize = 256;
 const DEFAULT_CHAT_TOKENS: usize = 1_000_000;
@@ -39,6 +43,10 @@ pub struct ServerConfig {
     pub default_chat_tokens: usize,
     pub response_memo_entries: usize,
     pub response_memo_bytes: usize,
+    /// Concurrent generation requests allowed to wait, in arrival order, for
+    /// the single generation slot. Zero — the default — preserves the
+    /// documented immediate 429 for every concurrent request.
+    pub generation_queue_slots: usize,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +59,7 @@ impl Default for ServerConfig {
             default_chat_tokens: DEFAULT_CHAT_TOKENS,
             response_memo_entries: DEFAULT_RESPONSE_MEMO_ENTRIES,
             response_memo_bytes: DEFAULT_RESPONSE_MEMO_BYTES,
+            generation_queue_slots: 0,
         }
     }
 }
@@ -84,6 +93,12 @@ impl ServerConfig {
             )
             .into());
         }
+        if self.generation_queue_slots > MAX_GENERATION_QUEUE_SLOTS {
+            return Err(format!(
+                "OpenAI server generation queue must be in 0..={MAX_GENERATION_QUEUE_SLOTS} waiting slots"
+            )
+            .into());
+        }
         Ok(())
     }
 }
@@ -91,9 +106,13 @@ impl ServerConfig {
 /// Thread-safe OpenAI request dispatcher.
 ///
 /// One owned generation permit protects the target and its response-boundary
-/// transaction. A concurrent completion is rejected immediately instead of
-/// waiting behind a generation that may run for hours; model discovery and
-/// other non-generation routes do not need the permit.
+/// transaction. A concurrent completion is rejected immediately — or, when
+/// the operator configures waiting slots, admitted to a bounded
+/// arrival-ordered queue — instead of waiting indefinitely behind a
+/// generation that may run for hours; model discovery and other
+/// non-generation routes do not need the permit. A client that provably
+/// disconnects, whether waiting or generating, is abandoned so its turn costs
+/// no target compute.
 pub struct OpenAiService<T> {
     shared: Arc<ServiceInner<T>>,
 }
@@ -106,32 +125,138 @@ struct ServiceInner<T> {
     created: u64,
 }
 
+/// How often a queued request re-checks its client's socket while waiting for
+/// the generation slot.
+const QUEUED_DISCONNECT_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Default)]
 struct GenerationGate {
-    active: AtomicBool,
+    state: Mutex<GateState>,
+    turned: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    generating: bool,
+    /// Tickets of admitted waiters, front first. Strict arrival order: a
+    /// waiter claims the slot only while its ticket is the queue front, so a
+    /// condvar wake can never reorder admissions.
+    waiting: VecDeque<u64>,
+    next_ticket: u64,
+}
+
+/// Admission decision for one generation-capable request.
+enum Admission {
+    /// The caller owns the sole generation slot immediately.
+    Permit(GenerationPermit),
+    /// The slot is taken but a waiting slot was free; the ticket holds the
+    /// caller's place in arrival order.
+    Queued(QueueTicket),
+    /// The slot is taken and every waiting slot is occupied.
+    Busy,
 }
 
 impl GenerationGate {
-    fn try_acquire(self: &Arc<Self>) -> Option<GenerationPermit> {
-        self.active
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| GenerationPermit {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        // No caller code runs while this lock is held, so poisoning can only
+        // follow a panic elsewhere; admission must keep working regardless.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn admit(self: &Arc<Self>, waiting_slots: usize) -> Admission {
+        let mut state = self.lock_state();
+        if !state.generating && state.waiting.is_empty() {
+            state.generating = true;
+            return Admission::Permit(GenerationPermit {
                 gate: Arc::clone(self),
-            })
+            });
+        }
+        if state.waiting.len() < waiting_slots {
+            let number = state.next_ticket;
+            state.next_ticket += 1;
+            state.waiting.push_back(number);
+            return Admission::Queued(QueueTicket {
+                gate: Arc::clone(self),
+                number,
+                claimed: false,
+            });
+        }
+        Admission::Busy
     }
 }
 
 /// Owned so the listener can reserve the sole generation slot before moving
 /// an accepted completion request to its worker. Dropping this on every path
-/// reopens admission only after the previous transaction is over.
+/// reopens admission — and wakes the queue front — only after the previous
+/// transaction is over.
 struct GenerationPermit {
     gate: Arc<GenerationGate>,
 }
 
 impl Drop for GenerationPermit {
     fn drop(&mut self) {
-        self.gate.active.store(false, Ordering::Release);
+        let mut state = self.gate.lock_state();
+        state.generating = false;
+        drop(state);
+        self.gate.turned.notify_all();
+    }
+}
+
+/// One place in the arrival-ordered wait queue. Dropping an unclaimed ticket
+/// (client disconnect, body-read failure, worker panic) removes it and wakes
+/// the queue, so a departed waiter can never wedge admission.
+struct QueueTicket {
+    gate: Arc<GenerationGate>,
+    number: u64,
+    claimed: bool,
+}
+
+impl QueueTicket {
+    /// Block until this ticket reaches the queue front and the generation
+    /// slot frees, probing `client` between waits. Returns `None` — freeing
+    /// the waiting slot — once the client has provably disconnected.
+    fn wait_for_permit(mut self, client: &ClientPresence) -> Option<GenerationPermit> {
+        loop {
+            {
+                let mut state = self.gate.lock_state();
+                loop {
+                    if !state.generating && state.waiting.front() == Some(&self.number) {
+                        state.waiting.pop_front();
+                        state.generating = true;
+                        self.claimed = true;
+                        return Some(GenerationPermit {
+                            gate: Arc::clone(&self.gate),
+                        });
+                    }
+                    let (reacquired, timeout) = self
+                        .gate
+                        .turned
+                        .wait_timeout(state, QUEUED_DISCONNECT_PROBE_INTERVAL)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state = reacquired;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+            }
+            // The probe is a syscall; run it outside the admission lock.
+            if client.disconnected() {
+                return None;
+            }
+        }
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        if self.claimed {
+            return;
+        }
+        let mut state = self.gate.lock_state();
+        state.waiting.retain(|number| *number != self.number);
+        drop(state);
+        // Removing the queue front can make the next waiter claimable.
+        self.gate.turned.notify_all();
     }
 }
 
@@ -166,12 +291,22 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
     }
 
     /// Consume and answer one `tiny_http` request.
+    ///
+    /// This synchronous entry point has no socket probe for its client, so a
+    /// queued caller waits as long as its turn takes; `serve_forever` is the
+    /// path that observes disconnects.
     pub fn handle_request(&self, request: Request) -> io::Result<()> {
         let permit = if request_requires_generation_permit(&request) {
-            let Some(permit) = self.shared.generation_gate.try_acquire() else {
-                return respond_busy(request);
-            };
-            Some(permit)
+            let queue_slots = self.shared.config.generation_queue_slots;
+            match self.shared.generation_gate.admit(queue_slots) {
+                Admission::Permit(permit) => Some(permit),
+                Admission::Queued(ticket) => Some(
+                    ticket
+                        .wait_for_permit(&ClientPresence::assumed_present())
+                        .expect("an assumed-present client cannot disconnect"),
+                ),
+                Admission::Busy => return respond_busy(request),
+            }
         } else {
             None
         };
@@ -181,29 +316,89 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
     fn handle_admitted_request(
         &self,
         mut request: Request,
-        _permit: Option<GenerationPermit>,
+        permit: Option<GenerationPermit>,
     ) -> io::Result<()> {
         let method = HttpMethod::from(request.method());
-        let path = request
-            .url()
-            .split_once('?')
-            .map_or(request.url(), |(path, _)| path)
-            .to_owned();
+        if method == HttpMethod::Post {
+            let body = read_bounded_body(&mut request, self.shared.config.max_request_body_bytes);
+            return self.respond_to_post(request, permit, body, &ClientPresence::assumed_present());
+        }
+        let path = request_path(&request);
+        let response = self.dispatch(method, &path, &[]);
+        request.respond(response.into_tiny_http())
+    }
 
-        let response = if method == HttpMethod::Post {
-            match read_bounded_body(&mut request, self.shared.config.max_request_body_bytes) {
-                Ok(body) => {
-                    if let Some(stream_kind) = StreamKind::for_path(&path)
-                        && body_requests_stream(&body)
-                    {
-                        return self.handle_stream_request(request, stream_kind, &body);
-                    }
-                    self.dispatch(method, &path, &body)
-                }
-                Err(error) => error.into_response(),
+    /// Read the body and answer while already holding the generation permit,
+    /// exactly as a single uncontended request always has.
+    fn respond_generation(
+        &self,
+        mut request: Request,
+        permit: GenerationPermit,
+        client: &ClientPresence,
+    ) -> io::Result<()> {
+        let body = read_bounded_body(&mut request, self.shared.config.max_request_body_bytes);
+        self.respond_to_post(request, Some(permit), body, client)
+    }
+
+    /// Wait for the generation slot from a queue ticket, dropping the request
+    /// silently if its client disconnects first.
+    fn respond_queued_generation(
+        &self,
+        mut request: Request,
+        ticket: QueueTicket,
+        client: &ClientPresence,
+    ) -> io::Result<()> {
+        // Drain the request body before waiting: a malformed or oversized
+        // request is answered right away without ever consuming a generation
+        // turn, and the client's send side is not left blocked on a full
+        // socket buffer for however long the queue takes.
+        let body = match read_bounded_body(&mut request, self.shared.config.max_request_body_bytes)
+        {
+            Ok(body) => body,
+            Err(error) => {
+                // The unclaimed ticket drops here, freeing its waiting slot.
+                return request.respond(error.into_response().into_tiny_http());
             }
-        } else {
-            self.dispatch(method, &path, &[])
+        };
+        let Some(permit) = ticket.wait_for_permit(client) else {
+            eprintln!("[serve] queued client disconnected; its waiting slot was freed");
+            abandon_unanswered(request);
+            return Ok(());
+        };
+        self.respond_to_post(request, Some(permit), Ok(body), client)
+    }
+
+    /// Answer one POST whose body has already been read (or failed to read).
+    ///
+    /// Every generation-capable request funnels through here: the
+    /// immediate-permit flow, the queued flow, and fabricated test requests
+    /// (which probe as assumed-present).
+    fn respond_to_post(
+        &self,
+        request: Request,
+        _permit: Option<GenerationPermit>,
+        body: Result<Vec<u8>, ApiFailure>,
+        client: &ClientPresence,
+    ) -> io::Result<()> {
+        if client.disconnected() {
+            // The last pre-generation moment to notice a vanished client:
+            // skip the whole response instead of aborting one layer into
+            // prefill. The permit drops with this frame, reopening admission.
+            eprintln!("[serve] client disconnected before generation; request abandoned");
+            abandon_unanswered(request);
+            return Ok(());
+        }
+        let path = request_path(&request);
+        let response = match body {
+            Ok(body) => {
+                if let Some(stream_kind) = StreamKind::for_path(&path)
+                    && body_requests_stream(&body)
+                {
+                    return self.handle_stream_request(request, stream_kind, &body, client);
+                }
+                self.dispatch_for_client(HttpMethod::Post, &path, &body, client)
+            }
+            Err(error) => error.into_response(),
         };
 
         let response_succeeded = (200..300).contains(&response.status);
@@ -219,12 +414,25 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         result
     }
 
+    /// Route a request whose client has no liveness probe, mirroring the
+    /// interrupt-source pattern: tests and embedders route here, and the HTTP
+    /// paths that can observe a socket route through [`Self::dispatch_for_client`].
     fn dispatch(&self, method: HttpMethod, path: &str, body: &[u8]) -> WireResponse {
+        self.dispatch_for_client(method, path, body, &ClientPresence::assumed_present())
+    }
+
+    fn dispatch_for_client(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: &[u8],
+        client: &ClientPresence,
+    ) -> WireResponse {
         match (method, path) {
             (HttpMethod::Get, "/v1/models" | "/models") => self.models(),
-            (HttpMethod::Post, "/v1/completions" | "/completions") => self.completion(body),
+            (HttpMethod::Post, "/v1/completions" | "/completions") => self.completion(body, client),
             (HttpMethod::Post, "/v1/chat/completions" | "/chat/completions") => {
-                self.chat_completion(body)
+                self.chat_completion(body, client)
             }
             (
                 _,
@@ -259,12 +467,12 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         )
     }
 
-    fn completion(&self, body: &[u8]) -> WireResponse {
+    fn completion(&self, body: &[u8], client: &ClientPresence) -> WireResponse {
         let request = match self.parse_completion(body) {
             Ok(request) => request,
             Err(error) => return error.into_response(),
         };
-        let generated = match self.generate(&request, ResponseMode::Completion) {
+        let generated = match self.generate(&request, ResponseMode::Completion, client) {
             Ok(output) => output,
             Err(response) => return response,
         };
@@ -286,12 +494,12 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         WireResponse::target_json(200, response, generated.target_invoked)
     }
 
-    fn chat_completion(&self, body: &[u8]) -> WireResponse {
+    fn chat_completion(&self, body: &[u8], client: &ClientPresence) -> WireResponse {
         let request = match self.parse_chat(body) {
             Ok(request) => request,
             Err(error) => return error.into_response(),
         };
-        let generated = match self.generate(&request, ResponseMode::Chat) {
+        let generated = match self.generate(&request, ResponseMode::Chat, client) {
             Ok(output) => output,
             Err(response) => return response,
         };
@@ -328,6 +536,7 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         &self,
         request: &TargetRequest,
         mode: ResponseMode,
+        client: &ClientPresence,
     ) -> Result<GeneratedOutput, WireResponse> {
         if let Ok(mut memo) = self.shared.response_memo.lock()
             && let Some(output) = memo.get(mode, request)
@@ -345,7 +554,7 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
             )
             .into_response()
         })?;
-        let output = match target.generate_target(request) {
+        let output = match target.generate_target(request, client) {
             Ok(output) => output,
             Err(error) => {
                 let mut response =
@@ -476,6 +685,7 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
         request: Request,
         kind: StreamKind,
         body: &[u8],
+        client: &ClientPresence,
     ) -> io::Result<()> {
         let parsed = match kind {
             StreamKind::Completion => self.parse_completion_mode(body, true),
@@ -550,6 +760,7 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
             &identity,
             &version,
             &mut writer,
+            client,
         );
         if let Ok(output) = &generated
             && let Ok(mut memo) = self.shared.response_memo.lock()
@@ -594,6 +805,7 @@ impl<T: AuthoritativeTarget> OpenAiHttpServer<T> {
     where
         T: 'static,
     {
+        let listener_port = listener_tcp_port(&self.listener);
         for request in self.listener.incoming_requests() {
             if !request_requires_generation_permit(&request) {
                 if let Err(error) = self.service.handle_admitted_request(request, None) {
@@ -602,26 +814,43 @@ impl<T: AuthoritativeTarget> OpenAiHttpServer<T> {
                 continue;
             }
 
-            let Some(permit) = self.service.shared.generation_gate.try_acquire() else {
-                if let Err(error) = respond_busy(request) {
-                    eprintln!("[serve] busy response aborted safely: {error}");
+            let queue_slots = self.service.shared.config.generation_queue_slots;
+            match self.service.shared.generation_gate.admit(queue_slots) {
+                Admission::Busy => {
+                    if let Err(error) = respond_busy(request) {
+                        eprintln!("[serve] busy response aborted safely: {error}");
+                    }
                 }
-                continue;
-            };
-
-            // There can be at most one live request worker because the permit
-            // is reserved in the listener thread before spawning. Keeping the
-            // listener free is what lets a second client receive 429 instead
-            // of sitting in the socket queue for the duration of generation.
-            let service = self.service.clone();
-            let _worker = thread::spawn(move || {
-                if let Err(error) = service.handle_admitted_request(request, Some(permit)) {
-                    // A disconnected client or one failed target request must
-                    // not take down the listener. The streaming transaction
-                    // has already received `Aborted` before this error escapes.
-                    eprintln!("[serve] response aborted safely: {error}");
+                // There can be at most one live generation worker because the
+                // permit is reserved in the listener thread before spawning,
+                // and at most `queue_slots` waiting workers because tickets
+                // are too. Keeping the listener free is what lets the next
+                // client receive its 429 or waiting slot instead of sitting
+                // in the socket queue for the duration of generation.
+                Admission::Permit(permit) => {
+                    let service = self.service.clone();
+                    let client = client_presence_for(&request, listener_port);
+                    let _worker = thread::spawn(move || {
+                        if let Err(error) = service.respond_generation(request, permit, &client) {
+                            // A disconnected client or one failed target
+                            // request must not take down the listener. The
+                            // streaming transaction has already received
+                            // `Aborted` before this error escapes.
+                            eprintln!("[serve] response aborted safely: {error}");
+                        }
+                    });
                 }
-            });
+                Admission::Queued(ticket) => {
+                    let service = self.service.clone();
+                    let client = client_presence_for(&request, listener_port);
+                    let _worker = thread::spawn(move || {
+                        let outcome = service.respond_queued_generation(request, ticket, &client);
+                        if let Err(error) = outcome {
+                            eprintln!("[serve] queued response aborted safely: {error}");
+                        }
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -671,15 +900,242 @@ impl StreamKind {
     }
 }
 
-fn request_requires_generation_permit(request: &Request) -> bool {
-    if request.method() != &Method::Post {
-        return false;
-    }
-    let path = request
+fn request_path(request: &Request) -> String {
+    request
         .url()
         .split_once('?')
-        .map_or(request.url(), |(path, _)| path);
-    StreamKind::for_path(path).is_some()
+        .map_or(request.url(), |(path, _)| path)
+        .to_owned()
+}
+
+fn request_requires_generation_permit(request: &Request) -> bool {
+    request.method() == &Method::Post && StreamKind::for_path(&request_path(request)).is_some()
+}
+
+/// Consume a request whose client has provably disconnected without writing
+/// tiny_http's automatic 500: extracting the response writer marks the
+/// request answered, and dropping that writer closes the connection quietly.
+fn abandon_unanswered(request: Request) {
+    drop(request.into_writer());
+}
+
+fn listener_tcp_port(listener: &Server) -> Option<u16> {
+    listener.server_addr().to_ip().map(|address| address.port())
+}
+
+/// Build the liveness probe for one accepted generation request.
+///
+/// A request whose connection cannot be located — a fabricated test request,
+/// a Unix-socket listener, or a platform without a readable descriptor
+/// table — degrades to an assumed-present client, restoring the previous
+/// generate-to-completion behavior rather than risking a false disconnect.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn client_presence_for(request: &Request, listener_port: Option<u16>) -> ClientPresence {
+    let (Some(port), Some(peer)) = (listener_port, request.remote_addr().copied()) else {
+        return ClientPresence::assumed_present();
+    };
+    match client_socket::capture(peer, port) {
+        Some(socket) => ClientPresence::from_probe(Box::new(move || socket.provably_disconnected())),
+        None => ClientPresence::assumed_present(),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn client_presence_for(_request: &Request, _listener_port: Option<u16>) -> ClientPresence {
+    ClientPresence::assumed_present()
+}
+
+/// Peer-socket liveness observation for `tiny_http` connections.
+///
+/// `tiny_http` deliberately hides its `TcpStream`, so the server locates the
+/// accepted connection's descriptor in this process's own descriptor table by
+/// matching the request's exact TCP 4-tuple — `getpeername` equal to the
+/// request's remote address and `getsockname` on the listener's port — and
+/// duplicates it. Matching both endpoints means a live connection can never
+/// select the wrong descriptor: one live 4-tuple maps to one socket. A scan
+/// miss degrades to an assumed-present client, never to a false disconnect.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod client_socket {
+    use std::fs;
+    use std::net::{IpAddr, SocketAddr};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    #[cfg(target_os = "macos")]
+    const DESCRIPTOR_TABLE: &str = "/dev/fd";
+    #[cfg(target_os = "linux")]
+    const DESCRIPTOR_TABLE: &str = "/proc/self/fd";
+
+    pub(super) struct ClientSocket {
+        connection: OwnedFd,
+    }
+
+    impl ClientSocket {
+        /// True only on positive evidence that the client is gone.
+        ///
+        /// `recv(MSG_PEEK)` cannot be the signal here: `tiny_http` shuts down
+        /// its read half once it knows a connection carries no further
+        /// requests, and a local read shutdown makes `recv` report EOF while
+        /// the peer is still waiting for its response. The kernel's TCP
+        /// state ignores local API-level shutdown: an alive, waiting client
+        /// stays ESTABLISHED, while a departed one has advanced to
+        /// CLOSE-WAIT (its FIN arrived) or CLOSED (reset). Nothing is ever
+        /// read from the stream, so pipelined bytes stay untouched, and an
+        /// unanswerable state query degrades to "present" rather than
+        /// abandoning a live client. A client that half-closes its send side
+        /// yet keeps reading is indistinguishable from a departed one and is
+        /// treated as gone; HTTP clients do not do this mid-response.
+        pub(super) fn provably_disconnected(&self) -> bool {
+            match tcp_state(self.connection.as_raw_fd()) {
+                Some(state) => state != TCP_STATE_ESTABLISHED,
+                None => false,
+            }
+        }
+    }
+
+    /// `TCPS_ESTABLISHED` from xnu's `netinet/tcp_fsm.h`.
+    #[cfg(target_os = "macos")]
+    const TCP_STATE_ESTABLISHED: u8 = 4;
+    /// `TCP_ESTABLISHED` from the Linux kernel's `include/net/tcp_states.h`.
+    #[cfg(target_os = "linux")]
+    const TCP_STATE_ESTABLISHED: u8 = 1;
+
+    #[cfg(target_os = "macos")]
+    fn tcp_state(fd: RawFd) -> Option<u8> {
+        // SAFETY: an all-zero tcp_connection_info is a valid out-parameter
+        // for this plain-data kernel report.
+        let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+        // SAFETY: `info` and `length` describe one writable, properly sized
+        // report buffer owned by this frame.
+        let outcome = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONNECTION_INFO,
+                std::ptr::from_mut(&mut info).cast(),
+                &mut length,
+            )
+        };
+        (outcome == 0).then_some(info.tcpi_state)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tcp_state(fd: RawFd) -> Option<u8> {
+        // SAFETY: an all-zero tcp_info is a valid out-parameter for this
+        // plain-data kernel report.
+        let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        // SAFETY: `info` and `length` describe one writable, properly sized
+        // report buffer owned by this frame.
+        let outcome = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                std::ptr::from_mut(&mut info).cast(),
+                &mut length,
+            )
+        };
+        (outcome == 0).then_some(info.tcpi_state)
+    }
+
+    pub(super) fn capture(peer: SocketAddr, listener_port: u16) -> Option<ClientSocket> {
+        let peer = canonical(peer);
+        for entry in fs::read_dir(DESCRIPTOR_TABLE).ok()?.flatten() {
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<RawFd>().ok())
+            else {
+                continue;
+            };
+            if socket_peer(fd).map(canonical) != Some(peer)
+                || socket_local_port(fd) != Some(listener_port)
+            {
+                continue;
+            }
+            let duplicate = duplicate_descriptor(fd)?;
+            // Re-verify on the duplicate: the matched descriptor number could
+            // have been closed and reused between the scan and the dup. The
+            // duplicate's identity can no longer change underneath us.
+            if socket_peer(duplicate.as_raw_fd()).map(canonical) == Some(peer)
+                && socket_local_port(duplicate.as_raw_fd()) == Some(listener_port)
+            {
+                return Some(ClientSocket {
+                    connection: duplicate,
+                });
+            }
+        }
+        None
+    }
+
+    fn duplicate_descriptor(fd: RawFd) -> Option<OwnedFd> {
+        // SAFETY: fcntl reads only its arguments; a non-negative return is a
+        // fresh descriptor this process owns exclusively.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return None;
+        }
+        // SAFETY: `duplicate` was just returned open by fcntl and is owned by
+        // nobody else; OwnedFd takes over its close.
+        Some(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    /// Dual-stack listeners report IPv4 peers as v4-mapped IPv6 addresses;
+    /// compare both sides through the canonical form.
+    fn canonical(address: SocketAddr) -> (IpAddr, u16) {
+        (address.ip().to_canonical(), address.port())
+    }
+
+    fn socket_peer(fd: RawFd) -> Option<SocketAddr> {
+        // SAFETY: an all-zero sockaddr_storage is a valid initial value for a
+        // kernel-filled out-parameter of this plain-data type.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `storage` and `length` describe one writable, properly
+        // sized address buffer owned by this frame.
+        let outcome =
+            unsafe { libc::getpeername(fd, std::ptr::from_mut(&mut storage).cast(), &mut length) };
+        if outcome != 0 {
+            return None;
+        }
+        decode_socket_address(&storage)
+    }
+
+    fn socket_local_port(fd: RawFd) -> Option<u16> {
+        // SAFETY: as in `socket_peer`; zeroed storage is a valid sockaddr
+        // out-parameter.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `storage` and `length` describe one writable, properly
+        // sized address buffer owned by this frame.
+        let outcome =
+            unsafe { libc::getsockname(fd, std::ptr::from_mut(&mut storage).cast(), &mut length) };
+        if outcome != 0 {
+            return None;
+        }
+        decode_socket_address(&storage).map(|address| address.port())
+    }
+
+    fn decode_socket_address(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+        match libc::c_int::from(storage.ss_family) {
+            libc::AF_INET => {
+                // SAFETY: the kernel reported AF_INET, so the storage prefix
+                // is an initialized sockaddr_in, a plain-data type.
+                let source = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in>() };
+                let ip = std::net::Ipv4Addr::from(u32::from_be(source.sin_addr.s_addr));
+                Some(SocketAddr::from((ip, u16::from_be(source.sin_port))))
+            }
+            libc::AF_INET6 => {
+                // SAFETY: the kernel reported AF_INET6, so the storage prefix
+                // is an initialized sockaddr_in6, a plain-data type.
+                let source = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
+                let ip = std::net::Ipv6Addr::from(source.sin6_addr.s6_addr);
+                Some(SocketAddr::from((ip, u16::from_be(source.sin6_port))))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -910,6 +1366,10 @@ impl<T: AuthoritativeTarget> Drop for StreamFinalizer<'_, T> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SSE boundary keeps identity, transport, and client-liveness controls explicit"
+)]
 fn stream_target_to_writer<T: AuthoritativeTarget, W: Write>(
     target: &mut T,
     request: &TargetRequest,
@@ -918,6 +1378,7 @@ fn stream_target_to_writer<T: AuthoritativeTarget, W: Write>(
     identity: &StreamIdentity<'_>,
     http_version: &str,
     writer: &mut W,
+    client: &ClientPresence,
 ) -> io::Result<TargetOutput> {
     write_stream_headers(writer, http_version)?;
     let mut publisher = SsePublisher {
@@ -931,7 +1392,7 @@ fn stream_target_to_writer<T: AuthoritativeTarget, W: Write>(
     let mut capture = CapturingSseSink::new(&mut publisher);
     let summary = match finalizer
         .target()
-        .generate_target_stream(request, &mut capture)
+        .generate_target_stream(request, &mut capture, client)
     {
         Ok(summary) => summary,
         Err(StreamGenerationError::Publication(error)) => return Err(error),
@@ -1726,14 +2187,25 @@ fn response_id(prefix: &str, timestamp: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::error::DeltafinError;
     use crate::openai::{FinishReason, TokenUsage};
+
+    /// Poll `condition` until it holds, panicking with `subject` on timeout.
+    /// Generation admission and socket teardown are asynchronous by nature;
+    /// bounded polling keeps these tests deterministic without fixed sleeps.
+    fn wait_until(subject: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {subject}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[derive(Clone)]
     struct RecordingTarget {
@@ -1758,6 +2230,7 @@ mod tests {
         fn generate_target(
             &mut self,
             request: &TargetRequest,
+            _client: &ClientPresence,
         ) -> crate::error::Result<TargetOutput> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.maximum_active.fetch_max(active, Ordering::SeqCst);
@@ -1795,6 +2268,7 @@ mod tests {
         fn generate_target(
             &mut self,
             _request: &TargetRequest,
+            _client: &ClientPresence,
         ) -> crate::error::Result<TargetOutput> {
             Ok(TargetOutput::target_verified(
                 "non-streaming fallback",
@@ -1806,6 +2280,7 @@ mod tests {
             &mut self,
             _request: &TargetRequest,
             sink: &mut dyn TargetDeltaSink,
+            _client: &ClientPresence,
         ) -> std::result::Result<TargetStreamSummary, StreamGenerationError> {
             if self.fail_target {
                 return Err(DeltafinError::new("target stream failed").into());
@@ -1902,6 +2377,7 @@ mod tests {
             fn generate_target(
                 &mut self,
                 _request: &TargetRequest,
+                _client: &ClientPresence,
             ) -> crate::error::Result<TargetOutput> {
                 self.generated.fetch_add(1, Ordering::SeqCst);
                 Ok(TargetOutput::target_verified("exact", FinishReason::Stop))
@@ -2392,6 +2868,7 @@ mod tests {
             fn generate_target(
                 &mut self,
                 _request: &TargetRequest,
+                _client: &ClientPresence,
             ) -> crate::error::Result<TargetOutput> {
                 panic!("stream request entered the non-streaming target method")
             }
@@ -2400,6 +2877,7 @@ mod tests {
                 &mut self,
                 _request: &TargetRequest,
                 sink: &mut dyn TargetDeltaSink,
+                _client: &ClientPresence,
             ) -> std::result::Result<TargetStreamSummary, StreamGenerationError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 sink.publish_target_delta(TargetDelta::target_verified_content("certified"))?;
@@ -2476,7 +2954,10 @@ mod tests {
             publications.lock().unwrap().as_slice(),
             &[StreamPublication::Complete]
         );
-        assert!(service.shared.generation_gate.try_acquire().is_some());
+        assert!(matches!(
+            service.shared.generation_gate.admit(0),
+            Admission::Permit(_)
+        ));
     }
 
     #[test]
@@ -2545,6 +3026,7 @@ mod tests {
             fn generate_target(
                 &mut self,
                 _request: &TargetRequest,
+                _client: &ClientPresence,
             ) -> crate::error::Result<TargetOutput> {
                 Err(DeltafinError::new("target failed"))
             }
@@ -2564,6 +3046,7 @@ mod tests {
             fn generate_target(
                 &mut self,
                 _request: &TargetRequest,
+                _client: &ClientPresence,
             ) -> crate::error::Result<TargetOutput> {
                 Err(DeltafinError::new("target failed"))
             }
@@ -2610,6 +3093,7 @@ mod tests {
             &fixed_identity(),
             "1.1",
             &mut wire,
+            &ClientPresence::assumed_present(),
         )
         .unwrap();
 
@@ -2659,6 +3143,7 @@ mod tests {
             &identity,
             "1.1",
             &mut wire,
+            &ClientPresence::assumed_present(),
         )
         .unwrap();
 
@@ -2719,6 +3204,7 @@ mod tests {
             &fixed_identity(),
             "1.1",
             &mut writer,
+            &ClientPresence::assumed_present(),
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -2742,6 +3228,7 @@ mod tests {
             &fixed_identity(),
             "1.1",
             &mut wire,
+            &ClientPresence::assumed_present(),
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
@@ -2800,6 +3287,7 @@ mod tests {
             fn generate_target(
                 &mut self,
                 _request: &TargetRequest,
+                _client: &ClientPresence,
             ) -> crate::error::Result<TargetOutput> {
                 panic!("stream request entered the non-streaming target method")
             }
@@ -2808,6 +3296,7 @@ mod tests {
                 &mut self,
                 _request: &TargetRequest,
                 sink: &mut dyn TargetDeltaSink,
+                _client: &ClientPresence,
             ) -> std::result::Result<TargetStreamSummary, StreamGenerationError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 sink.publish_target_delta(TargetDelta::target_verified_content("native"))?;
@@ -2837,5 +3326,353 @@ mod tests {
             publications.lock().unwrap().as_slice(),
             &[StreamPublication::Complete]
         );
+    }
+
+    #[test]
+    fn assumed_present_client_never_disconnects_and_probes_reflect_their_socket() {
+        assert!(!ClientPresence::assumed_present().disconnected());
+        let departed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&departed);
+        let client =
+            ClientPresence::from_probe(Box::new(move || observed.load(Ordering::Relaxed)));
+        assert!(!client.disconnected());
+        departed.store(true, Ordering::Relaxed);
+        assert!(client.disconnected());
+    }
+
+    #[test]
+    fn generation_queue_beyond_the_cap_fails_validation() {
+        let beyond = ServerConfig {
+            generation_queue_slots: MAX_GENERATION_QUEUE_SLOTS + 1,
+            ..ServerConfig::default()
+        };
+        assert!(OpenAiService::new(RecordingTarget::new(), beyond).is_err());
+        let at_cap = ServerConfig {
+            generation_queue_slots: MAX_GENERATION_QUEUE_SLOTS,
+            ..ServerConfig::default()
+        };
+        assert!(OpenAiService::new(RecordingTarget::new(), at_cap).is_ok());
+    }
+
+    fn expect_permit(admission: Admission) -> GenerationPermit {
+        match admission {
+            Admission::Permit(permit) => permit,
+            Admission::Queued(_) => panic!("expected an immediate permit, got a queue ticket"),
+            Admission::Busy => panic!("expected an immediate permit, got busy"),
+        }
+    }
+
+    fn expect_ticket(admission: Admission) -> QueueTicket {
+        match admission {
+            Admission::Queued(ticket) => ticket,
+            Admission::Permit(_) => panic!("expected a queue ticket, got an immediate permit"),
+            Admission::Busy => panic!("expected a queue ticket, got busy"),
+        }
+    }
+
+    #[test]
+    fn gate_serves_waiters_in_arrival_order_and_rejects_beyond_capacity() {
+        let gate = Arc::new(GenerationGate::default());
+        let permit = expect_permit(gate.admit(2));
+        let first = expect_ticket(gate.admit(2));
+        let second = expect_ticket(gate.admit(2));
+        assert!(matches!(gate.admit(2), Admission::Busy));
+
+        let (second_claimed_tx, second_claimed_rx) = mpsc::channel();
+        let second_waiter = thread::spawn(move || {
+            let permit = second
+                .wait_for_permit(&ClientPresence::assumed_present())
+                .expect("an assumed-present waiter cannot be dropped");
+            second_claimed_tx.send(()).unwrap();
+            drop(permit);
+        });
+
+        drop(permit);
+        // The freed slot must go to the queue front even though the younger
+        // waiter has been runnable for longer.
+        let first_permit = first
+            .wait_for_permit(&ClientPresence::assumed_present())
+            .expect("an assumed-present waiter cannot be dropped");
+        assert!(
+            second_claimed_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "the younger waiter claimed the slot ahead of the queue front"
+        );
+        drop(first_permit);
+        second_claimed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second waiter must claim the slot after the first releases");
+        second_waiter.join().unwrap();
+        drop(expect_permit(gate.admit(2)));
+    }
+
+    #[test]
+    fn dropping_an_unclaimed_ticket_frees_its_waiting_slot() {
+        let gate = Arc::new(GenerationGate::default());
+        let _permit = expect_permit(gate.admit(1));
+        let ticket = expect_ticket(gate.admit(1));
+        assert!(matches!(gate.admit(1), Admission::Busy));
+        drop(ticket);
+        drop(expect_ticket(gate.admit(1)));
+    }
+
+    #[test]
+    fn queued_wait_ends_and_frees_the_slot_when_the_client_disconnects() {
+        let gate = Arc::new(GenerationGate::default());
+        let _permit = expect_permit(gate.admit(1));
+        let ticket = expect_ticket(gate.admit(1));
+        let departed = Arc::new(AtomicBool::new(true));
+        let observed = Arc::clone(&departed);
+        let client =
+            ClientPresence::from_probe(Box::new(move || observed.load(Ordering::Relaxed)));
+        assert!(
+            ticket.wait_for_permit(&client).is_none(),
+            "a provably disconnected waiter must not receive the generation slot"
+        );
+        assert_eq!(gate.lock_state().waiting.len(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn socket_probe_reports_only_peer_departure_and_never_consumes_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut accepted, peer) = listener.accept().unwrap();
+        let socket = client_socket::capture(peer, port)
+            .expect("the accepted connection must be locatable by its exact 4-tuple");
+
+        assert!(!socket.provably_disconnected(), "open idle socket");
+        client.write_all(b"p").unwrap();
+        assert!(
+            !socket.provably_disconnected(),
+            "a pipelined byte is not a disconnect"
+        );
+        let mut pipelined = [0_u8; 1];
+        accepted.read_exact(&mut pipelined).unwrap();
+        assert_eq!(&pipelined, b"p", "the probe must never consume stream bytes");
+
+        // tiny_http shuts down its read half once a connection carries no
+        // further requests; a local read shutdown must not read as the
+        // client leaving.
+        accepted.shutdown(std::net::Shutdown::Read).unwrap();
+        assert!(
+            !socket.provably_disconnected(),
+            "a local read shutdown is not a client departure"
+        );
+
+        drop(client);
+        wait_until("the probe to observe the client's departure", || {
+            socket.provably_disconnected()
+        });
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn probe_capture_misses_fabricated_peers_instead_of_guessing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // No connection exists from this fabricated peer, so capture must
+        // decline rather than duplicate an unrelated descriptor.
+        let fabricated: std::net::SocketAddr = "127.0.0.1:23456".parse().unwrap();
+        assert!(client_socket::capture(fabricated, port).is_none());
+    }
+
+    fn waiting_count<T>(service: &OpenAiService<T>) -> usize {
+        service.shared.generation_gate.lock_state().waiting.len()
+    }
+
+    fn http_post_completion(port: u16, prompt: &str) -> std::net::TcpStream {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = format!(r#"{{"prompt":"{prompt}","max_tokens":2}}"#);
+        write!(
+            stream,
+            "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        stream
+    }
+
+    fn read_http_response(mut stream: std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut wire = String::new();
+        let _ = stream.read_to_string(&mut wire);
+        wire
+    }
+
+    /// A target that reports entry, then blocks until released, so tests can
+    /// hold the generation slot at a precise moment.
+    struct GatedTarget {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AuthoritativeTarget for GatedTarget {
+        fn generate_target(
+            &mut self,
+            _request: &TargetRequest,
+            _client: &ClientPresence,
+        ) -> crate::error::Result<TargetOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(TargetOutput::target_verified(
+                "K3 output",
+                FinishReason::Stop,
+            ))
+        }
+    }
+
+    fn spawn_gated_server(
+        queue_slots: usize,
+    ) -> (
+        u16,
+        OpenAiService<GatedTarget>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let target = GatedTarget {
+            entered: entered_tx,
+            release: release_rx,
+            calls: Arc::clone(&calls),
+        };
+        let config = ServerConfig {
+            generation_queue_slots: queue_slots,
+            ..ServerConfig::default()
+        };
+        let server = OpenAiHttpServer::bind("127.0.0.1:0", target, config).unwrap();
+        let port = listener_tcp_port(server.listener()).expect("TCP listener has a port");
+        let service = server.service().clone();
+        thread::spawn(move || {
+            let _ = server.serve_forever();
+        });
+        (port, service, entered_rx, release_tx, calls)
+    }
+
+    #[test]
+    fn served_queue_admits_one_waiter_in_order_and_rejects_the_next() {
+        let (port, service, entered_rx, release_tx, calls) = spawn_gated_server(1);
+
+        let running = http_post_completion(port, "running");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first request must enter the target");
+
+        let queued = http_post_completion(port, "queued");
+        wait_until("the second request to join the wait queue", || {
+            waiting_count(&service) == 1
+        });
+
+        let rejected = http_post_completion(port, "rejected");
+        let rejection = read_http_response(rejected);
+        assert!(rejection.starts_with("HTTP/1.1 429"), "{rejection}");
+        assert!(rejection.contains("server_busy"), "{rejection}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).unwrap();
+        let first = read_http_response(running);
+        assert!(first.contains("\"K3 output\""), "{first}");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the queued request must enter the target after the slot frees");
+        release_tx.send(()).unwrap();
+        let second = read_http_response(queued);
+        assert!(second.contains("\"K3 output\""), "{second}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(waiting_count(&service), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn served_queue_frees_the_slot_of_a_client_that_disconnects_while_waiting() {
+        let (port, service, entered_rx, release_tx, calls) = spawn_gated_server(1);
+
+        let running = http_post_completion(port, "running");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first request must enter the target");
+
+        let abandoned = http_post_completion(port, "abandoned");
+        wait_until("the second request to join the wait queue", || {
+            waiting_count(&service) == 1
+        });
+        drop(abandoned);
+        wait_until("the departed waiter's slot to free", || {
+            waiting_count(&service) == 0
+        });
+
+        release_tx.send(()).unwrap();
+        let first = read_http_response(running);
+        assert!(first.contains("\"K3 output\""), "{first}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a waiter that disconnected must never enter the target"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn served_generation_observes_its_vanished_client_through_the_probe() {
+        struct DepartureObservingTarget {
+            entered: mpsc::SyncSender<()>,
+            observed_departure: Arc<AtomicBool>,
+        }
+
+        impl AuthoritativeTarget for DepartureObservingTarget {
+            fn generate_target(
+                &mut self,
+                _request: &TargetRequest,
+                client: &ClientPresence,
+            ) -> crate::error::Result<TargetOutput> {
+                self.entered.send(()).unwrap();
+                // Poll exactly as the engine's transaction boundaries do.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    if client.disconnected() {
+                        self.observed_departure.store(true, Ordering::SeqCst);
+                        return Err(DeltafinError::new("client disconnected"));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(TargetOutput::target_verified(
+                    "nobody is listening",
+                    FinishReason::Stop,
+                ))
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let observed_departure = Arc::new(AtomicBool::new(false));
+        let target = DepartureObservingTarget {
+            entered: entered_tx,
+            observed_departure: Arc::clone(&observed_departure),
+        };
+        let server =
+            OpenAiHttpServer::bind("127.0.0.1:0", target, ServerConfig::default()).unwrap();
+        let port = listener_tcp_port(server.listener()).expect("TCP listener has a port");
+        thread::spawn(move || {
+            let _ = server.serve_forever();
+        });
+
+        let vanishing = http_post_completion(port, "vanishing");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request must enter the target while its client is connected");
+        drop(vanishing);
+        wait_until("the target to observe the disconnect", || {
+            observed_departure.load(Ordering::SeqCst)
+        });
     }
 }

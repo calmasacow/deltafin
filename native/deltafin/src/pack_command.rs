@@ -13,8 +13,10 @@ use crate::program::{K3_LAYER_COUNT, SourceLayout, SpineRepresentation, TargetPr
 pub fn run(arguments: PackSpineArgs) -> Result<()> {
     let model = ModelSpec::load_from_root(&arguments.model_root)?;
     let representation = match SpineRequest::parse(arguments.spine.as_deref())? {
-        SpineRequest::Auto | SpineRequest::Bf16 => SpineRepresentation::OriginalBf16,
-        SpineRequest::Int8 => SpineRepresentation::QuantizedInt8,
+        // The default resident spine is the measured row-int8 conversion;
+        // the original checkpoint remains selectable explicitly.
+        SpineRequest::Auto | SpineRequest::Int8 => SpineRepresentation::QuantizedInt8,
+        SpineRequest::Bf16 => SpineRepresentation::OriginalBf16,
     };
     let program = TargetProgram::compile_with_representation(&model, representation)?;
     let identity = program.pack_identity(&arguments.model_root)?;

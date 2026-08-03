@@ -140,6 +140,10 @@ fn run() -> Result<()> {
             if let Some(note) = status.device_selection_policy.startup_note() {
                 eprintln!("[native-server] {note}");
             }
+            let queue_slots = crate::cli::resolve_generation_queue_slots(
+                arguments.queue_slots,
+                environment_text("K3_SERVER_QUEUE")?.as_deref(),
+            )?;
             let address = socket_address(&arguments.host, arguments.port);
             let server_config = ServerConfig {
                 max_request_body_bytes: arguments.max_request_bytes,
@@ -148,6 +152,7 @@ fn run() -> Result<()> {
                 default_chat_tokens: arguments.max_tokens,
                 response_memo_entries: arguments.response_memo_entries,
                 response_memo_bytes: arguments.response_memo_bytes,
+                generation_queue_slots: queue_slots,
                 ..ServerConfig::default()
             };
             let server =
@@ -155,6 +160,15 @@ fn run() -> Result<()> {
                     DeltafinError::new(format!("bind native OpenAI server at {address}: {error}"))
                 })?;
             eprintln!("[native-server] OpenAI-compatible API listening at http://{address}/v1");
+            if queue_slots == 0 {
+                eprintln!(
+                    "[native-server] admission: one generation at a time; a concurrent request gets an immediate 429 (--queue N allows waiting)"
+                );
+            } else {
+                eprintln!(
+                    "[native-server] admission: one generation at a time; up to {queue_slots} request(s) wait in arrival order, the rest get 429"
+                );
+            }
             server
                 .serve_forever()
                 .map_err(|error| DeltafinError::new(format!("native OpenAI server: {error}")))
@@ -841,6 +855,18 @@ fn audit_installed_payload(root: &Path) -> Result<InstalledPayloadAudit> {
         mode: installation.mode,
         qwen_installed,
     })
+}
+
+/// Read one environment variable as text, failing on a value that exists but
+/// is not UTF-8 instead of silently treating it as unset.
+fn environment_text(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(DeltafinError::new(format!(
+            "{name} must be valid UTF-8 text"
+        ))),
+    }
 }
 
 fn fetch_model_root(explicit: Option<&Path>) -> Result<PathBuf> {
