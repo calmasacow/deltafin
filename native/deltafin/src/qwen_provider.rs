@@ -572,6 +572,7 @@ mod tests {
     #[test]
     #[ignore = "requires the optional pinned Qwen checkpoint and an MPS host"]
     fn installed_qwen06_mps_matches_frozen_transformers_sdpa_oracle() {
+        let _device = crate::provider::exclusive_mps_device();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let checkpoint = QwenCheckpoint::open(&root, QwenVariant::Probe06B)
             .expect("open installed pinned Qwen 0.6B checkpoint");

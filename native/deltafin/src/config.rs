@@ -74,6 +74,32 @@ fn parse_spine_resident_gb(raw: &str) -> Result<u64> {
     Ok(bytes as u64)
 }
 
+fn parse_pilot_gate_threshold(raw: &str) -> Result<f64> {
+    let threshold = raw.trim().parse::<f64>().map_err(|_| {
+        DeltafinError::new("K3_PILOT_GATE_THRESHOLD must be a finite number in [0,1)")
+    })?;
+    if !threshold.is_finite() || !(0.0..1.0).contains(&threshold) {
+        return Err(DeltafinError::new(
+            "K3_PILOT_GATE_THRESHOLD must be a finite number in [0,1)",
+        ));
+    }
+    Ok(threshold)
+}
+
+pub const MAX_PILOT_GATE_WARMUP: u32 = 100_000;
+
+fn parse_pilot_gate_warmup(raw: &str) -> Result<u32> {
+    let warmup = raw.trim().parse::<u32>().map_err(|_| {
+        DeltafinError::new("K3_PILOT_GATE_WARMUP must be an integer in 1..=100000")
+    })?;
+    if !(1..=MAX_PILOT_GATE_WARMUP).contains(&warmup) {
+        return Err(DeltafinError::new(
+            "K3_PILOT_GATE_WARMUP must be an integer in 1..=100000",
+        ));
+    }
+    Ok(warmup)
+}
+
 fn parse_reasoning_effort(raw: &str) -> Result<String> {
     let effort = raw.trim().to_ascii_lowercase();
     match effort.as_str() {
@@ -155,6 +181,32 @@ pub enum DSparkRequest {
     Off,
     Auto,
     On,
+}
+
+/// Admission policy for PILOT speculative expert reads. `On` scores every
+/// prediction and gates each layer's disk reads on its trailing measured
+/// recall; `Measure` keeps the scoring and reporting but never suppresses or
+/// redirects a read (the A/B baseline); `Off` restores the ungoverned legacy
+/// scheduler exactly. All three are scheduling-only: the authoritative router
+/// still selects every executed expert.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PilotGateRequest {
+    Off,
+    Measure,
+    On,
+}
+
+impl PilotGateRequest {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("on").trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Ok(Self::Off),
+            "measure" => Ok(Self::Measure),
+            "" | "on" | "1" => Ok(Self::On),
+            _ => Err(DeltafinError::new(
+                "K3_PILOT_GATE must be on, measure, or off",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -250,6 +302,12 @@ pub struct RuntimeConfig {
     pub expert_read_threads: Option<usize>,
     pub expert_backend: ExpertBackendRequest,
     pub expert_scale4: ExpertScale4Request,
+    /// Adaptive admission for PILOT speculative expert reads. Threshold and
+    /// warmup are resolved even when the gate is off so a bad value never
+    /// silently rides along with a disabled feature.
+    pub pilot_gate: PilotGateRequest,
+    pub pilot_gate_threshold: f64,
+    pub pilot_gate_warmup: u32,
     pub quality: QualityPolicy,
     pub dspark: DSparkRequest,
     pub dspark_max_context: Option<usize>,
@@ -339,6 +397,17 @@ impl RuntimeConfig {
             .map(parse_reasoning_effort)
             .transpose()?;
         let expert_scale4 = ExpertScale4Request::parse(environment("K3_EXPERT_SCALE4").as_deref())?;
+        let pilot_gate = PilotGateRequest::parse(environment("K3_PILOT_GATE").as_deref())?;
+        let pilot_gate_threshold = environment("K3_PILOT_GATE_THRESHOLD")
+            .as_deref()
+            .map(parse_pilot_gate_threshold)
+            .transpose()?
+            .unwrap_or(0.10);
+        let pilot_gate_warmup = environment("K3_PILOT_GATE_WARMUP")
+            .as_deref()
+            .map(parse_pilot_gate_warmup)
+            .transpose()?
+            .unwrap_or(16);
         let dspark_max_context = parse_optional_positive_usize(
             environment("K3_DSPARK_MAX_CONTEXT").as_deref(),
             8_192,
@@ -377,6 +446,9 @@ impl RuntimeConfig {
             expert_read_threads,
             expert_backend: ExpertBackendRequest::parse(backend_value.as_deref())?,
             expert_scale4,
+            pilot_gate,
+            pilot_gate_threshold,
+            pilot_gate_warmup,
             quality,
             dspark,
             dspark_max_context,
@@ -424,7 +496,8 @@ impl std::fmt::Display for RuntimeConfig {
             f,
             "surface={:?} device={:?} spine={:?} spine_read_threads={} spine_fd_cache={} \
              spine_stream_nocache={} spine_resident_bytes={} provider_resident_layers={} \
-             expert_read_threads={} expert_backend={:?} expert_scale4={:?} quality={:?} \
+             expert_read_threads={} expert_backend={:?} expert_scale4={:?} pilot_gate={:?} \
+             pilot_gate_threshold={} pilot_gate_warmup={} quality={:?} \
              dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
              reasoning_effort={} router_trace_mode={:?} router_trace_path={} chat={} \
              stats={} max_new={}",
@@ -439,6 +512,9 @@ impl std::fmt::Display for RuntimeConfig {
             describe_usize(self.expert_read_threads),
             self.expert_backend,
             self.expert_scale4,
+            self.pilot_gate,
+            self.pilot_gate_threshold,
+            self.pilot_gate_warmup,
             self.quality,
             self.dspark,
             describe_usize(self.dspark_max_context),
@@ -551,6 +627,9 @@ mod tests {
             "expert_read_threads=",
             "expert_backend=",
             "expert_scale4=",
+            "pilot_gate=",
+            "pilot_gate_threshold=",
+            "pilot_gate_warmup=",
             "quality=",
             "dspark=",
             "dspark_max_context=",
@@ -811,6 +890,76 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn pilot_gate_environment_is_bounded_and_fail_closed() {
+        let default = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
+        assert_eq!(default.pilot_gate, PilotGateRequest::On);
+        assert_eq!(default.pilot_gate_threshold, 0.10);
+        assert_eq!(default.pilot_gate_warmup, 16);
+
+        for (raw, expected) in [
+            ("on", PilotGateRequest::On),
+            ("1", PilotGateRequest::On),
+            ("", PilotGateRequest::On),
+            ("measure", PilotGateRequest::Measure),
+            ("off", PilotGateRequest::Off),
+            ("0", PilotGateRequest::Off),
+            (" MEASURE ", PilotGateRequest::Measure),
+        ] {
+            let config = RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_PILOT_GATE").then(|| raw.into())
+            })
+            .unwrap();
+            assert_eq!(config.pilot_gate, expected);
+        }
+        assert!(
+            RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_PILOT_GATE").then(|| "auto".into())
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("on, measure, or off")
+        );
+
+        let tuned = RuntimeConfig::resolve(arguments(), |name| match name {
+            "K3_PILOT_GATE_THRESHOLD" => Some("0.25".into()),
+            "K3_PILOT_GATE_WARMUP" => Some("100000".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(tuned.pilot_gate_threshold, 0.25);
+        assert_eq!(tuned.pilot_gate_warmup, 100_000);
+
+        // A zero threshold means "never suppress" and stays legal; the knobs
+        // fail closed even while the gate itself is off.
+        let never = RuntimeConfig::resolve(arguments(), |name| match name {
+            "K3_PILOT_GATE" => Some("off".into()),
+            "K3_PILOT_GATE_THRESHOLD" => Some("0".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(never.pilot_gate_threshold, 0.0);
+        for (name, value) in [
+            ("K3_PILOT_GATE_THRESHOLD", "1"),
+            ("K3_PILOT_GATE_THRESHOLD", "-0.1"),
+            ("K3_PILOT_GATE_THRESHOLD", "nan"),
+            ("K3_PILOT_GATE_THRESHOLD", "many"),
+            ("K3_PILOT_GATE_WARMUP", "0"),
+            ("K3_PILOT_GATE_WARMUP", "100001"),
+            ("K3_PILOT_GATE_WARMUP", "-1"),
+            ("K3_PILOT_GATE_WARMUP", "many"),
+        ] {
+            assert!(
+                RuntimeConfig::resolve(arguments(), |candidate| {
+                    let off = (candidate == "K3_PILOT_GATE").then(|| "off".to_string());
+                    off.or_else(|| (candidate == name).then(|| value.into()))
+                })
+                .is_err(),
+                "{name}={value} must fail closed"
+            );
+        }
     }
 
     #[test]

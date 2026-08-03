@@ -91,8 +91,8 @@ const TARGET_SEQUENCE_STATE_READY_TO_COMMIT: u32 = 4;
 const TARGET_SEQUENCE_STATE_COMMITTED: u32 = 5;
 const TARGET_SEQUENCE_STATE_CANCELLED: u32 = 6;
 const TARGET_SEQUENCE_STATE_POISONED: u32 = 7;
-const ROUTE_TOP_K: usize = 16;
-const PILOT_MAX_PREFETCH: usize = 32;
+pub(crate) const ROUTE_TOP_K: usize = 16;
+pub(crate) const PILOT_MAX_PREFETCH: usize = 32;
 const ROUTE_MAX_POSITIONS: usize = 64;
 const ROUTE_MAX_EDGES: usize = ROUTE_TOP_K * ROUTE_MAX_POSITIONS;
 const TARGET_SEQUENCE_MAX_EXPERTS: usize = 64;
@@ -3040,6 +3040,17 @@ impl Drop for TargetStateBranch {
 /// Owns one provider-side device context. Tensor, cache, and ticket objects
 /// below contain only opaque integer IDs plus an `Arc` that keeps this session
 /// alive; an ATen object never crosses into Rust.
+///
+/// Threading contract on MPS: the provider locks each session independently,
+/// but ATen submits every MPS operation through one process-global Metal
+/// command buffer that two threads may not encode into at once — one thread's
+/// commit hits the other's open encoder and Metal aborts the process. Session
+/// locking cannot close that gap, because the shared stream sits below the
+/// session boundary and ATen also submits from allocator and completion
+/// callbacks that never enter this ABI. So MPS work must be driven from one
+/// thread at a time process-wide. The runtime satisfies this structurally (an
+/// engine owns exactly one session, and the server admits one generation at a
+/// time); tests must use [`exclusive_mps_device`].
 #[derive(Debug)]
 pub struct NativeProviderSession {
     inner: Arc<SessionInner>,
@@ -7930,6 +7941,31 @@ fn ffi_error(operation: &str, error: &[c_char]) -> DeltafinError {
     DeltafinError::new(format!("{operation} failed: {message}"))
 }
 
+/// Serializes every test that drives work on the MPS device.
+///
+/// ATen submits all MPS work through one process-global Metal command buffer,
+/// and two threads may not encode into it concurrently: one thread's commit
+/// observes the other's still-open encoder and Metal aborts the whole process
+/// with `commit command buffer with uncommitted encoder`. Locking provider
+/// sessions individually cannot prevent this — the shared stream is below the
+/// session boundary, and ATen also submits from allocator and completion
+/// callbacks that never pass through this ABI.
+///
+/// The runtime satisfies the contract structurally: an engine owns exactly one
+/// provider session, and the server admits one generation at a time. The test
+/// harness does not — `cargo test` runs these tests on as many threads as the
+/// host has cores — so every test that touches the device must hold this guard
+/// for as long as its MPS session, tensors, or canaries live.
+#[cfg(test)]
+pub(crate) fn exclusive_mps_device() -> std::sync::MutexGuard<'static, ()> {
+    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding the guard has already been reported.
+    // Poisoning it must not cascade into unrelated MPS tests.
+    DEVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8011,6 +8047,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn embedded_metallibs_survive_repeated_create_load_and_release() {
+        let _device = exclusive_mps_device();
         let inventory = NativeProvider::inventory().unwrap();
         if !inventory.providers.mps {
             return;
@@ -8055,6 +8092,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_expert_cache_flush_stats_and_multi_session_teardown_are_total() {
+        let _device = exclusive_mps_device();
         let inventory = NativeProvider::inventory().unwrap();
         if !inventory.providers.mps {
             return;
@@ -8817,6 +8855,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn mps_f32_upload_owns_static_and_dropped_sources_before_return() {
+        let _device = exclusive_mps_device();
         let inventory = NativeProvider::inventory().unwrap();
         if !inventory.providers.mps {
             return;
@@ -8854,6 +8893,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn mps_cache_trim_preserves_live_tensors_and_rejects_live_tickets() {
+        let _device = exclusive_mps_device();
         let inventory = NativeProvider::inventory().unwrap();
         if !inventory.providers.mps {
             return;

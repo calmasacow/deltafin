@@ -241,6 +241,45 @@ fn run() -> Result<()> {
                 let interrupt = interrupt_guard.source();
                 engine.prefill_and_decode_interruptible(&config, &interrupt)
             };
+            if let Some(report) = engine.pilot_gate_report()
+                && report.telemetry.passes_scored != 0
+            {
+                let suppressed_layers: Vec<u32> = report
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.reads_suppressed)
+                    .map(|layer| layer.layer_index)
+                    .collect();
+                eprintln!(
+                    "[pilot-gate] mode={} threshold={:.0}% warmup={} passes={} experts issued={} suppressed={} prev-token-plans={} suppressed-layers={:?}",
+                    if report.measure_only { "measure" } else { "on" },
+                    report.threshold * 100.0,
+                    report.warmup,
+                    report.telemetry.passes_scored,
+                    report.telemetry.experts_issued,
+                    report.telemetry.experts_suppressed,
+                    report.telemetry.prev_token_plans,
+                    suppressed_layers,
+                );
+                if config.stats {
+                    for layer in &report.layers {
+                        eprintln!(
+                            "[pilot-gate] layer {:>2}: pilot {:>5.1}% (n={}) prev-token {:>5.1}% (n={}) preferred={} reads={}",
+                            layer.layer_index,
+                            layer.pilot_ema * 100.0,
+                            layer.pilot_samples,
+                            layer.prev_token_ema * 100.0,
+                            layer.prev_token_samples,
+                            layer.preferred.as_str(),
+                            if layer.reads_suppressed {
+                                "suppressed"
+                            } else {
+                                "active"
+                            },
+                        );
+                    }
+                }
+            }
             let qwen = engine.status().qwen_telemetry;
             if qwen.proposals != 0
                 || qwen.proposed_tokens != 0

@@ -3665,16 +3665,11 @@ fn open_deferred_source(source: &Source) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(target_os = "macos")]
+// Resolved from the active target ABI, never a literal: O_NOFOLLOW is 0x20000
+// on x86_64 Linux but 0x8000 on aarch64, so an x86-derived literal decodes to
+// O_LARGEFILE there and silently opens these sources through symlinks.
 const fn open_cloexec_nofollow() -> i32 {
-    // Darwin O_CLOEXEC | O_NOFOLLOW.
-    0x0100_0100
-}
-
-#[cfg(target_os = "linux")]
-const fn open_cloexec_nofollow() -> i32 {
-    // Linux O_CLOEXEC | O_NOFOLLOW.
-    0x000a_0000
+    libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -3685,7 +3680,14 @@ fn open_deferred_catalog_source(
     source: &DeferredSourceName,
 ) -> Result<File> {
     unsafe extern "C" {
-        fn openat(directory: i32, path: *const i8, flags: i32, ...) -> i32;
+        // `c_char` is signed on x86_64 and unsigned on aarch64; spelling the
+        // C types keeps this declaration valid on both.
+        fn openat(
+            directory: libc::c_int,
+            path: *const libc::c_char,
+            flags: libc::c_int,
+            ...
+        ) -> libc::c_int;
     }
     // SAFETY: the catalog retains a live directory descriptor, `source` is a
     // validated NUL-terminated direct child name, and no mode argument is
@@ -3838,6 +3840,16 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn deferred_source_open_flags_keep_the_symlink_guard() {
+        // Asserted as bits, not a literal: O_NOFOLLOW's value differs between
+        // x86_64 and aarch64 Linux, and every caller of this helper depends on
+        // the guard actually being present.
+        let flags = open_cloexec_nofollow();
+        assert_ne!(flags & libc::O_NOFOLLOW, 0, "symlink guard dropped");
+        assert_ne!(flags & libc::O_CLOEXEC, 0, "close-on-exec dropped");
+    }
 
     static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 

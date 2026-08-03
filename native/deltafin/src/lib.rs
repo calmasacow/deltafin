@@ -66,6 +66,8 @@ mod pack_command;
 #[cfg(feature = "runtime")]
 pub mod packfile;
 #[cfg(feature = "runtime")]
+mod pilot_gate;
+#[cfg(feature = "runtime")]
 mod platform;
 #[cfg(feature = "runtime")]
 mod program;

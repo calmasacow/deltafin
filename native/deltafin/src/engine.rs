@@ -45,6 +45,7 @@ use crate::openai::{
     TokenUsage,
 };
 use crate::output::IncrementalUtf8Decoder;
+use crate::pilot_gate::{ExpertPrefetchPlan, PilotGate, PilotGateReport};
 use crate::platform::{
     Device, DeviceRequest, DeviceSelection, DeviceSelectionPolicy, ProviderInventory,
     apple_cpu_family,
@@ -1063,6 +1064,7 @@ pub struct NativeTargetEngine {
     experts: RawExpertCorpus,
     expert_reader: Reader,
     expert_prefetch_reader: Option<Reader>,
+    pilot_gate: Option<PilotGate>,
     router_trace: RouterTrace,
     global_plans: Box<[GlobalSpinePlan]>,
     spine: CompiledSpine,
@@ -1355,6 +1357,18 @@ impl NativeTargetEngine {
                 )
             })
             .transpose()?;
+        // The gate governs only speculative reads, so it exists exactly when
+        // the speculative reader does; `K3_PILOT_GATE=off` keeps the legacy
+        // ungoverned scheduler with no governor in the loop.
+        let pilot_gate = expert_prefetch_enabled
+            .then(|| {
+                PilotGate::new(
+                    config.pilot_gate,
+                    config.pilot_gate_threshold,
+                    config.pilot_gate_warmup,
+                )
+            })
+            .flatten();
 
         // Ordinary Reader slabs allocate lazily; the optional compact wide
         // expert slab above is already reflected in the live host snapshot.
@@ -1544,6 +1558,7 @@ impl NativeTargetEngine {
             experts,
             expert_reader,
             expert_prefetch_reader,
+            pilot_gate,
             router_trace,
             global_plans,
             spine,
@@ -1568,6 +1583,12 @@ impl NativeTargetEngine {
         };
         engine.validate_owned_state()?;
         Ok(engine)
+    }
+
+    /// Snapshot of the PILOT gate's scored recall and admission telemetry.
+    /// `None` when speculative prefetch is uninstalled or `K3_PILOT_GATE=off`.
+    pub fn pilot_gate_report(&self) -> Option<PilotGateReport> {
+        self.pilot_gate.as_ref().map(PilotGate::report)
     }
 
     pub fn status(&self) -> NativeEngineStatus<'_> {
@@ -1660,6 +1681,11 @@ impl NativeTargetEngine {
         {
             return Err(DeltafinError::new(
                 "native expert-prefetch owner differs from its fail-closed device/install policy",
+            ));
+        }
+        if self.pilot_gate.is_some() && self.expert_prefetch_reader.is_none() {
+            return Err(DeltafinError::new(
+                "native PILOT gate exists without the speculative reader it governs",
             ));
         }
         if self.global_plans.len() != crate::program::K3_GLOBAL_TRANSFER_GROUPS {
@@ -2053,6 +2079,7 @@ impl NativeTargetEngine {
             &self.experts,
             &self.expert_reader,
             self.expert_prefetch_reader.as_ref(),
+            self.pilot_gate.as_mut(),
             &mut self.router_trace,
             target_expert_backend(self.expert_backend),
             self.expert_cpu_threads,
@@ -4960,6 +4987,7 @@ fn execute_target_sequence(
     experts: &RawExpertCorpus,
     expert_reader: &Reader,
     expert_prefetch_reader: Option<&Reader>,
+    mut pilot_gate: Option<&mut PilotGate>,
     router_trace: &mut RouterTrace,
     expert_backend: TargetExpertBackend,
     cpu_threads: usize,
@@ -4987,7 +5015,18 @@ fn execute_target_sequence(
     let mut profile = collect_profile.then(TargetExecutionProfile::default);
     spine_pipeline.prime(&layers[0])?;
     let mut trace_pass = router_trace.begin_pass();
-    let mut pending_expert_prefetch = None;
+    // Layer 1 is the one routed layer PILOT can never see coming: its hint
+    // would have to come from the dense layer 0, which produces no mailbox.
+    // The governor's prev-token predictor covers it from the previous pass's
+    // routes, overlapping layer 1's otherwise-cold expert reads with layer
+    // 0's compute and both layers' spine binds. Same admission machinery,
+    // same fail-soft ticket handling, same authoritative demand path.
+    let mut pending_expert_prefetch = match (pilot_gate.as_deref_mut(), expert_prefetch_reader) {
+        (Some(gate), Some(reader)) => gate
+            .plan_sequence_start()
+            .and_then(|plan| try_schedule_expert_prefetch(experts, reader, plan)),
+        _ => None,
+    };
     for (index, current) in layers.iter().enumerate() {
         let layer_started = collect_profile.then(Instant::now);
         let mut layer_profile = TargetLayerPhaseProfile::default();
@@ -5042,6 +5081,7 @@ fn execute_target_sequence(
                         expert_reader,
                         expert_prefetch_reader,
                         &mut pending_expert_prefetch,
+                        pilot_gate.as_deref_mut(),
                         expert_backend,
                         cpu_threads,
                         metal_source_selector,
@@ -5208,18 +5248,18 @@ where
 fn try_schedule_expert_prefetch(
     experts: &RawExpertCorpus,
     reader: &Reader,
-    hint: crate::provider::TargetSequencePrefetchHint,
+    plan: ExpertPrefetchPlan,
 ) -> Option<ExpertPrefetchSet> {
-    let expected = hint.expert_ids().len();
+    let expected = plan.expert_ids().len();
     if !(K3_EXPERT_TOP_K..=EXPERT_PREFETCH_MAX_EXPERTS).contains(&expected) {
         return None;
     }
     let mut tickets = Vec::with_capacity(expected);
-    for &expert in hint.expert_ids() {
+    for &expert in plan.expert_ids() {
         let ticket =
-            match experts.try_submit_local_prefetch_one(reader, hint.target_layer(), expert) {
+            match experts.try_submit_local_prefetch_one(reader, plan.target_layer(), expert) {
                 Ok(Some(ticket))
-                    if ticket.layer() == hint.target_layer()
+                    if ticket.layer() == plan.target_layer()
                         && ticket.expert_ids() == [expert]
                         && ticket.layout() == experts.layout() =>
                 {
@@ -5237,7 +5277,7 @@ fn try_schedule_expert_prefetch(
         return None;
     }
     Some(ExpertPrefetchSet {
-        target_layer: hint.target_layer(),
+        target_layer: plan.target_layer(),
         tickets,
     })
 }
@@ -5482,6 +5522,7 @@ fn finish_expert_mailbox(
     expert_reader: &Reader,
     expert_prefetch_reader: Option<&Reader>,
     pending_expert_prefetch: &mut Option<ExpertPrefetchSet>,
+    mut pilot_gate: Option<&mut PilotGate>,
     backend: TargetExpertBackend,
     cpu_threads: usize,
     metal_source_selector: Option<&str>,
@@ -5489,6 +5530,17 @@ fn finish_expert_mailbox(
     complete_expert_union: CompleteExpertUnion,
     mut profile: Option<&mut TargetLayerPhaseProfile>,
 ) -> Result<()> {
+    // The authoritative routes are the free scoring signal: they settle any
+    // outstanding lookahead prediction for this layer and reseed the
+    // previous-token predictor, before a single expert byte is read.
+    if let Some(gate) = pilot_gate.as_deref_mut() {
+        gate.observe_routes(
+            mailbox.layer_index(),
+            (0..mailbox.position_count())
+                .filter_map(|row| mailbox.route(row))
+                .map(|route| route.ordered_experts()),
+        );
+    }
     let mut first_row = 0_usize;
     // The established Python/Metal verifier fetches one sorted unique expert
     // union for all candidate rows. Reproduce that topology only for exact
@@ -5636,13 +5688,29 @@ fn finish_expert_mailbox(
         // tickets cannot deadlock. Keep the new generation local until current
         // publication succeeds; on failure drain all speculative work before
         // returning.
+        //
+        // The gate sits strictly between the hint and the read submission: it
+        // records every taken hint for scoring, then admits, redirects to the
+        // better-scoring predictor, or suppresses this layer's speculative
+        // reads. Without a governor the hint passes through unchanged.
         let submit_started = profile.as_ref().map(|_| Instant::now());
+        let next_plan = if expert_prefetch_reader.is_some() && final_tile {
+            let pilot_plan = next_hint
+                .as_ref()
+                .and_then(|hint| ExpertPrefetchPlan::new(hint.target_layer(), hint.expert_ids()));
+            match pilot_gate.as_deref_mut() {
+                Some(gate) => gate.admit(mailbox.layer_index(), pilot_plan),
+                None => pilot_plan,
+            }
+        } else {
+            None
+        };
         let next_prefetch = match (
             pending_expert_prefetch.is_none(),
             expert_prefetch_reader,
-            next_hint,
+            next_plan,
         ) {
-            (true, Some(reader), Some(hint)) => try_schedule_expert_prefetch(experts, reader, hint),
+            (true, Some(reader), Some(plan)) => try_schedule_expert_prefetch(experts, reader, plan),
             _ => None,
         };
         add_profile_elapsed(profile.as_deref_mut(), submit_started, |profile| {

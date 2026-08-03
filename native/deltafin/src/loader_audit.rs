@@ -698,6 +698,10 @@ fn system_elf_soname(path: &[u8]) -> bool {
         b"libcurl.so".as_slice(),
         b"libcuda.so".as_slice(),
         b"libnvidia-ml.so".as_slice(),
+        // The pinned aarch64 runtime ships libgfortran.so.5, which resolves
+        // the distribution's zlib. This admits that runtime's own closure
+        // only; Deltafin's ZIP support stays on its pure-Rust implementation.
+        b"libz.so".as_slice(),
     ]
     .iter()
     .any(|stem| versioned_soname(basename, stem));

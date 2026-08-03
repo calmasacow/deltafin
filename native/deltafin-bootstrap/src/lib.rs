@@ -1769,21 +1769,18 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-#[cfg(target_os = "macos")]
+// Open flags must come from the active target ABI, never from literals. The
+// numeric values of O_NOFOLLOW and O_DIRECTORY differ between x86_64 and
+// aarch64 Linux: an x86-derived literal silently decodes to O_LARGEFILE and
+// O_DIRECT on aarch64, dropping the very symlink guard these callers exist
+// to apply. Darwin shares one ABI across its architectures, so only Linux
+// ever diverged.
 const fn open_nofollow_cloexec() -> i32 {
-    0x0100_0100
+    libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
-#[cfg(target_os = "linux")]
-const fn open_nofollow_cloexec() -> i32 {
-    0x000a_0000
-}
-#[cfg(target_os = "macos")]
+
 const fn open_directory_flags() -> i32 {
-    0x0110_0100
-}
-#[cfg(target_os = "linux")]
-const fn open_directory_flags() -> i32 {
-    0x000b_0000
+    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
 
 #[cfg(target_os = "macos")]
@@ -1819,6 +1816,24 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn secure_open_flags_carry_the_guards_their_names_promise() {
+        // A hard-coded x86 literal silently loses O_NOFOLLOW on aarch64
+        // Linux, so assert the bits rather than any numeric value.
+        let nofollow = open_nofollow_cloexec();
+        assert_ne!(nofollow & libc::O_NOFOLLOW, 0, "symlink guard dropped");
+        assert_ne!(nofollow & libc::O_CLOEXEC, 0, "close-on-exec dropped");
+
+        let directory = open_directory_flags();
+        for (bit, name) in [
+            (libc::O_DIRECTORY, "O_DIRECTORY"),
+            (libc::O_NOFOLLOW, "O_NOFOLLOW"),
+            (libc::O_CLOEXEC, "O_CLOEXEC"),
+        ] {
+            assert_ne!(directory & bit, 0, "{name} dropped from directory flags");
+        }
+    }
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 

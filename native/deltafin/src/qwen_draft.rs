@@ -820,6 +820,7 @@ mod tests {
     #[test]
     #[ignore = "requires the optional pinned Qwen 0.6B checkpoint and an MPS host"]
     fn installed_adaptive_qwen_skips_wide_for_the_frozen_paris_schedule() {
+        let _device = crate::provider::exclusive_mps_device();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let target = Arc::new(K3Tokenizer::load_from_root(&root).expect("load K3 tokenizer"));
         let probe_checkpoint = QwenCheckpoint::open(&root, QwenVariant::Probe06B)

@@ -1,0 +1,234 @@
+# PILOT gate: adaptive per-layer prefetch admission and predictor selection
+
+Status: implemented and live-validated (design first landed with the
+implementation; this document is the reviewable rationale, with measured
+results at the end).
+
+## Problem
+
+PILOT speculative expert prefetch (run layer L+1's bit-identical cached router
+on layer L's in-progress hidden state, start background reads for the predicted
+top-16) averages ~50% recall but collapses at layers sitting at or immediately
+after MLA (full-attention) boundaries — measured 1.2% at layer 13, ~20-30% at
+layers 12/24/25/36 on the France/planet oracle prompts. The mechanism is input
+staleness: the snapshot PILOT routes on is missing the large global update the
+next MLA attention step is about to apply. At those layers nearly every
+prefetched expert read (17.5 MB each) is wasted SSD bandwidth on the very
+channel that bounds decode speed.
+
+Hardcoding "skip layer 13" would bake in two prompts' worth of evidence and go
+stale on the next quantization or model revision. Instead: keep scoring every
+prediction on every token (free — both ID lists already exist), and gate only
+the *disk reads* per layer on the trailing measured hit rate, with a cheaper
+fallback predictor for layers where PILOT is measurably worse than naive
+alternatives.
+
+## Correctness envelope
+
+Unchanged and non-negotiable: everything here decides only what to prefetch
+speculatively. The authoritative mailbox route from the real router still
+selects every executed expert; `read_expert_tile_with_prefetch` still treats
+prefetched bytes as an opportunistic cache keyed by exact expert ID, layer,
+and layout, and every miss goes down the ordinary checked demand path. A wrong
+gate decision costs bandwidth (prefetching garbage) or latency (suppressing a
+good prefetch) — never output. The governor is advisory-only by construction:
+it holds no I/O resources, its state is never consulted by the demand path,
+and it cannot panic the run (out-of-range inputs are skipped, not asserted).
+
+## Where the signal lives
+
+All integration is in `finish_expert_mailbox` (engine.rs), the single choke
+point where three things meet per MoE layer per pass:
+
+1. the authoritative routes for layer L (the mailbox), which score any
+   outstanding prediction *for* L and seed the prev-token predictor;
+2. the provider's PILOT hint for L+1 (`take_prefetch_hint`, taken at L's final
+   tile) — the C++ side (`prepare_pilot_rows`) computes the prediction
+   unconditionally during routing, and taking the hint is a pure fail-soft
+   consume, so scoring continues even for layers whose reads are gated off:
+   recovery needs no special path;
+3. the decision to submit speculative reads (`try_schedule_expert_prefetch`),
+   which is the only thing the gate ever suppresses or redirects.
+
+No ABI or provider_runtime.cpp change is required.
+
+## Scoring
+
+Per layer (1..=92; layer 0 is dense) and per predictor, an EMA of per-row
+recall with a sample counter:
+
+- A pass's sample is `mean over rows of |predicted ∩ row_top16| / 16`.
+  Denominator 16 per row — not the pass's route union — so prefill chunks,
+  speculative multi-row verify passes, and single-row decode produce
+  comparable samples. For single-row decode (the case that matters) this is
+  exactly the recall the hand-instrumentation measured. Draft rows that later
+  fail verification still count; that noise is bounded and advisory.
+- `ema += 0.2 * (sample - ema)`, first sample initializes the EMA directly.
+  Effective window ~10 samples; `samples` saturates.
+- The PILOT predictor's outstanding hint is recorded when taken (whether or
+  not reads were issued) and scored one layer later when its target mailbox
+  arrives; a mismatched or missing target (sequence teardown) drops it
+  unscored. A provider fail-soft miss (no hint) contributes no sample.
+- The prev-token predictor needs no lookahead: when layer L's mailbox arrives,
+  its remembered previous route set is scored against the same rows, then
+  replaced by the newest row's 16 experts (sorted). Across sequence
+  boundaries this is precisely "previous token's routing" for decode; across
+  request boundaries it degrades to one noisy sample per layer.
+
+## Gating and predictor selection
+
+At layer L's final tile, for target layer L+1:
+
+- Warmup: until a predictor has `K3_PILOT_GATE_WARMUP` samples for that layer
+  it cannot be judged. While PILOT is unwarmed the legacy behavior (prefetch
+  the PILOT hint) is preserved; the prev-token predictor is eligible for
+  selection only once warmed.
+- Selection: the warmed predictor with the higher EMA wins the layer. PILOT
+  wins ties (it is the stronger predictor globally and the incumbent).
+- Gate: if the winner's EMA is below `K3_PILOT_GATE_THRESHOLD`, no speculative
+  reads are issued for that layer this pass. Scoring continues regardless, so
+  a layer whose recall recovers (different prompt regime, model update)
+  automatically resumes prefetching — the same threshold in both directions,
+  no hysteresis; flapping is harmless and flip logging is capped.
+- The prev-token plan is the remembered 16 IDs (sorted unique, already
+  ABI-validated < 896); the PILOT plan is the hint's canonical union (16..=32
+  IDs). Both flow through the existing `try_schedule_expert_prefetch` bounds
+  checks via `ExpertPrefetchPlan`, the small type that generalizes the
+  provider hint.
+
+Expected effect at the measured pathology: layer 13 (PILOT 1.2%) falls to the
+prev-token predictor (~30% class); if even that sat below threshold the layer
+would go dark on reads while remaining fully scored. Healthy layers (~50-70%)
+see byte-identical scheduling to today.
+
+One layer gets net-new coverage: layer 1, the first routed layer, is
+structurally invisible to PILOT because its hint would have to come from the
+dense layer 0, which produces no mailbox — so its ~272 MB of expert reads
+were demand-read cold on every pass. In `on` mode the governor offers the
+prev-token plan for layer 1 at sequence start (`plan_sequence_start`),
+overlapping those reads with layer 0's compute and both layers' spine binds,
+under the same warmup/threshold discipline as every other layer. `measure`
+mode declines this plan deliberately: it must keep the legacy read schedule
+byte-identical to stay a clean A/B baseline.
+
+## Configuration
+
+Following the `RuntimeConfig` conventions (env-resolved, fail closed on
+garbage, echoed on the `[config] resolved:` line):
+
+- `K3_PILOT_GATE` = `on` (default) | `measure` | `off`.
+  `measure` scores and reports but never suppresses or redirects (A/B
+  baseline, and the tool for the open prompt-diversity question).
+  `off` restores legacy behavior exactly (no governor is constructed).
+- `K3_PILOT_GATE_THRESHOLD` = EMA recall below which a layer's speculative
+  reads stop. Finite, in [0,1). Default 0.10.
+- `K3_PILOT_GATE_WARMUP` = samples per layer before the gate may act.
+  Integer in 1..=100000. Default 16.
+
+## Observability
+
+- Gate flips log one line each (`[pilot-gate] layer 13: reads suppressed
+  (pilot 1.2%, prev-token 8.9%, 24 samples)`), capped per layer against
+  threshold flapping.
+- End of run (`deltafin run`), mirroring the Qwen telemetry block: a summary
+  line (passes scored, experts admitted/suppressed at the gate, prev-token
+  plans, currently suppressed layers), plus a per-layer table under `--stats`
+  of both EMAs, both sample counts, the standing preferred predictor
+  (`pilot` / `prev-token` / `warming`; an individual pass can still fall
+  through to the other predictor when the preferred one has nothing to offer,
+  e.g. on a provider hint miss), and the gate state. The server surface keeps
+  flip logs only for now.
+
+## Measured (M1 Max 64GB, int8 spine, scale4 experts, 2026-08-03)
+
+Live measure-mode runs (32 new tokens each) on "France", "planet", and a
+`def fibonacci(n):` code prompt confirmed the collapse map is architectural,
+not content-driven:
+
+| layer | france | planet | code | prev-token (best) |
+|---|---|---|---|---|
+| 1 | — (no hint possible) | — | — | 7-8% |
+| 12 | 11.5% | 29.7% | 20.2% | ~28% |
+| 13 | 1.9% | 1.1% | 1.1% | ~25-29% |
+| 24 | 29.5% | 20.2% | 19.3% | ~22% |
+| 36 | 33.8% | 34.1% | 33.8% | ~29% |
+
+Mean pilot recall is 59-70% per prompt (per-row decode EMA); expert reads are
+58-67% of steady-state pass time. Layer 1's prev-token predictor sits at 7-8%
+on every prompt, so the sequence-start plan is correctly suppressed at the
+default threshold — dormant machinery unless a workload with stable layer-1
+routing appears.
+
+Interleaved A/B on the France prompt (2 reps per arm, 15 chunks each,
+outputs byte-identical across all 10 runs — the advisory invariant held under
+every arm including total suppression):
+
+- `off` (legacy ungoverned prefetch) vs `on@0.10` vs `on@0.35`: pooled
+  per-chunk medians 10.31 / 10.41 / 10.41 s/token post-warmup —
+  statistically indistinguishable at this power (~±1-1.5%). The gate's
+  addressable traffic is just 0.25% (t=0.10) to 2.5% (t=0.35) of
+  speculative bytes, so a null here is expected, not a measurement failure.
+- `off` vs `on@0.99` (all speculation suppressed once warmed): the
+  no-speculation arm is slower by ~+0.40 s per steady single-token chunk —
+  about 4% of steady-state decode, ~1.5% of these runs' total wall-clock.
+  Every clean on99 steady chunk (10.45-10.67 s) exceeded every clean off
+  steady chunk (9.96-10.15 s); run-level significance ~t=2.7-3.1 with a
+  12/14 sign test (p≈0.013), and the entire deficit localizes in the
+  expert-read wait phase (6.0-6.2 → 6.5-6.8 s/chunk) while kernel,
+  attention, and bind phases stay flat — the mechanism, not just the
+  average, points at speculation. (These figures were independently
+  re-derived from the raw logs by two adversarial verification passes,
+  which also caught and corrected an earlier mis-derived "1.9%" version of
+  this number.)
+
+Interpretation: the SSD is near-continuously busy with demand expert reads
+plus spine streaming, so speculative prefetch can only exploit the small
+compute-only windows; that budget is worth ~4% of steady decode here, and
+59-70% recall already captures it. Across the four-point tuning curve (no
+speculation → aggressively gated → gated → full), everything except "none"
+is indistinguishable, so the default configuration sits at the measured
+maximum within this experiment's power; no gate setting can add measurable
+speed on this machine. Defaults stay `on` / threshold 0.10 / warmup 16:
+same speed as every alternative measured, plus the redirects at the
+collapsed layers, the per-layer diagnostic surface, and self-correction if
+a future quantization or model revision shifts the map. Recall-improving
+extensions (delayed snapshots, learned correctors) inherit the same ~4%
+ceiling; larger decode wins on this machine live outside prefetch
+scheduling entirely (fewer bytes per miss, bigger caches, spine-stream
+reduction).
+
+## Re-measuring this (scripts/ab_pilot.sh)
+
+Decode wall-clock on this machine swings 20%+ between identical runs, so the
+numbers above came from short runs and are correspondingly soft — the
+speculation figure rests on four runs of one 32-token prompt. To harden them,
+or to measure a new predictor, use the sustained harness:
+
+```bash
+./scripts/ab_pilot.sh -n 5                    # overnight: 5 A/B pairs
+./scripts/ab_pilot.sh -n 1 -t 200             # one pair, shorter
+./scripts/ab_pilot.sh -a gate -n 5            # governor vs legacy instead
+./scripts/ab_pilot.sh --smoke-only            # preflight only
+```
+
+It runs both arms inside each iteration with the order coin-flipped per
+iteration (a fixed order is a real confound — the first campaign here always
+ran the control first), verifies that every run generated byte-identical text
+before trusting any timing, and analyzes with one independent sample per
+iteration rather than cross-pairing runs, which is what made the first
+analysis's error bars several times too tight. Results and the exact prompt
+are archived together under `bench-results/ab-pilot-<stamp>/`; rerun
+`scripts/ab_pilot_analyze.py <dir>` on a partial run at any time.
+
+Budget roughly `tokens x 11s x 2` per iteration plus prefill, and note that a
+long prompt makes prefill a significant share — `-t 250 -n 5` fits a night.
+
+## Out of scope (deliberately)
+
+- Delayed snapshots for bad layers (idea #3) — needs C++ scheduling changes;
+  the gate's telemetry will identify the layers worth the invasive change.
+- The learned per-layer corrector (idea #4) — offline harvest/train first via
+  the router-trace infrastructure; nothing engine-side until it beats the
+  stale baseline on held-out traces.
+- Per-predictor kill switches and server-side telemetry endpoints — add if
+  A/B practice demands them.
