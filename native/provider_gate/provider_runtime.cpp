@@ -8370,9 +8370,12 @@ extern "C" int32_t deltafin_provider_dspark_append_target_v1(
         at::TensorOptions().dtype(at::kLong).device(at::kCPU));
     const at::Tensor positions = positions_cpu.to(session->selected.device);
     model->append_target_context(context, positions);
-    const std::uint32_t flags = model->shape().is_exact_k3()
-        ? 0u
-        : DELTAFIN_PROVIDER_DSPARK_SYNTHETIC_V1;
+    // Both arms must share a type: GCC's -Wextra rejects mixing an unsigned
+    // literal with an unscoped enumerator in a conditional expression.
+    const std::uint32_t flags =
+        model->shape().is_exact_k3()
+            ? 0u
+            : static_cast<std::uint32_t>(DELTAFIN_PROVIDER_DSPARK_SYNTHETIC_V1);
     *report = dspark_report(request->model, *model, flags);
   });
 }
@@ -8430,9 +8433,12 @@ extern "C" int32_t deltafin_provider_dspark_append_target_tensor_v1(
     model->append_target_context(
         context.narrow(0, 0, static_cast<std::int64_t>(request->rows)),
         positions);
-    const std::uint32_t flags = model->shape().is_exact_k3()
-        ? 0u
-        : DELTAFIN_PROVIDER_DSPARK_SYNTHETIC_V1;
+    // Both arms must share a type: GCC's -Wextra rejects mixing an unsigned
+    // literal with an unscoped enumerator in a conditional expression.
+    const std::uint32_t flags =
+        model->shape().is_exact_k3()
+            ? 0u
+            : static_cast<std::uint32_t>(DELTAFIN_PROVIDER_DSPARK_SYNTHETIC_V1);
     *report = dspark_report(request->model, *model, flags);
   });
 }
@@ -8489,9 +8495,12 @@ extern "C" int32_t deltafin_provider_dspark_restore_v1(
       throw std::invalid_argument("DSpark snapshot is stale or belongs elsewhere");
     }
     model->cache().restore(found->second.snapshot);
-    const std::uint32_t flags = model->shape().is_exact_k3()
-        ? 0u
-        : DELTAFIN_PROVIDER_DSPARK_SYNTHETIC_V1;
+    // Both arms must share a type: GCC's -Wextra rejects mixing an unsigned
+    // literal with an unscoped enumerator in a conditional expression.
+    const std::uint32_t flags =
+        model->shape().is_exact_k3()
+            ? 0u
+            : static_cast<std::uint32_t>(DELTAFIN_PROVIDER_DSPARK_SYNTHETIC_V1);
     *report = dspark_report(request->model, *model, flags);
   });
 }
