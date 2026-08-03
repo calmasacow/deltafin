@@ -666,6 +666,10 @@ MlaInputBundle bundle_mla_input_weights(const MlaShape& shape,
                             weights.output_gate.row_scale},
                            0)
                        .contiguous(),
+      // Stated rather than left implicit: the fused projection carries no original bf16 matrix.
+      // GCC's -Wmissing-field-initializers rejects the omission under -Werror, while Clang does
+      // not, so leaving it out builds on macOS and fails on Linux.
+      .original_bf16 = {},
   };
 
   std::int64_t row = 0;
@@ -674,6 +678,7 @@ MlaInputBundle bundle_mla_input_weights(const MlaShape& shape,
         .encoding = MlaLinearEncoding::RowI8F32Scale,
         .data = bundle.projection.data.narrow(0, row, rows),
         .row_scale = bundle.projection.row_scale.narrow(0, row, rows),
+        .original_bf16 = {},
     };
     row += rows;
     return result;
