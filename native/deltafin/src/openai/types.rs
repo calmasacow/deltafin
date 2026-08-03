@@ -34,6 +34,10 @@ pub enum TargetPrompt {
 pub struct TargetRequest {
     pub prompt: TargetPrompt,
     pub max_new_tokens: usize,
+    /// Chat-only thinking depth (`low`, `high`, or `max`), already
+    /// normalized. `None` defers to the engine's configured default and
+    /// ultimately the chat template's own `max`.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

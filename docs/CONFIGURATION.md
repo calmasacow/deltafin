@@ -11,6 +11,7 @@ Normal operation needs no environment overrides. The most useful controls are:
 | `K3_DSPARK` | `auto` | `auto`, `off` or force-qualified `on`; K3 verification is never bypassed |
 | `K3_DSPARK_MAX_CONTEXT` | `8192` | bounded auxiliary draft-state context; full K3 continues above it |
 | `K3_UAG_DRAFT` | `auto` | optional Qwen raw-completion policy: `auto`, `off` or `on` |
+| `--reasoning-effort` / `K3_REASONING_EFFORT` | template default (`max`) | chat thinking depth: `low`, `high` or `max`; the server's per-request `reasoning_effort` field overrides it |
 | `K3_TRACE` / `K3_TRACE_PATH` | `off` | native router trace mode and path; CLI flags are preferred |
 
 The quality guard rejects fewer than 16 experts, non-fp32 target activations and approximation switches. Original BF16 remains the automatic resident authority. Optional paths must validate their device, ABI, shapes, memory and correctness before activation.

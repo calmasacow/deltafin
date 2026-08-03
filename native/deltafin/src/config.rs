@@ -74,6 +74,16 @@ fn parse_spine_resident_gb(raw: &str) -> Result<u64> {
     Ok(bytes as u64)
 }
 
+fn parse_reasoning_effort(raw: &str) -> Result<String> {
+    let effort = raw.trim().to_ascii_lowercase();
+    match effort.as_str() {
+        "low" | "high" | "max" => Ok(effort),
+        _ => Err(DeltafinError::new(
+            "K3_REASONING_EFFORT must be low, high, or max",
+        )),
+    }
+}
+
 fn parse_provider_resident_layers(raw: &str) -> Result<usize> {
     let layers = raw.parse::<usize>().map_err(|_| {
         DeltafinError::new(format!(
@@ -245,6 +255,10 @@ pub struct RuntimeConfig {
     pub dspark_max_context: Option<usize>,
     pub dspark_min_auto_speedup: f64,
     pub qwen: QwenRequest,
+    /// Chat thinking depth (`low`, `high`, or `max`), normalized. `None`
+    /// defers to the chat template's own default of `max`; the server's
+    /// per-request `reasoning_effort` field overrides this per request.
+    pub reasoning_effort: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -318,6 +332,12 @@ impl RuntimeConfig {
         .with_resident_weights(resident_weights);
         let dspark = DSparkRequest::parse(environment("K3_DSPARK").as_deref())?;
         let qwen = QwenRequest::parse(environment("K3_UAG_DRAFT").as_deref())?;
+        let reasoning_effort = arguments
+            .reasoning_effort
+            .or_else(|| environment("K3_REASONING_EFFORT"))
+            .as_deref()
+            .map(parse_reasoning_effort)
+            .transpose()?;
         let expert_scale4 = ExpertScale4Request::parse(environment("K3_EXPERT_SCALE4").as_deref())?;
         let dspark_max_context = parse_optional_positive_usize(
             environment("K3_DSPARK_MAX_CONTEXT").as_deref(),
@@ -362,6 +382,7 @@ impl RuntimeConfig {
             dspark_max_context,
             dspark_min_auto_speedup,
             qwen,
+            reasoning_effort,
         })
     }
 
@@ -384,6 +405,7 @@ impl RuntimeConfig {
                 spine: arguments.spine.clone(),
                 spine_read_threads: arguments.spine_read_threads,
                 expert_backend: arguments.expert_backend.clone(),
+                reasoning_effort: None,
             },
             |name| std::env::var(name).ok(),
         )?;
@@ -404,7 +426,8 @@ impl std::fmt::Display for RuntimeConfig {
              spine_stream_nocache={} spine_resident_bytes={} provider_resident_layers={} \
              expert_read_threads={} expert_backend={:?} expert_scale4={:?} quality={:?} \
              dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
-             router_trace_mode={:?} router_trace_path={} chat={} stats={} max_new={}",
+             reasoning_effort={} router_trace_mode={:?} router_trace_path={} chat={} \
+             stats={} max_new={}",
             self.surface,
             self.device,
             self.spine,
@@ -421,6 +444,7 @@ impl std::fmt::Display for RuntimeConfig {
             describe_usize(self.dspark_max_context),
             self.dspark_min_auto_speedup,
             self.qwen,
+            self.reasoning_effort.as_deref().unwrap_or("default"),
             self.router_trace_mode,
             describe_path(&self.router_trace_path),
             self.chat,
@@ -480,7 +504,35 @@ mod tests {
             spine: None,
             spine_read_threads: None,
             expert_backend: None,
+            reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn reasoning_effort_is_normalized_validated_and_cli_wins() {
+        let mut explicit = arguments();
+        explicit.reasoning_effort = Some(" MAX ".into());
+        let config = RuntimeConfig::resolve(explicit, |name| {
+            (name == "K3_REASONING_EFFORT").then(|| "low".into())
+        })
+        .unwrap();
+        assert_eq!(config.reasoning_effort.as_deref(), Some("max"));
+
+        let from_environment = RuntimeConfig::resolve(arguments(), |name| {
+            (name == "K3_REASONING_EFFORT").then(|| "high".into())
+        })
+        .unwrap();
+        assert_eq!(from_environment.reasoning_effort.as_deref(), Some("high"));
+
+        assert!(
+            RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_REASONING_EFFORT").then(|| "medium".into())
+            })
+            .is_err()
+        );
+
+        let unset = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
+        assert_eq!(unset.reasoning_effort, None);
     }
 
     #[test]
@@ -504,6 +556,7 @@ mod tests {
             "dspark_max_context=",
             "dspark_min_auto_speedup=",
             "qwen=",
+            "reasoning_effort=",
             "router_trace_mode=",
             "router_trace_path=",
             "chat=",

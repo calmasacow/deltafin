@@ -18,7 +18,9 @@ Output is always greedy and reproducible: the same prompt produces the same toke
 
 ## What gets refused
 
-These OpenAI features are not implemented: non-default `stop` sequences, penalties, logit bias, logprobs, seeds, suffix/echo, tools and tool choice, structured response formats, prediction, service tiers, and reasoning effort. Sending any of them — or any field the server does not recognize — returns an ordinary OpenAI-shaped HTTP 400 error before the model is ever entered, so a client can never believe an option worked when it didn't.
+Chat requests accept `reasoning_effort` (`low`, `high`, or `max`) to control K3's thinking depth; when absent, the `K3_REASONING_EFFORT` environment variable and then the chat template's own default of `max` apply.
+
+These OpenAI features are not implemented: non-default `stop` sequences, penalties, logit bias, logprobs, seeds, suffix/echo, tools and tool choice, structured response formats, prediction, and service tiers. Sending any of them — or any field the server does not recognize — returns an ordinary OpenAI-shaped HTTP 400 error before the model is ever entered, so a client can never believe an option worked when it didn't.
 
 The server also generates one answer at a time, on purpose: a second generation request arriving mid-generation receives an OpenAI-shaped HTTP 429 ("busy"), while `/v1/models` and other non-generation requests keep responding normally.
 

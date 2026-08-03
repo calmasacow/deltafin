@@ -1075,6 +1075,8 @@ pub struct NativeTargetEngine {
     mla_capacity_tokens: u64,
     verify_snapshots: VerifySnapshotBudget,
     metal_source_selector: Option<String>,
+    /// Configured chat thinking depth; `None` defers to the template's `max`.
+    reasoning_effort: Option<String>,
     readiness: NativeTargetReadiness,
     lifecycle: NativeEngineLifecycle,
     stream_boundary: NativeStreamBoundary,
@@ -1554,6 +1556,7 @@ impl NativeTargetEngine {
             mla_capacity_tokens: 0,
             verify_snapshots,
             metal_source_selector,
+            reasoning_effort: config.reasoning_effort.clone(),
             readiness,
             lifecycle: NativeEngineLifecycle::Ready,
             stream_boundary: NativeStreamBoundary::None,
@@ -1712,11 +1715,11 @@ impl NativeTargetEngine {
         let mut message = Map::new();
         message.insert("role".into(), Value::String("user".into()));
         message.insert("content".into(), Value::String(config.prompt.clone()));
-        encode_chat(
-            &self.tokenizer,
-            &[Value::Object(message)],
-            &ChatOptions::default(),
-        )
+        let mut options = ChatOptions::default();
+        if let Some(effort) = config.reasoning_effort.as_deref() {
+            options.thinking_effort = Some(effort);
+        }
+        encode_chat(&self.tokenizer, &[Value::Object(message)], &options)
     }
 
     fn reset_for_fresh_request(&mut self) -> Result<()> {
@@ -3833,10 +3836,17 @@ impl NativeTargetEngine {
                         Value::Object(object)
                     })
                     .collect::<Vec<_>>();
-                (
-                    encode_chat(&self.tokenizer, &messages, &ChatOptions::default())?,
-                    true,
-                )
+                // Per-request effort wins; the engine's configured default is
+                // the fallback; both absent leaves the template's own `max`.
+                let mut options = ChatOptions::default();
+                if let Some(effort) = request
+                    .reasoning_effort
+                    .as_deref()
+                    .or(self.reasoning_effort.as_deref())
+                {
+                    options.thinking_effort = Some(effort);
+                }
+                (encode_chat(&self.tokenizer, &messages, &options)?, true)
             }
         };
         let maximum_new = u64::try_from(request.max_new_tokens)

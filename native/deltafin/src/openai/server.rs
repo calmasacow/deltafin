@@ -609,6 +609,7 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
             request: TargetRequest {
                 prompt: TargetPrompt::Completion(prompt.to_owned()),
                 max_new_tokens,
+                reasoning_effort: None,
             },
             include_usage: parse_stream_usage(object, streaming)?,
         })
@@ -675,6 +676,7 @@ impl<T: AuthoritativeTarget> OpenAiService<T> {
             request: TargetRequest {
                 prompt: TargetPrompt::Chat(messages),
                 max_new_tokens,
+                reasoning_effort: parse_reasoning_effort(object.get("reasoning_effort"))?,
             },
             include_usage: parse_stream_usage(object, streaming)?,
         })
@@ -1757,7 +1759,7 @@ fn validate_request_contract(
             validate_optional_bool(object.get("parallel_tool_calls"), "parallel_tool_calls")?;
             validate_text_modality(object.get("modalities"))?;
             validate_null_only(object.get("audio"), "audio")?;
-            validate_null_only(object.get("reasoning_effort"), "reasoning_effort")?;
+            parse_reasoning_effort(object.get("reasoning_effort"))?;
             validate_null_only(object.get("prediction"), "prediction")?;
             validate_null_only(object.get("service_tier"), "service_tier")?;
             validate_false(object.get("store"), "store")?;
@@ -1880,6 +1882,27 @@ fn validate_false(value: Option<&Value>, field: &str) -> Result<(), ApiFailure> 
     match value {
         None | Some(Value::Null | Value::Bool(false)) => Ok(()),
         Some(_) => Err(unsupported_non_default(field)),
+    }
+}
+
+/// Chat-only `reasoning_effort`: absent/null defers to the engine default,
+/// and a string must normalize to one of the chat template's accepted levels.
+fn parse_reasoning_effort(value: Option<&Value>) -> Result<Option<String>, ApiFailure> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let effort = raw.trim().to_ascii_lowercase();
+            if matches!(effort.as_str(), "low" | "high" | "max") {
+                Ok(Some(effort))
+            } else {
+                Err(ApiFailure::invalid(
+                    "`reasoning_effort` must be `low`, `high`, or `max`",
+                ))
+            }
+        }
+        Some(_) => Err(ApiFailure::invalid(
+            "`reasoning_effort` must be a JSON string: `low`, `high`, or `max`",
+        )),
     }
 }
 
@@ -2305,6 +2328,7 @@ mod tests {
         TargetRequest {
             prompt: TargetPrompt::Completion("hello".to_owned()),
             max_new_tokens: 8,
+            reasoning_effort: None,
         }
     }
 
@@ -2474,6 +2498,7 @@ mod tests {
             &[TargetRequest {
                 prompt: TargetPrompt::Completion("hello".to_owned()),
                 max_new_tokens: 12,
+                reasoning_effort: None,
             }]
         );
     }
@@ -2499,6 +2524,50 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hi");
         assert_eq!(messages[0].additional_fields["name"], "Chris");
+    }
+
+    #[test]
+    fn chat_reasoning_effort_is_normalized_validated_and_reaches_the_target() {
+        let target = RecordingTarget::new();
+        let requests = Arc::clone(&target.requests);
+        let response = service(target).dispatch(
+            HttpMethod::Post,
+            "/v1/chat/completions",
+            br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"reasoning_effort":" LOW "}"#,
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            requests.lock().unwrap()[0].reasoning_effort.as_deref(),
+            Some("low")
+        );
+
+        let absent = RecordingTarget::new();
+        let absent_requests = Arc::clone(&absent.requests);
+        let response = service(absent).dispatch(
+            HttpMethod::Post,
+            "/v1/chat/completions",
+            br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(absent_requests.lock().unwrap()[0].reasoning_effort, None);
+
+        for wire in [
+            br#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}"#.as_slice(),
+            br#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":3}"#.as_slice(),
+        ] {
+            let target = RecordingTarget::new();
+            let requests = Arc::clone(&target.requests);
+            let response =
+                service(target).dispatch(HttpMethod::Post, "/v1/chat/completions", wire);
+            assert_eq!(response.status, 400);
+            assert!(
+                body(&response)["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("reasoning_effort")
+            );
+            assert!(requests.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -2584,11 +2653,6 @@ mod tests {
                 "/v1/chat/completions",
                 br#"{"messages":[{"role":"user","content":"x"}],"frequency_penalty":0.2}"#,
                 "frequency_penalty",
-            ),
-            (
-                "/v1/chat/completions",
-                br#"{"messages":[{"role":"user","content":"x"}],"reasoning_effort":"low"}"#,
-                "reasoning_effort",
             ),
         ];
         for &(path, wire, field) in cases {
@@ -3015,6 +3079,7 @@ mod tests {
             &[TargetRequest {
                 prompt: TargetPrompt::Completion("through HTTP".to_owned()),
                 max_new_tokens: 3,
+                reasoning_effort: None,
             }]
         );
     }
@@ -3128,6 +3193,7 @@ mod tests {
                 additional_fields: Map::new(),
             }]),
             max_new_tokens: 8,
+            reasoning_effort: None,
         };
         let identity = StreamIdentity {
             id: "chatcmpl-test",

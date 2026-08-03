@@ -26,6 +26,7 @@ Run options:\n\
   --prompt TEXT          Text to continue (default: The capital of France is)\n\
   --max-new N            Stop after at most N generated tokens\n\
   --chat                 Apply the K3 chat template\n\
+  --reasoning-effort L   Chat thinking depth: low, high, or max (K3_REASONING_EFFORT fallback; template default max)\n\
   --stats                Show live cumulative performance statistics\n\
   --events-jsonl PATH    Write the benchmark event stream\n\
   --router-trace PATH    Append native expert-route JSONL (relative to model root)\n\
@@ -332,6 +333,7 @@ pub struct RunArgs {
     pub prompt: String,
     pub max_new: Option<u64>,
     pub chat: bool,
+    pub reasoning_effort: Option<String>,
     pub stats: bool,
     pub events_jsonl: Option<PathBuf>,
     pub router_trace: Option<PathBuf>,
@@ -349,6 +351,7 @@ impl Default for RunArgs {
             prompt: "The capital of France is".into(),
             max_new: None,
             chat: false,
+            reasoning_effort: None,
             stats: false,
             events_jsonl: None,
             router_trace: None,
@@ -541,6 +544,9 @@ where
         let option = values[index].as_str();
         match option {
             "--chat" => run.chat = true,
+            "--reasoning-effort" => {
+                run.reasoning_effort = Some(take_value(&values, &mut index, option)?);
+            }
             "--stats" => run.stats = true,
             "--prompt" => run.prompt = take_value(&values, &mut index, option)?,
             "--max-new" => {

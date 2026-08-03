@@ -152,6 +152,13 @@ fn request_key(mode: ResponseMode, request: &TargetRequest, maximum: usize) -> O
         maximum,
     )?;
     append_bytes(&mut key, &request.max_new_tokens.to_le_bytes(), maximum)?;
+    match &request.reasoning_effort {
+        None => append_byte(&mut key, 0, maximum)?,
+        Some(effort) => {
+            append_byte(&mut key, 1, maximum)?;
+            append_bytes(&mut key, effort.as_bytes(), maximum)?;
+        }
+    }
     match &request.prompt {
         TargetPrompt::Completion(prompt) => {
             append_byte(&mut key, 0, maximum)?;
@@ -243,7 +250,24 @@ mod tests {
         TargetRequest {
             prompt: TargetPrompt::Completion(prompt.to_owned()),
             max_new_tokens,
+            reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn reasoning_effort_is_part_of_the_replay_key() {
+        let mut memo = DeterministicResponseMemo::new(4, 4096);
+        let mut low = request("x", 2);
+        low.reasoning_effort = Some("low".into());
+        memo.put(ResponseMode::Chat, &low, &output("thought briefly"));
+        assert!(memo.get(ResponseMode::Chat, &request("x", 2)).is_none());
+        let mut max = request("x", 2);
+        max.reasoning_effort = Some("max".into());
+        assert!(memo.get(ResponseMode::Chat, &max).is_none());
+        assert_eq!(
+            memo.get(ResponseMode::Chat, &low).unwrap().text(),
+            "thought briefly"
+        );
     }
 
     #[test]
