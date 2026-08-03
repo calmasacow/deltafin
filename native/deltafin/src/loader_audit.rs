@@ -698,6 +698,16 @@ fn system_elf_soname(path: &[u8]) -> bool {
         b"libcurl.so".as_slice(),
         b"libcuda.so".as_slice(),
         b"libnvidia-ml.so".as_slice(),
+        // A ROCm LibTorch reaches AMD hardware through HIP and resolves its
+        // runtime and kernel-driver closure from the distribution, the same
+        // way a CUDA build resolves libcuda. Vendor libraries shipped inside
+        // the torch tree are authenticated as payload and never reach here.
+        b"libamdhip64.so".as_slice(),
+        b"libhsa-runtime64.so".as_slice(),
+        b"libamd_comgr.so".as_slice(),
+        b"libhsakmt.so".as_slice(),
+        b"libdrm.so".as_slice(),
+        b"libdrm_amdgpu.so".as_slice(),
         // The pinned aarch64 runtime ships libgfortran.so.5, which resolves
         // the distribution's zlib. This admits that runtime's own closure
         // only; Deltafin's ZIP support stays on its pure-Rust implementation.

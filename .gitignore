@@ -139,6 +139,11 @@ nohup.out
 /tools/build_spine_layer_pack.py
 /tools/lut_codec_kernels.c
 
+# A/B pilot harness for the PILOT speculative-prefetch study: local
+# measurement tooling, not a build input. The compiled-only publication
+# policy forbids tracking interpreted sources.
+/scripts/
+
 # Unfinished or rejected native experiments.
 /tools/metal_mps_bridge.mm
 /tools/metal_mps_bridge.py

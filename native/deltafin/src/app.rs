@@ -1052,6 +1052,11 @@ fn report_native_runtime(executable: &Path) -> Result<()> {
     if let Some(cuda_major) = option_env!("DELTAFIN_LIBTORCH_CUDA_MAJOR") {
         println!("LibTorch CUDA runtime ABI: {cuda_major}.x");
     }
+    if option_env!("DELTAFIN_LIBTORCH_HIP").is_some() {
+        println!(
+            "LibTorch GPU runtime: ROCm/HIP (reported as CUDA devices; MXFP4 experts use the exact CPU path)"
+        );
+    }
     if let (Some(toolkit), Some(architectures)) = (
         option_env!("DELTAFIN_CUDA_TOOLKIT"),
         option_env!("DELTAFIN_CUDA_ARCHITECTURES"),

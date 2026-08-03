@@ -572,7 +572,7 @@ struct ProviderBuildArtifacts {
     guard: PythonGuard,
     cuda_provider: Option<CudaProviderBuild>,
     cuda: Option<CudaBuild>,
-    libtorch_cuda_major: Option<u8>,
+    gpu_runtime: Option<GpuRuntime>,
 }
 
 pub fn run_production_build() {
@@ -636,12 +636,15 @@ pub fn run_production_build() {
     if torch_cuda.is_some() {
         println!("cargo:rustc-link-lib=dylib=torch_cuda");
         println!("cargo:rustc-link-lib=dylib=c10_cuda");
-        println!(
-            "cargo:rustc-env=DELTAFIN_LIBTORCH_CUDA_MAJOR={}",
-            artifacts
-                .libtorch_cuda_major
-                .expect("CUDA libraries require an identified cudart ABI")
-        );
+        match artifacts
+            .gpu_runtime
+            .expect("GPU libraries require an identified runtime ABI")
+        {
+            GpuRuntime::Cuda(major) => {
+                println!("cargo:rustc-env=DELTAFIN_LIBTORCH_CUDA_MAJOR={major}");
+            }
+            GpuRuntime::Rocm => println!("cargo:rustc-env=DELTAFIN_LIBTORCH_HIP=1"),
+        }
     }
     link_optional(&artifacts.torch_lib, "torch_cuda_linalg");
     link_required(&artifacts.torch_lib, "c10");
@@ -868,8 +871,12 @@ fn build_provider_artifacts(
     validate_torch_version(&torch_root, emit_cargo_metadata);
     let torch_lib = torch_root.join("lib");
     let libtorch_cxx11_abi = detect_libtorch_cxx11_abi(&torch_lib);
-    let libtorch_cuda_major = detect_libtorch_cuda_major(&torch_lib);
-    let cuda_provider = libtorch_cuda_major.map(|_| find_cuda_provider(&torch_root));
+    let gpu_runtime = detect_gpu_runtime(&torch_lib);
+    // Only NVIDIA needs the separate cudart toolkit discovery; a ROCm tree
+    // resolves HIP through its own runtime and has no cudart to find.
+    let cuda_provider = gpu_runtime
+        .filter(|runtime| matches!(runtime, GpuRuntime::Cuda(_)))
+        .map(|_| find_cuda_provider(&torch_root));
     fs::create_dir_all(native_build).unwrap_or_else(|error| {
         panic!(
             "create Rust-owned provider build directory {}: {error}",
@@ -924,7 +931,7 @@ fn build_provider_artifacts(
         &native_build,
         &toolchain,
         &guard,
-        libtorch_cuda_major,
+        gpu_runtime,
         emit_cargo_metadata,
     );
     let mut definitions = vec!["DELTAFIN_HAVE_MXFP4_CPU_V1=1"];
@@ -1056,7 +1063,7 @@ fn build_provider_artifacts(
         guard,
         cuda_provider,
         cuda,
-        libtorch_cuda_major,
+        gpu_runtime,
     })
 }
 
@@ -2821,7 +2828,7 @@ fn build_cuda_kernel(
     native_build: &Path,
     toolchain: &NativeToolchain,
     guard: &PythonGuard,
-    libtorch_cuda_major: Option<u8>,
+    gpu_runtime: Option<GpuRuntime>,
     emit_cargo_metadata: bool,
 ) -> Option<CudaBuild> {
     let mode = cuda_mode();
@@ -2831,11 +2838,34 @@ fn build_cuda_kernel(
         }
         return None;
     }
-    let Some(libtorch_major) = libtorch_cuda_major else {
+    let Some(runtime) = gpu_runtime else {
         if mode == CudaMode::On {
             panic!("DELTAFIN_CUDA_MOE=ON requires a CUDA-enabled LibTorch root");
         }
         return None;
+    };
+    // These kernels reduce with a fixed 32-lane warp contract (full 0xffffffff
+    // shuffle mask, `threadIdx.x & 31` lanes, `>> 5` warp index). AMD
+    // wavefronts are 64 lanes on CDNA, where that contract silently sums only
+    // part of each wavefront rather than failing, so HIP must not reuse them
+    // until the reduction is made wavefront-agnostic and validated against the
+    // token oracle on real hardware. ROCm keeps the exact CPU MXFP4 path.
+    let libtorch_major = match runtime {
+        GpuRuntime::Cuda(major) => major,
+        GpuRuntime::Rocm => {
+            if mode == CudaMode::On {
+                panic!(
+                    "DELTAFIN_CUDA_MOE=ON requires an NVIDIA CUDA LibTorch root; the selected root is a ROCm/HIP build, whose MXFP4 expert kernels are not ported (the 32-lane warp reduction is not wavefront-agnostic)"
+                );
+            }
+            let note = "ROCm/HIP LibTorch detected: HIP tensors and the int8 spine are available with the exact CPU MXFP4 expert fallback; the MXFP4 and original-BF16 device kernels remain NVIDIA-only";
+            if emit_cargo_metadata {
+                println!("cargo:warning={note}");
+            } else {
+                eprintln!("[xtask] {note}");
+            }
+            return None;
+        }
     };
     let Some(compiler) = discover_nvcc() else {
         if mode == CudaMode::On {
@@ -3649,7 +3679,19 @@ fn library_file(directory: &Path, name: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-fn detect_libtorch_cuda_major(torch_lib: &Path) -> Option<u8> {
+/// Which GPU runtime backs a LibTorch tree's `torch_cuda`/`c10_cuda` pair.
+///
+/// A ROCm build of PyTorch keeps the CUDA library names and the `at::kCUDA`
+/// device type, reaching AMD hardware through HIP, so the pair's presence
+/// alone cannot distinguish the two. The ELF dependency does: NVIDIA builds
+/// carry `libcudart.so.N` and ROCm builds carry `libamdhip64.so`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuRuntime {
+    Cuda(u8),
+    Rocm,
+}
+
+fn detect_gpu_runtime(torch_lib: &Path) -> Option<GpuRuntime> {
     if target_os() != "linux" {
         return None;
     }
@@ -3667,17 +3709,27 @@ fn detect_libtorch_cuda_major(torch_lib: &Path) -> Option<u8> {
         );
     }
 
-    // libc10_cuda owns PyTorch's low-level CUDA runtime calls and therefore
-    // carries the direct cudart ELF dependency. Inspecting this small library
-    // avoids reading the multi-gigabyte libtorch_cuda payload on every build.
+    // libc10_cuda owns PyTorch's low-level device runtime calls and therefore
+    // carries the direct cudart or HIP ELF dependency. Inspecting this small
+    // library avoids reading the multi-gigabyte torch payload on every build.
     let c10_cuda = cuda_libraries[0].as_deref().expect("complete CUDA pair");
+    let found_hip = file_contains(c10_cuda, b"libamdhip64.so\0");
     let found_12 = file_contains(c10_cuda, b"libcudart.so.12\0");
     let found_13 = file_contains(c10_cuda, b"libcudart.so.13\0");
+    if found_hip && (found_12 || found_13) {
+        panic!(
+            "selected LibTorch root {} references both the HIP and CUDA runtimes",
+            torch_lib.display()
+        );
+    }
+    if found_hip {
+        return Some(GpuRuntime::Rocm);
+    }
     match (found_12, found_13) {
-        (true, false) => Some(12),
-        (false, true) => Some(13),
+        (true, false) => Some(GpuRuntime::Cuda(12)),
+        (false, true) => Some(GpuRuntime::Cuda(13)),
         (false, false) => panic!(
-            "could not identify the CUDA runtime ABI required by the selected LibTorch root {}; expected an ELF dependency on libcudart.so.12 or libcudart.so.13",
+            "could not identify the GPU runtime ABI required by the selected LibTorch root {}; expected an ELF dependency on libcudart.so.12, libcudart.so.13, or libamdhip64.so",
             torch_lib.display()
         ),
         (true, true) => panic!(

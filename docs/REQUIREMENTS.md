@@ -53,6 +53,18 @@ cargo build --locked --release
 - `DELTAFIN_CUDA_ARCHITECTURES` is only for a deliberate cross-build; otherwise
   the build bootstrap and NVCC derive the architecture set themselves.
 
+## Manual: AMD/ROCm builds
+
+A ROCm LibTorch tree needs no extra build flag. Point `DELTAFIN_TORCH_ROOT` at
+it and build normally: the runtime identifies the HIP dependency, links the
+same `torch_cuda`/`c10_cuda` pair, and reports AMD hardware as CUDA devices,
+which is how ROCm's PyTorch presents itself.
+
+Leave `DELTAFIN_CUDA_MOE` unset. Routed experts run the exact CPU MXFP4 path,
+because the device MXFP4 and original-BF16 kernels assume a 32-lane warp and
+would misreduce silently on 64-lane wavefronts; `ON` is rejected against a
+ROCm root for that reason. `deltafin doctor` names the detected runtime.
+
 ## Distribution
 
 Deltafin ships as one complete Git source tree, not as crates.io packages. Its
