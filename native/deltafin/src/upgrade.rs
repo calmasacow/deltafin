@@ -712,6 +712,16 @@ pub fn run() -> Result<()> {
         ))
     })?;
     let repository = locate_repository_from(&executable, &current_directory)?;
+    // The reproducible profile carries NVCC-shaped variables and validates its
+    // architecture list as numeric compute capabilities, so it cannot describe
+    // a HIPCC build. Reproducing this binary would therefore silently drop the
+    // device kernels back to the exact CPU MXFP4 path. Refuse instead, and say
+    // exactly which command rebuilds the same thing.
+    if option_env!("DELTAFIN_GPU_KERNEL_RUNTIME") == Some("HIP") {
+        return Err(DeltafinError::new(
+            "this binary's device kernels were compiled by HIPCC for ROCm, which the reproducible build profile does not describe; `deltafin upgrade` will not rebuild it as a different configuration. Update the checkout and rebuild on the ROCm host with DELTAFIN_CUDA_MOE=ON",
+        ));
+    }
     let profile = BuildProfile::embedded()?;
     run_with_profile(&repository, &ProcessRunner, &profile, &mut |message| {
         println!("{message}")

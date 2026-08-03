@@ -528,3 +528,73 @@ fn dependency_features_preserve_the_audited_build_profile() {
         );
     }
 }
+
+/// The device-kernel compile workflow exists to prove that the two `.cu`
+/// translation units build under the real vendor toolchains. It can only do
+/// that if it passes the same arithmetic flags the shared Rust build graph
+/// passes; a compile check running different flags would report success on a
+/// configuration the product never ships, which is worse than no check at all.
+#[test]
+fn the_device_kernel_compile_workflow_matches_the_shared_build_flags() {
+    let root = repository_root();
+    let graph = read(&root.join("native/deltafin-native-build/src/lib.rs"));
+    let workflow = read(&root.join(".github/workflows/device-kernel-compile.yml"));
+
+    for constant in ["CUDA_IEEE_MATH_FLAGS", "HIP_IEEE_MATH_FLAGS"] {
+        let block = graph
+            .split(&format!("const {constant}: &[&str] = &["))
+            .nth(1)
+            .and_then(|tail| tail.split("];").next())
+            .unwrap_or_else(|| panic!("{constant} is absent from the shared build graph"));
+        let flags: Vec<&str> = block.split('"').skip(1).step_by(2).collect();
+        assert!(
+            !flags.is_empty(),
+            "{constant} parsed as an empty flag list",
+        );
+        for flag in flags {
+            assert!(
+                workflow.contains(flag),
+                "the device-kernel compile workflow omits {flag:?} from {constant}",
+            );
+        }
+    }
+
+    // The default HIP offload list is the reason the reduction rewrite exists:
+    // two 64-lane CDNA parts and one 32-lane RDNA control. A workflow that
+    // compiled only one width would not exercise the wave-dependent tree.
+    let hip_defaults = graph
+        .split("fn hip_architectures()")
+        .nth(1)
+        .and_then(|tail| tail.split("\nfn ").next())
+        .expect("hip_architectures is absent from the shared build graph");
+    // Anchored on the returned literal, not on the first "gfx" text: the
+    // override validator in the same function also spells a bare "gfx" prefix,
+    // and matching that would reduce every assertion below to a tautology.
+    let defaults = hip_defaults
+        .split(".to_owned()")
+        .next()
+        .and_then(|before_return| before_return.rsplit('"').nth(1))
+        .filter(|value| value.starts_with("gfx") && value.contains(';'))
+        .expect("hip_architectures does not return a semicolon-separated gfx literal");
+    for architecture in defaults.split(';') {
+        // Matched as the offload flag rather than as bare text: every default
+        // target is also named by the code-object verification step, so a
+        // substring search would still pass after the compile stopped
+        // requesting it.
+        assert!(
+            workflow.contains(&format!("--offload-arch={architecture}")),
+            "the device-kernel compile workflow does not offload to the default target {architecture:?}",
+        );
+    }
+
+    // Both sources must be named, or the leg silently checks half the surface.
+    for source in [
+        "tools/cuda_moe_kernels.cu",
+        "native/provider_gate/provider_spine_bf16_cuda.cu",
+    ] {
+        assert!(
+            workflow.contains(source),
+            "the device-kernel compile workflow does not compile {source}",
+        );
+    }
+}

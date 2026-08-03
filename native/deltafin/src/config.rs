@@ -57,6 +57,17 @@ fn parse_spine_stream_nocache(raw: &str) -> Result<Option<bool>> {
     }
 }
 
+fn parse_expert_stream_nocache(raw: &str) -> Result<Option<bool>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "1" | "true" | "on" | "yes" | "enabled" => Ok(Some(true)),
+        "0" | "false" | "off" | "no" | "disabled" => Ok(Some(false)),
+        _ => Err(DeltafinError::new(
+            "K3_EXPERT_STREAM_NOCACHE must be auto, 0/1, false/true, or off/on",
+        )),
+    }
+}
+
 fn parse_spine_resident_gb(raw: &str) -> Result<u64> {
     let gigabytes = if raw.trim().is_empty() {
         0.0
@@ -294,6 +305,10 @@ pub struct RuntimeConfig {
     /// `None` is the capability-qualified automatic policy. `Some` preserves
     /// the established K3_SPINE_STREAM_NOCACHE explicit override.
     pub spine_stream_nocache: Option<bool>,
+    /// Page-cache policy for streaming expert reads. `None` is automatic:
+    /// purge on the memory-tight macOS reference host, keep the kernel file
+    /// cache warm elsewhere. `Some` is the K3_EXPERT_STREAM_NOCACHE override.
+    pub expert_stream_nocache: Option<bool>,
     pub spine_resident_bytes: Option<u64>,
     /// Diagnostic ceiling for provider-owned layer storage. `None` preserves
     /// automatic safe-prefix selection; every explicit value remains subject
@@ -341,6 +356,11 @@ impl RuntimeConfig {
         let spine_stream_nocache = environment("K3_SPINE_STREAM_NOCACHE")
             .as_deref()
             .map(parse_spine_stream_nocache)
+            .transpose()?
+            .flatten();
+        let expert_stream_nocache = environment("K3_EXPERT_STREAM_NOCACHE")
+            .as_deref()
+            .map(parse_expert_stream_nocache)
             .transpose()?
             .flatten();
         let spine_resident_bytes = environment("K3_SPINE_RESIDENT_GB")
@@ -441,6 +461,7 @@ impl RuntimeConfig {
             spine_read_threads,
             spine_fd_cache,
             spine_stream_nocache,
+            expert_stream_nocache,
             spine_resident_bytes,
             provider_resident_layers,
             expert_read_threads,
@@ -495,7 +516,8 @@ impl std::fmt::Display for RuntimeConfig {
         write!(
             f,
             "surface={:?} device={:?} spine={:?} spine_read_threads={} spine_fd_cache={} \
-             spine_stream_nocache={} spine_resident_bytes={} provider_resident_layers={} \
+             spine_stream_nocache={} expert_stream_nocache={} spine_resident_bytes={} \
+             provider_resident_layers={} \
              expert_read_threads={} expert_backend={:?} expert_scale4={:?} pilot_gate={:?} \
              pilot_gate_threshold={} pilot_gate_warmup={} quality={:?} \
              dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
@@ -507,6 +529,7 @@ impl std::fmt::Display for RuntimeConfig {
             describe_usize(self.spine_read_threads),
             describe_bool(self.spine_fd_cache),
             describe_bool(self.spine_stream_nocache),
+            describe_bool(self.expert_stream_nocache),
             describe_u64(self.spine_resident_bytes),
             describe_usize(self.provider_resident_layers),
             describe_usize(self.expert_read_threads),
@@ -759,6 +782,31 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn expert_stream_cache_policy_is_explicit_or_auto() {
+        for (raw, expected) in [
+            ("auto", None),
+            ("1", Some(true)),
+            ("on", Some(true)),
+            ("0", Some(false)),
+            ("off", Some(false)),
+        ] {
+            let config = RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_EXPERT_STREAM_NOCACHE").then(|| raw.into())
+            })
+            .unwrap();
+            assert_eq!(config.expert_stream_nocache, expected);
+        }
+        assert!(
+            RuntimeConfig::resolve(arguments(), |name| {
+                (name == "K3_EXPERT_STREAM_NOCACHE").then(|| "perhaps".into())
+            })
+            .is_err()
+        );
+        let unset = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
+        assert_eq!(unset.expert_stream_nocache, None);
     }
 
     #[test]

@@ -60,10 +60,22 @@ it and build normally: the runtime identifies the HIP dependency, links the
 same `torch_cuda`/`c10_cuda` pair, and reports AMD hardware as CUDA devices,
 which is how ROCm's PyTorch presents itself.
 
-Leave `DELTAFIN_CUDA_MOE` unset. Routed experts run the exact CPU MXFP4 path,
-because the device MXFP4 and original-BF16 kernels assume a 32-lane warp and
-would misreduce silently on 64-lane wavefronts; `ON` is rejected against a
-ROCm root for that reason. `deltafin doctor` names the detected runtime.
+Leaving `DELTAFIN_CUDA_MOE` unset keeps routed experts on the exact CPU MXFP4
+path. That is the default because no AMD device has ever executed Deltafin's
+device kernels, not because they are unported: both reduce correctly at either
+wavefront width.
+
+`DELTAFIN_CUDA_MOE=ON` builds them with HIPCC, discovered through
+`DELTAFIN_HIPCC`, `HIP_PATH`, `ROCM_PATH`, or `PATH`, and requires ROCm 6 or
+newer. `DELTAFIN_HIP_ARCHITECTURES` overrides the default
+`gfx90a;gfx942;gfx1100` offload list. Treat the result as unvalidated until it
+passes the token oracle on the hardware in front of you: a wrong reduction in
+these kernels produces wrong tokens, not a crash. `deltafin upgrade` refuses to
+rebuild a HIP kernel binary, because the reproducible build profile describes
+an NVCC toolchain only; update the checkout and rebuild explicitly instead.
+
+`deltafin doctor` names the detected runtime, the compiling toolchain, and the
+offload architectures.
 
 ## Distribution
 

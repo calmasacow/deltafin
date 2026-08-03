@@ -27,6 +27,18 @@ const CUDA_IEEE_MATH_FLAGS: &[&str] = &[
     "--prec-sqrt=true",
     "--fmad=true",
 ];
+/// The HIPCC spellings of the same four decisions: keep denormals, keep
+/// correctly rounded division and square root, keep approximate transcendental
+/// substitution off, and keep explicit fmaf contraction on. Clang defaults
+/// already match on a stock ROCm install; they are stated so a distribution
+/// that changes a default cannot quietly change the arithmetic.
+const HIP_IEEE_MATH_FLAGS: &[&str] = &[
+    "-fno-fast-math",
+    "-fno-gpu-flush-denormals-to-zero",
+    "-fhip-fp32-correctly-rounded-divide-sqrt",
+    "-fno-gpu-approx-transcendentals",
+    "-ffp-contract=fast-honor-pragmas",
+];
 const PROVIDER_CPP_SOURCES: &[&str] = &[
     "provider_abi.cpp",
     "provider_bf16_cpu.cpp",
@@ -101,6 +113,7 @@ pub const PRODUCTION_PROVIDER_SOURCES: &[&str] = &[
     "tools/fused_gemv.c",
     "tools/fused_gemv_batch.c",
     "tools/neon_compat_x86.h",
+    "tools/gpu_runtime_compat.h",
     "tools/metal_moe_abi.h",
     "tools/metal_moe.mm",
     "tools/metal/moe_mxfp4.metal",
@@ -594,6 +607,8 @@ pub fn run_production_build() {
     println!("cargo:rerun-if-env-changed=LIBTORCH");
     println!("cargo:rerun-if-env-changed=DELTAFIN_CUDA_MOE");
     println!("cargo:rerun-if-env-changed=DELTAFIN_CUDA_ARCHITECTURES");
+    println!("cargo:rerun-if-env-changed=DELTAFIN_HIP_ARCHITECTURES");
+    println!("cargo:rerun-if-env-changed=DELTAFIN_HIPCC");
     println!("cargo:rerun-if-env-changed=CUDACXX");
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
     println!("cargo:rerun-if-env-changed=CUDAToolkit_ROOT");
@@ -661,10 +676,11 @@ pub fn run_production_build() {
         );
     }
     if let Some(cuda) = &artifacts.cuda {
-        if artifacts
-            .cuda_provider
-            .as_ref()
-            .is_none_or(|provider| provider.runtime_directory != cuda.runtime_directory)
+        if cuda.runtime == KernelRuntime::Cuda
+            && artifacts
+                .cuda_provider
+                .as_ref()
+                .is_none_or(|provider| provider.runtime_directory != cuda.runtime_directory)
         {
             panic!(
                 "CUDA provider and NVCC selected different runtimes: {} versus {}",
@@ -675,18 +691,49 @@ pub fn run_production_build() {
                 cuda.runtime_directory.display()
             );
         }
+        if cuda.runtime == KernelRuntime::Hip {
+            // A HIP object references the HIP runtime directly, and the linker
+            // will not resolve those symbols through libtorch_cuda's own
+            // DT_NEEDED entry, so libamdhip64 is named here the way libcudart
+            // is named for NVIDIA.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda.runtime_directory.display()
+            );
+            println!("cargo:rustc-link-lib=dylib=amdhip64");
+            println!(
+                "cargo:rustc-link-arg=-Wl,-rpath,{}",
+                cuda.runtime_directory.display()
+            );
+        }
+        println!(
+            "cargo:rustc-env=DELTAFIN_GPU_KERNEL_RUNTIME={}",
+            cuda.runtime.label()
+        );
         println!(
             "cargo:rustc-env=DELTAFIN_CUDA_TOOLKIT={}",
             cuda.toolkit_version
         );
         println!(
-            "cargo:rustc-env=DELTAFIN_CUDA_ARCHITECTURES={}",
+            "cargo:rustc-env=DELTAFIN_GPU_KERNEL_ARCHITECTURES={}",
             cuda.architectures
         );
+        if cuda.runtime == KernelRuntime::Cuda {
+            println!(
+                "cargo:rustc-env=DELTAFIN_CUDA_ARCHITECTURES={}",
+                cuda.architectures
+            );
+        }
     }
+    // `deltafin upgrade` reproduces a build from NVCC-shaped variables and
+    // validates the architecture list as numeric compute capabilities. A HIP
+    // kernel build fits none of that, so it is deliberately absent from the
+    // reproducible profile and `upgrade` refuses it outright rather than
+    // replaying a different build.
     let effective_cuda = artifacts
         .cuda
         .as_ref()
+        .filter(|cuda| cuda.runtime == KernelRuntime::Cuda)
         .map(|cuda| (cuda.architectures.clone(), cuda.compiler.clone()));
     emit_upgrade_build_profile(
         &artifacts.torch_root,
@@ -1037,9 +1084,10 @@ fn build_provider_artifacts(
     archive_objects(&toolchain.ar, &archive, &objects, &guard);
 
     if let Some(cuda) = &cuda {
-        if cuda_provider
-            .as_ref()
-            .is_none_or(|provider| provider.runtime_directory != cuda.runtime_directory)
+        if cuda.runtime == KernelRuntime::Cuda
+            && cuda_provider
+                .as_ref()
+                .is_none_or(|provider| provider.runtime_directory != cuda.runtime_directory)
         {
             panic!(
                 "CUDA provider and NVCC selected different runtimes: {} versus {}",
@@ -1261,6 +1309,16 @@ fn link_provider_test(
         link.arg("-L")
             .arg(&cuda.runtime_directory)
             .arg("-lcudart")
+            .arg(format!("-Wl,-rpath,{}", cuda.runtime_directory.display()));
+    }
+    if let Some(cuda) = provider
+        .cuda
+        .as_ref()
+        .filter(|cuda| cuda.runtime == KernelRuntime::Hip)
+    {
+        link.arg("-L")
+            .arg(&cuda.runtime_directory)
+            .arg("-lamdhip64")
             .arg(format!("-Wl,-rpath,{}", cuda.runtime_directory.display()));
     }
     match target_os().as_str() {
@@ -1535,6 +1593,13 @@ fn audit_transitive_dependencies(
 ) -> NativeBuildResult<()> {
     let mut roots = vec![provider.torch_root.clone(), provider.torch_lib.clone()];
     if let Some(cuda) = &provider.cuda_provider {
+        roots.push(cuda.runtime_directory.clone());
+    }
+    if let Some(cuda) = provider
+        .cuda
+        .as_ref()
+        .filter(|cuda| cuda.runtime == KernelRuntime::Hip)
+    {
         roots.push(cuda.runtime_directory.clone());
     }
     audit_dependency_graph(executable, &roots, build, &provider.guard)
@@ -2112,8 +2177,27 @@ impl PythonGuard {
     }
 }
 
+/// Which vendor toolchain compiled the device kernel objects. A ROCm LibTorch
+/// still reports `at::kCUDA` devices, so this is the only place the build
+/// distinguishes them after detection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelRuntime {
+    Cuda,
+    Hip,
+}
+
+impl KernelRuntime {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cuda => "CUDA",
+            Self::Hip => "HIP",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CudaBuild {
+    runtime: KernelRuntime,
     compiler: PathBuf,
     toolkit_version: String,
     architectures: String,
@@ -2823,6 +2907,17 @@ fn find_cuda_provider(torch_root: &Path) -> CudaProviderBuild {
     );
 }
 
+/// Toolchain selection for the device kernel translation units, resolved
+/// before either source is compiled so the CUDA and HIP paths cannot drift
+/// into two independent copies of the compile loop.
+struct KernelBuildPlan {
+    runtime: KernelRuntime,
+    compiler: PathBuf,
+    toolkit_version: String,
+    architectures: String,
+    runtime_directory: PathBuf,
+}
+
 fn build_cuda_kernel(
     repository: &Path,
     native_build: &Path,
@@ -2840,33 +2935,94 @@ fn build_cuda_kernel(
     }
     let Some(runtime) = gpu_runtime else {
         if mode == CudaMode::On {
-            panic!("DELTAFIN_CUDA_MOE=ON requires a CUDA-enabled LibTorch root");
+            panic!("DELTAFIN_CUDA_MOE=ON requires a GPU-enabled LibTorch root");
         }
         return None;
     };
-    // These kernels reduce with a fixed 32-lane warp contract (full 0xffffffff
-    // shuffle mask, `threadIdx.x & 31` lanes, `>> 5` warp index). AMD
-    // wavefronts are 64 lanes on CDNA, where that contract silently sums only
-    // part of each wavefront rather than failing, so HIP must not reuse them
-    // until the reduction is made wavefront-agnostic and validated against the
-    // token oracle on real hardware. ROCm keeps the exact CPU MXFP4 path.
-    let libtorch_major = match runtime {
-        GpuRuntime::Cuda(major) => major,
-        GpuRuntime::Rocm => {
-            if mode == CudaMode::On {
-                panic!(
-                    "DELTAFIN_CUDA_MOE=ON requires an NVIDIA CUDA LibTorch root; the selected root is a ROCm/HIP build, whose MXFP4 expert kernels are not ported (the 32-lane warp reduction is not wavefront-agnostic)"
-                );
-            }
-            let note = "ROCm/HIP LibTorch detected: HIP tensors and the int8 spine are available with the exact CPU MXFP4 expert fallback; the MXFP4 and original-BF16 device kernels remain NVIDIA-only";
-            if emit_cargo_metadata {
-                println!("cargo:warning={note}");
-            } else {
-                eprintln!("[xtask] {note}");
-            }
-            return None;
+    let plan = match runtime {
+        GpuRuntime::Cuda(major) => {
+            plan_cuda_kernel_build(major, mode, guard, emit_cargo_metadata)?
         }
+        GpuRuntime::Rocm => plan_hip_kernel_build(mode, guard, emit_cargo_metadata)?,
     };
+    let object = native_build.join("cuda_moe_kernels.o");
+    let spine_object = native_build.join("provider_spine_bf16_cuda_kernel.o");
+    let provider_source = repository.join("native/provider_gate");
+    // Both translation units include tools/gpu_runtime_compat.h, which selects
+    // the CUDA or HIP runtime headers. Only the MoE kernel finds it beside
+    // itself; the spine kernel needs the search path.
+    let compat_include = format!("-I{}", repository.join("tools").display());
+    for (source, output, label) in [
+        (
+            repository.join("tools/cuda_moe_kernels.cu"),
+            &object,
+            "exact device MXFP4 kernels",
+        ),
+        (
+            provider_source.join("provider_spine_bf16_cuda.cu"),
+            &spine_object,
+            "exact device RAW_BF16 spine kernel",
+        ),
+    ] {
+        let mut command = Command::new(&plan.compiler);
+        match plan.runtime {
+            KernelRuntime::Cuda => {
+                command
+                    .args([
+                        "-std=c++17",
+                        "-O3",
+                        "-DNDEBUG",
+                        "-Xcompiler=-fPIC",
+                        "-ccbin",
+                    ])
+                    .arg(&toolchain.cxx)
+                    .args(CUDA_IEEE_MATH_FLAGS);
+                for architecture in plan.architectures.split(';') {
+                    command.arg(format!(
+                        "--generate-code=arch=compute_{architecture},code=[compute_{architecture},sm_{architecture}]"
+                    ));
+                }
+            }
+            KernelRuntime::Hip => {
+                // HIPCC is a Clang driver and compiles host and device code
+                // itself, so there is no -ccbin equivalent. These translation
+                // units export only extern "C" symbols and include no
+                // libstdc++ container types across that boundary, so the host
+                // compiler's dual ABI does not reach them.
+                command
+                    .args(["-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-x", "hip"])
+                    .args(HIP_IEEE_MATH_FLAGS);
+                for architecture in plan.architectures.split(';') {
+                    command.arg(format!("--offload-arch={architecture}"));
+                }
+            }
+        }
+        command
+            .arg(&compat_include)
+            .arg("-c")
+            .arg(source)
+            .arg("-o")
+            .arg(output);
+        run_guarded_checked(&mut command, &format!("compile {label}"), guard);
+        validate_object(output);
+    }
+    Some(CudaBuild {
+        runtime: plan.runtime,
+        compiler: plan.compiler,
+        toolkit_version: plan.toolkit_version,
+        architectures: plan.architectures,
+        runtime_directory: plan.runtime_directory,
+        object,
+        spine_object,
+    })
+}
+
+fn plan_cuda_kernel_build(
+    libtorch_major: u8,
+    mode: CudaMode,
+    guard: &PythonGuard,
+    emit_cargo_metadata: bool,
+) -> Option<KernelBuildPlan> {
     let Some(compiler) = discover_nvcc() else {
         if mode == CudaMode::On {
             panic!("DELTAFIN_CUDA_MOE=ON needs NVCC from exact CUDA 12.6 or 13.0");
@@ -2906,48 +3062,72 @@ fn build_cuda_kernel(
     let toolkit_root = cuda_toolkit_root(&compiler);
     let runtime_directory = cuda_runtime_directory(&toolkit_root);
     let architectures = cuda_architectures(toolkit_major, toolkit_minor);
-    let object = native_build.join("cuda_moe_kernels.o");
-    let spine_object = native_build.join("provider_spine_bf16_cuda_kernel.o");
-    let provider_source = repository.join("native/provider_gate");
-    for (source, output, label) in [
-        (
-            repository.join("tools/cuda_moe_kernels.cu"),
-            &object,
-            "exact CUDA MXFP4 kernels",
-        ),
-        (
-            provider_source.join("provider_spine_bf16_cuda.cu"),
-            &spine_object,
-            "exact CUDA RAW_BF16 spine kernel",
-        ),
-    ] {
-        let mut command = Command::new(&compiler);
-        command
-            .args([
-                "-std=c++17",
-                "-O3",
-                "-DNDEBUG",
-                "-Xcompiler=-fPIC",
-                "-ccbin",
-            ])
-            .arg(&toolchain.cxx)
-            .args(CUDA_IEEE_MATH_FLAGS);
-        for architecture in architectures.split(';') {
-            command.arg(format!(
-                "--generate-code=arch=compute_{architecture},code=[compute_{architecture},sm_{architecture}]"
-            ));
-        }
-        command.arg("-c").arg(source).arg("-o").arg(output);
-        run_guarded_checked(&mut command, &format!("compile {label}"), guard);
-        validate_object(output);
-    }
-    Some(CudaBuild {
+    Some(KernelBuildPlan {
+        runtime: KernelRuntime::Cuda,
         compiler,
         toolkit_version,
         architectures,
         runtime_directory,
-        object,
-        spine_object,
+    })
+}
+
+fn plan_hip_kernel_build(
+    mode: CudaMode,
+    guard: &PythonGuard,
+    emit_cargo_metadata: bool,
+) -> Option<KernelBuildPlan> {
+    // The device reduction is wavefront-agnostic as of the port, and the MXFP4
+    // expert kernels reduce through shared memory and never read a lane at
+    // all. That makes these kernels compilable for AMD; it does not make them
+    // evidenced. No AMD device has executed them: there is no token-oracle
+    // run, no timing arm, and no physical residency or fault evidence on ROCm.
+    // Building them therefore stays opt-in, so a default build on an AMD host
+    // keeps the exact CPU MXFP4 path instead of silently adopting an
+    // accelerator no gate has ever confirmed.
+    if mode != CudaMode::On {
+        let note = "ROCm/HIP LibTorch detected: HIP tensors and the int8 spine are available with the exact CPU MXFP4 expert fallback. The device MXFP4 and original-BF16 kernels are wavefront-agnostic and can be built with DELTAFIN_CUDA_MOE=ON, but no AMD hardware has passed the token oracle, so they are not built by default";
+        if emit_cargo_metadata {
+            println!("cargo:warning={note}");
+        } else {
+            eprintln!("[xtask] {note}");
+        }
+        return None;
+    }
+    let Some(compiler) = discover_hipcc() else {
+        panic!(
+            "DELTAFIN_CUDA_MOE=ON selected a ROCm/HIP LibTorch root but found no hipcc; set DELTAFIN_HIPCC, HIP_PATH, or ROCM_PATH"
+        );
+    };
+    validate_native_executable(&compiler, "HIPCC");
+    let mut version_command = Command::new(&compiler);
+    version_command.arg("--version");
+    let version_output = run_guarded_output(&mut version_command, "query HIPCC version", guard);
+    let version_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&version_output.stdout),
+        String::from_utf8_lossy(&version_output.stderr)
+    );
+    let (toolkit_version, toolkit_major) = parse_hip_version(&version_text);
+    // ROCm 6 is the first series where `warpSize` is the documented way to read
+    // the wave width and `__AMDGCN_WAVEFRONT_SIZE__` is deprecated, which is
+    // exactly the contract the reduction relies on. No specific ROCm release
+    // is pinned the way CUDA 12.6/13.0 are, because no release has been
+    // validated against the oracle; the floor is a compatibility bound, not
+    // evidence.
+    if toolkit_major < 6 {
+        panic!(
+            "Deltafin's HIP kernels require ROCm 6 or newer for the documented warpSize contract; found {toolkit_version}"
+        );
+    }
+    let hip_root = hip_toolkit_root(&compiler);
+    let runtime_directory = hip_runtime_directory(&hip_root);
+    let architectures = hip_architectures();
+    Some(KernelBuildPlan {
+        runtime: KernelRuntime::Hip,
+        compiler,
+        toolkit_version,
+        architectures,
+        runtime_directory,
     })
 }
 
@@ -2976,6 +3156,142 @@ fn discover_nvcc() -> Option<PathBuf> {
         }
     }
     find_on_path(OsStr::new("nvcc")).map(|path| resolve_tool_path(&path, "NVCC"))
+}
+
+fn discover_hipcc() -> Option<PathBuf> {
+    for variable in ["DELTAFIN_HIPCC", "HIPCXX"] {
+        if let Some(value) = env::var_os(variable) {
+            return Some(resolve_tool_value(variable, &value));
+        }
+    }
+    for variable in ["HIP_PATH", "ROCM_PATH", "ROCM_HOME"] {
+        if let Some(value) = env::var_os(variable) {
+            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+                panic!(
+                    "resolve explicit ROCm root {variable}={}: {error}",
+                    PathBuf::from(&value).display()
+                )
+            });
+            let candidate = root.join("bin/hipcc");
+            if !candidate.is_file() {
+                continue;
+            }
+            return Some(resolve_tool_path(&candidate, "HIPCC"));
+        }
+    }
+    find_on_path(OsStr::new("hipcc")).map(|path| resolve_tool_path(&path, "HIPCC"))
+}
+
+fn hip_toolkit_root(compiler: &Path) -> PathBuf {
+    let inferred = compiler
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("HIPCC path has no ROCm root: {}", compiler.display()));
+    let inferred = fs::canonicalize(inferred).unwrap_or_else(|error| {
+        panic!("resolve inferred ROCm root {}: {error}", inferred.display())
+    });
+    let mut explicit_root: Option<PathBuf> = None;
+    for variable in ["HIP_PATH", "ROCM_PATH", "ROCM_HOME"] {
+        if let Some(value) = env::var_os(variable) {
+            let root = fs::canonicalize(&value).unwrap_or_else(|error| {
+                panic!(
+                    "resolve explicit ROCm root {variable}={}: {error}",
+                    PathBuf::from(&value).display()
+                )
+            });
+            if let Some(previous) = &explicit_root {
+                if previous != &root {
+                    panic!(
+                        "conflicting ROCm roots are forbidden: {} and {}",
+                        previous.display(),
+                        root.display()
+                    );
+                }
+            }
+            explicit_root = Some(root);
+        }
+    }
+    // An explicit root that does not itself own the selected hipcc would give
+    // a mixed toolchain the same way a mismatched CUDA_HOME would, so the two
+    // must agree before either is trusted.
+    let root = explicit_root.unwrap_or(inferred);
+    let root_hipcc = fs::canonicalize(root.join("bin/hipcc")).unwrap_or_else(|error| {
+        panic!(
+            "selected ROCm root {} has no resolvable bin/hipcc: {error}",
+            root.display()
+        )
+    });
+    if root_hipcc != compiler {
+        panic!(
+            "mixed ROCm toolchains are forbidden: compiler {} is not {}/bin/hipcc",
+            compiler.display(),
+            root.display()
+        );
+    }
+    root
+}
+
+fn hip_runtime_directory(root: &Path) -> PathBuf {
+    for relative in ["lib", "lib64"] {
+        let candidate = root.join(relative);
+        if library_file(&candidate, "amdhip64").is_some() {
+            return fs::canonicalize(&candidate).unwrap_or_else(|error| {
+                panic!(
+                    "resolve ROCm runtime directory {}: {error}",
+                    candidate.display()
+                )
+            });
+        }
+    }
+    panic!(
+        "selected ROCm root {} has no libamdhip64 runtime directory",
+        root.display()
+    );
+}
+
+fn hip_architectures() -> String {
+    if let Some(value) = env::var_os("DELTAFIN_HIP_ARCHITECTURES") {
+        let value = value.to_string_lossy();
+        if value.is_empty()
+            || value.split(';').any(|part| {
+                part.len() < 4
+                    || !part.starts_with("gfx")
+                    || !part[3..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        {
+            panic!(
+                "DELTAFIN_HIP_ARCHITECTURES must be a semicolon-separated list of gfx targets"
+            );
+        }
+        return value.into_owned();
+    }
+    // gfx90a and gfx942 are the 64-lane CDNA parts the reduction rewrite
+    // exists for; gfx1100 is a 32-lane RDNA3 control that exercises the same
+    // source down the other wave width. None of the three has been executed.
+    "gfx90a;gfx942;gfx1100".to_owned()
+}
+
+/// `hipcc --version` reports `HIP version: 6.2.41134-...`. Only the major and
+/// the printable release are used; the build patch suffix is not a contract.
+fn parse_hip_version(text: &str) -> (String, u8) {
+    let release = text
+        .split("HIP version:")
+        .nth(1)
+        .map(|tail| tail.trim_start())
+        .and_then(|tail| tail.split_whitespace().next())
+        .filter(|value| !value.is_empty() && value.starts_with(|byte: char| byte.is_ascii_digit()))
+        .unwrap_or_else(|| {
+            panic!(
+                "could not parse the HIP version from HIPCC output: {}",
+                one_line(text.as_bytes())
+            )
+        });
+    let major = release
+        .split(['.', '-'])
+        .next()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or_else(|| panic!("invalid HIP major version {release:?}"));
+    (release.to_owned(), major)
 }
 
 fn cuda_toolkit_root(compiler: &Path) -> PathBuf {

@@ -601,7 +601,11 @@ fn expected_launches() -> BTreeMap<Launch, usize> {
     add(build, "compile_gemv", "compiler", 1);
     add(build, "compile_c_test_main", "compiler", 1);
     add(build, "archive_objects", "archiver", 1);
-    add(build, "build_cuda_kernel", "&compiler", 2);
+    // The device-kernel compile loop is shared by NVCC and HIPCC; each planner
+    // separately launches its own compiler once to read a version banner.
+    add(build, "build_cuda_kernel", "&plan.compiler", 1);
+    add(build, "plan_cuda_kernel_build", "&compiler", 1);
+    add(build, "plan_hip_kernel_build", "&compiler", 1);
     add(build, "validate_compiler", "path", 1);
     expected
 }
@@ -718,15 +722,18 @@ fn owned_process_edges_are_ast_classified_and_guarded() {
         "run_guarded_raw_output",
         &[".prepare", ".output", ".assert_clean"],
     );
+    require_facts(&audit, build, "build_cuda_kernel", &["run_guarded_checked"]);
     require_facts(
         &audit,
         build,
-        "build_cuda_kernel",
-        &[
-            "validate_cuda_driver",
-            "run_guarded_output",
-            "run_guarded_checked",
-        ],
+        "plan_cuda_kernel_build",
+        &["validate_cuda_driver", "run_guarded_output"],
+    );
+    require_facts(
+        &audit,
+        build,
+        "plan_hip_kernel_build",
+        &["validate_native_executable", "run_guarded_output"],
     );
     require_facts(
         &audit,

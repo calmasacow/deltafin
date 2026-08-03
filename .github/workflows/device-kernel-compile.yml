@@ -1,0 +1,115 @@
+name: Device kernel compile
+
+# Manual only, deliberately.
+#
+# These legs compile the two device kernel translation units with the real
+# vendor toolchains. Neither has ever run: the HIP path has never been through
+# HIPCC at all, and the flag spellings, header layout and offload targets below
+# are unverified. Wiring that to `push` would make the default branch red for a
+# reason nobody can fix without first running it, and a permanently red build
+# stops being read.
+#
+# Neither job needs a GPU. HIPCC and NVCC cross-compile to gfx and sm targets on
+# an ordinary runner, so this establishes that the sources compile — not that
+# they produce correct tokens. That still requires physical hardware and the
+# token oracle.
+#
+# Promote to `push` once both legs pass.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocm_image:
+        description: ROCm development image providing hipcc
+        required: false
+        default: rocm/dev-ubuntu-24.04:6.3-complete
+      cuda_image:
+        description: CUDA development image providing nvcc
+        required: false
+        default: nvidia/cuda:12.6.3-devel-ubuntu24.04
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-kernel-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hip:
+    name: HIPCC device compile
+    runs-on: ubuntu-24.04
+    container: ${{ inputs.rocm_image }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the selected toolchain
+        run: hipcc --version
+
+      # The flags mirror HIP_IEEE_MATH_FLAGS in the shared Rust build graph.
+      # A policy test asserts they stay identical, because a compile check that
+      # passed different arithmetic flags would give false confidence on
+      # precisely the decisions it exists to protect.
+      - name: Compile both device kernels for every default offload target
+        run: |
+          set -eux
+          for source in tools/cuda_moe_kernels.cu \
+                        native/provider_gate/provider_spine_bf16_cuda.cu; do
+            hipcc \
+              -std=c++17 -O3 -DNDEBUG -fPIC -x hip \
+              -fno-fast-math \
+              -fno-gpu-flush-denormals-to-zero \
+              -fhip-fp32-correctly-rounded-divide-sqrt \
+              -fno-gpu-approx-transcendentals \
+              -ffp-contract=fast-honor-pragmas \
+              --offload-arch=gfx90a \
+              --offload-arch=gfx942 \
+              --offload-arch=gfx1100 \
+              -Itools \
+              -c "$source" -o "/tmp/$(basename "$source").o"
+          done
+
+      # A successful exit does not by itself prove device code was emitted for
+      # each target, so the bundled code objects are named explicitly.
+      - name: Prove a code object exists for every requested wavefront width
+        run: |
+          set -eux
+          for object in /tmp/*.o; do
+            for architecture in gfx90a gfx942 gfx1100; do
+              grep -aq "$architecture" "$object"
+            done
+          done
+
+  cuda:
+    name: NVCC device compile
+    runs-on: ubuntu-24.04
+    container: ${{ inputs.cuda_image }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the selected toolchain
+        run: nvcc --version
+
+      # Same sources, same shim, the other branch. This is the regression leg
+      # for the reduction rewrite: the spine kernel now reduces against
+      # `warpSize` rather than a literal 32, which removed two `#pragma unroll`
+      # sites. It confirms the sources still compile for NVIDIA; it cannot
+      # measure the resident-path timing that change puts at risk.
+      - name: Compile both device kernels for the pinned CUDA 12.6 architectures
+        run: |
+          set -eux
+          for source in tools/cuda_moe_kernels.cu \
+                        native/provider_gate/provider_spine_bf16_cuda.cu; do
+            nvcc \
+              -std=c++17 -O3 -DNDEBUG -Xcompiler=-fPIC \
+              --ftz=false \
+              --prec-div=true \
+              --prec-sqrt=true \
+              --fmad=true \
+              --generate-code=arch=compute_80,code=[compute_80,sm_80] \
+              --generate-code=arch=compute_90,code=[compute_90,sm_90] \
+              -Itools \
+              -c "$source" -o "/tmp/$(basename "$source").o"
+          done

@@ -115,7 +115,8 @@ reuses these audited sources:
 | `tools/fused_gemv.c` | portable single-expert MXFP4 GEMV with aarch64 NEON and x86 SIMD |
 | `tools/fused_gemv_batch.c` | persistent CPU workers, batched expert phases and ordered reduction |
 | `tools/metal_moe.mm` and `tools/metal/moe_mxfp4.metal` | bindless Apple-GPU expert execution and exact scale4 descriptors |
-| `tools/cuda_moe_kernels.cu` | NVIDIA MXFP4 GEMV and MoE execution |
+| `tools/cuda_moe_kernels.cu` | device MXFP4 GEMV and MoE execution, CUDA and ROCm/HIP |
+| `tools/gpu_runtime_compat.h` | CUDA/HIP runtime selection shared by both device kernel sources |
 | `native/provider_gate/provider_*.cpp` | coarse K3, KDA, MLA, draft, route and cache operations |
 
 These source files compile into the same executable. They are not public helper

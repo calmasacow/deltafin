@@ -17,6 +17,7 @@ const WORKSPACE_INPUTS: &[&str] = &[
     // `.documentor-public-ignore` is deliberately absent: it is publishing control, not a build
     // input, and the publishing tool withholds it from the public mirror by design, so requiring
     // it here can never be satisfied in a published checkout.
+    ".github/workflows/device-kernel-compile.yml",
     ".github/workflows/native-source-policy.yml",
     ".gitignore",
     "docs/COMPILED-RUNTIME.md",

@@ -184,6 +184,11 @@ pub struct RawExpertCorpus {
     storage: ExpertCorpusStorage,
     model_root: PathBuf,
     lazy: Option<LazyExpertAdmission>,
+    /// Page-cache treatment for every streaming expert read this corpus
+    /// plans. The memory-tight reference host purges after each pass;
+    /// large-RAM discrete-GPU hosts keep the kernel's file cache warm so
+    /// repeated routed misses stop paying full disk latency.
+    stream_cache_policy: CachePolicy,
 }
 
 #[derive(Debug)]
@@ -347,9 +352,21 @@ impl LazyExpertAdmission {
 
 impl RawExpertCorpus {
     pub fn open(model_root: &Path, layout: ExpertStorageLayout) -> Result<Self> {
+        Self::open_with_cache_policy(model_root, layout, CachePolicy::Streaming)
+    }
+
+    pub fn open_with_cache_policy(
+        model_root: &Path,
+        layout: ExpertStorageLayout,
+        stream_cache_policy: CachePolicy,
+    ) -> Result<Self> {
         match layout {
-            ExpertStorageLayout::RawV1 => Self::open_raw_v1(model_root),
-            ExpertStorageLayout::Scale4V2 => Self::open_scale4_v2(model_root),
+            ExpertStorageLayout::RawV1 => {
+                Self::open_raw_v1_with_cache_policy(model_root, stream_cache_policy)
+            }
+            ExpertStorageLayout::Scale4V2 => {
+                Self::open_scale4_v2_with_cache_policy(model_root, stream_cache_policy)
+            }
         }
     }
 
@@ -358,9 +375,13 @@ impl RawExpertCorpus {
     /// incomplete. A complete installation keeps the decode hot path free of
     /// duplicate metadata calls; a partial installation admits exactly the
     /// bounded routed union before its ordinary no-follow reader ticket.
-    pub fn open_auto(model_root: &Path, layout: ExpertStorageLayout) -> Result<Self> {
+    pub fn open_auto(
+        model_root: &Path,
+        layout: ExpertStorageLayout,
+        stream_cache_policy: CachePolicy,
+    ) -> Result<Self> {
         ensure_raw_cache_directory(model_root)?;
-        let mut corpus = Self::open(model_root, layout)?;
+        let mut corpus = Self::open_with_cache_policy(model_root, layout, stream_cache_policy)?;
         let missing = raw_cache_missing_files(model_root)?;
         if missing != 0 {
             let inventory = K3Inventory::load_from_root(model_root)?;
@@ -374,6 +395,13 @@ impl RawExpertCorpus {
     }
 
     pub fn open_raw_v1(model_root: &Path) -> Result<Self> {
+        Self::open_raw_v1_with_cache_policy(model_root, CachePolicy::Streaming)
+    }
+
+    pub fn open_raw_v1_with_cache_policy(
+        model_root: &Path,
+        stream_cache_policy: CachePolicy,
+    ) -> Result<Self> {
         let mut names = Vec::with_capacity(K3_EXPERT_RAW_FILES);
         for layer in K3_MOE_LAYER_FIRST..=K3_MOE_LAYER_LAST {
             for expert in 0..K3_EXPERTS_PER_LAYER as u16 {
@@ -384,17 +412,25 @@ impl RawExpertCorpus {
             &model_root.join("k3-experts"),
             names,
             K3_EXPERT_SOURCE_BYTES as u64,
-            CachePolicy::Streaming,
+            stream_cache_policy,
         )?;
         debug_assert_eq!(catalog.source_count(), K3_EXPERT_RAW_FILES);
         Ok(Self {
             storage: ExpertCorpusStorage::Raw(catalog),
             model_root: model_root.to_path_buf(),
             lazy: None,
+            stream_cache_policy,
         })
     }
 
     pub fn open_scale4_v2(model_root: &Path) -> Result<Self> {
+        Self::open_scale4_v2_with_cache_policy(model_root, CachePolicy::Streaming)
+    }
+
+    pub fn open_scale4_v2_with_cache_policy(
+        model_root: &Path,
+        stream_cache_policy: CachePolicy,
+    ) -> Result<Self> {
         let manifest = Scale4Manifest::load_full(model_root.join("k3-experts-scale4"))?;
         if manifest.entries().len() != K3_EXPERT_RAW_FILES {
             return Err(DeltafinError::new(
@@ -408,6 +444,7 @@ impl RawExpertCorpus {
             },
             model_root: model_root.to_path_buf(),
             lazy: None,
+            stream_cache_policy,
         })
     }
 
@@ -457,6 +494,7 @@ impl RawExpertCorpus {
                     layer,
                     &expert_ids,
                     0,
+                    self.stream_cache_policy,
                 )?;
                 let identity = plan.scale4_identity.ok_or_else(|| {
                     DeltafinError::new("scale4 read plan lost its sidecar identity")
@@ -539,10 +577,12 @@ impl RawExpertCorpus {
                         // decode top-k. A wider sequence union still enters the Reader's
                         // bounded arena, opens every source only on a worker with
                         // O_NOFOLLOW, and validates the live descriptor's exact length.
-                        let plan = ExpertBatchPlan::open_raw_cache_default(
+                        let plan = ExpertBatchPlan::open_raw_cache_with_cache_policy(
                             &self.model_root,
                             layer,
                             selection.expert_ids(),
+                            DEFAULT_EXPERT_CHUNK_BYTES,
+                            self.stream_cache_policy,
                         )?;
                         reader.submit(plan.read_plan(), priority)?
                     };
@@ -573,6 +613,7 @@ impl RawExpertCorpus {
                         layer,
                         selection.expert_ids(),
                         0,
+                        self.stream_cache_policy,
                     )?;
                     let identity = plan.scale4_identity.ok_or_else(|| {
                         DeltafinError::new("scale4 union plan lost its sidecar identity")
@@ -996,6 +1037,22 @@ impl ExpertBatchPlan {
         routed_experts: &[u16],
         chunk_bytes: usize,
     ) -> Result<Self> {
+        Self::open_raw_cache_with_cache_policy(
+            model_root,
+            layer,
+            routed_experts,
+            chunk_bytes,
+            CachePolicy::Streaming,
+        )
+    }
+
+    pub fn open_raw_cache_with_cache_policy(
+        model_root: &Path,
+        layer: u32,
+        routed_experts: &[u16],
+        chunk_bytes: usize,
+        cache_policy: CachePolicy,
+    ) -> Result<Self> {
         // Loose routed experts are deliberately not opened here. The fixed
         // reader pool opens them concurrently with O_NOFOLLOW, validates the
         // exact canonical length on the live descriptor, reads one complete
@@ -1063,7 +1120,7 @@ impl ExpertBatchPlan {
             extents,
             BufferLengths::new(0, 0, raw_bytes),
             chunk_bytes,
-            CachePolicy::Streaming,
+            cache_policy,
             K3_EXPERT_SOURCE_BYTES as u64,
         )?;
         Ok(Self {
@@ -1092,6 +1149,7 @@ impl ExpertBatchPlan {
             chunk_bytes,
             None,
             None,
+            CachePolicy::Streaming,
         )
     }
 
@@ -1102,6 +1160,7 @@ impl ExpertBatchPlan {
         layer: u32,
         routed_experts: &[u16],
         chunk_bytes: usize,
+        cache_policy: CachePolicy,
     ) -> Result<Self> {
         let reusable_identity = validation.reusable_corpus_identity(layer);
         let plan = Self::open_scale4_manifest_with_identity(
@@ -1112,6 +1171,7 @@ impl ExpertBatchPlan {
             chunk_bytes,
             reusable_identity,
             Some(validation),
+            cache_policy,
         )?;
         let identity = plan.scale4_identity.ok_or_else(|| {
             DeltafinError::new("scale4 corpus plan lost its sidecar identity contract")
@@ -1121,6 +1181,7 @@ impl ExpertBatchPlan {
         Ok(plan)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_scale4_manifest_with_identity(
         model_root: &Path,
         manifest: &Scale4Manifest,
@@ -1129,6 +1190,7 @@ impl ExpertBatchPlan {
         chunk_bytes: usize,
         captured_identity: Option<DeferredSourceIdentity>,
         validation: Option<&Scale4ValidationCache>,
+        cache_policy: CachePolicy,
     ) -> Result<Self> {
         validate_layer(layer)?;
         if routed_experts.is_empty() {
@@ -1269,7 +1331,7 @@ impl ExpertBatchPlan {
             source_lengths,
             BufferLengths::new(0, 0, blob_bytes),
             chunk_bytes,
-            CachePolicy::Streaming,
+            cache_policy,
         )?;
         Ok(Self {
             layer,

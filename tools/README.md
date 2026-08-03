@@ -18,6 +18,7 @@ these files from this directory:
 - `metal_moe_abi.h`
 - `metal_moe.mm`
 - `metal/moe_mxfp4.metal`
+- `gpu_runtime_compat.h`
 - `cuda_moe_kernels.cu`
 
 They are compiled into the in-process provider. Users do not launch them, and

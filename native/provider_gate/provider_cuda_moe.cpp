@@ -496,6 +496,10 @@ struct CudaMoeExpertCache::Impl {
   struct Entry {
     std::uint16_t expert = 0;
     Resident resident;
+    /// Monotonic recency stamp shared by every layer stratum. Eviction picks
+    /// the globally least-recent entry, so heavily re-routed (skewed) layers
+    /// keep more residents than layers whose routing churns.
+    std::uint64_t last_use = 0;
   };
 
   struct Plan {
@@ -522,11 +526,44 @@ struct CudaMoeExpertCache::Impl {
     }
     // Every raw-kernel tensor is recorded on its launch stream before status
     // checking, so dropping these owners cannot recycle storage still in use.
-    // Keep the pinned stage/event until destruction: its DMA may still be in
-    // flight, and the destructor performs the required host-side wait.
+    // Keep the pinned stages/events until destruction: their DMA may still be
+    // in flight, and the destructor performs the required host-side wait.
     for (auto& layer : layers) {
       layer.clear();
     }
+    resident_entries = 0;
+  }
+
+  /*
+   * A classified allocator failure with a proven-idle stream releases every
+   * cached expert and re-measures the budget instead of disabling the cache
+   * for the rest of the session. One transient spike (spine residency churn,
+   * allocator fragmentation) must not silently convert the remaining run
+   * into full expert re-streaming. Bounded retries keep a genuinely
+   * undersized device from oscillating; exhausting them poisons as before.
+   */
+  bool rebuild_after_memory_pressure(const char* failure) noexcept {
+    if (rebuilds_remaining == 0) {
+      poison(failure, false);
+      return false;
+    }
+    --rebuilds_remaining;
+    for (auto& layer : layers) {
+      layer.clear();
+    }
+    resident_entries = 0;
+    budget_ready = false;
+    try {
+      const c10::cuda::CUDAGuard guard(device);
+      // The caller already drained the execution stream, so no kernel can
+      // still read the dropped tensors; returning their blocks to the driver
+      // lets the re-measured budget see the reclaimed VRAM.
+      c10::cuda::CUDACachingAllocator::emptyCache();
+    } catch (...) {
+      poison(failure, false);
+      return false;
+    }
+    return true;
   }
 
   void freeze_configuration() noexcept { configuration_frozen = true; }
@@ -595,12 +632,16 @@ struct CudaMoeExpertCache::Impl {
       return std::forward<Function>(function)();
     } catch (const c10::OutOfMemoryError& error) {
       const cudaError_t drained = synchronize_execution_stream_noexcept();
-      poison(error.what(), drained != cudaSuccess);
       if (drained == cudaSuccess) {
+        // The tile still fails over to the exact CPU reconstruction, but the
+        // cache survives with a freshly re-measured (smaller) budget instead
+        // of silently re-streaming every expert for the rest of the session.
+        static_cast<void>(rebuild_after_memory_pressure(error.what()));
         throw CudaMoeRecoverableError(
             std::string("recoverable CUDA expert allocation failure: ") +
             error.what());
       }
+      poison(error.what(), true);
       throw std::runtime_error(
           std::string("CUDA expert allocation failed and its stream could not drain: ") +
           cudaGetErrorString(drained));
@@ -612,21 +653,16 @@ struct CudaMoeExpertCache::Impl {
   }
 
   ~Impl() {
-    if (stage_ready != nullptr) {
-      try {
-        stage_ready->synchronize();
-      } catch (...) {
-        // Destructors cannot surface a shutdown-time CUDA failure.  Device
-        // tensors remain allocator-owned and CUDA tears the context down.
+    for (auto& ready : stage_ready) {
+      if (ready != nullptr) {
+        try {
+          ready->synchronize();
+        } catch (...) {
+          // Destructors cannot surface a shutdown-time CUDA failure.  Device
+          // tensors remain allocator-owned and CUDA tears the context down.
+        }
       }
     }
-  }
-
-  std::size_t quota(const std::size_t slot) const {
-    const std::size_t base = capacity / kCudaLayerStrata;
-    const std::size_t remainder = capacity % kCudaLayerStrata;
-    const std::size_t rank = (slot * 53 + 17) % kCudaLayerStrata;
-    return base + static_cast<std::size_t>(rank < remainder);
   }
 
   void establish_budget() {
@@ -681,8 +717,33 @@ struct CudaMoeExpertCache::Impl {
     }
     Entry promoted = std::move(*found);
     entries.erase(found);
+    promoted.last_use = ++use_clock;
     entries.push_back(std::move(promoted));
     return &entries.back().resident;
+  }
+
+  /*
+   * Drop the globally least-recent resident. Each stratum keeps local
+   * recency order (hits and admissions move to the back), so its front is
+   * that layer's own LRU and the global victim is the minimum over fronts.
+   */
+  void evict_global_lru() {
+    std::size_t victim_slot = kCudaLayerStrata;
+    std::uint64_t victim_use = std::numeric_limits<std::uint64_t>::max();
+    for (std::size_t slot = 0; slot < kCudaLayerStrata; ++slot) {
+      const auto& entries = layers[slot];
+      if (!entries.empty() && entries.front().last_use < victim_use) {
+        victim_use = entries.front().last_use;
+        victim_slot = slot;
+      }
+    }
+    if (victim_slot == kCudaLayerStrata) {
+      throw std::logic_error(
+          "CUDA expert cache accounting lost its resident entries");
+    }
+    auto& victims = layers[victim_slot];
+    victims.erase(victims.begin());
+    --resident_entries;
   }
 
   Plan& require_plan(const std::uint64_t plan_id) {
@@ -700,32 +761,37 @@ struct CudaMoeExpertCache::Impl {
       throw std::invalid_argument(
           "CUDA expert source does not have the exact raw-v1 span");
     }
-    if (stage_ready != nullptr) {
-      // Host writes cannot be ordered by a stream wait.  The CPU must wait
-      // until the previous DMA has stopped reading the reusable pinned slab.
-      stage_ready->synchronize();
-      stage_ready.reset();
+    // Two pinned slabs alternate so this host memcpy overlaps the previous
+    // expert's still-running DMA instead of serializing every miss behind
+    // it. Each slab still waits for its own prior DMA before reuse: host
+    // writes cannot be ordered by a stream wait.
+    const std::size_t slot = stage_cursor;
+    stage_cursor = (stage_cursor + 1) % kStageSlots;
+    if (stage_ready[slot] != nullptr) {
+      stage_ready[slot]->synchronize();
+      stage_ready[slot].reset();
     }
-    if (!pinned_stage.defined()) {
-      pinned_stage = at::empty(
+    at::Tensor& pinned = pinned_stage[slot];
+    if (!pinned.defined()) {
+      pinned = at::empty(
           {kCudaExpertSpan},
           at::TensorOptions()
               .dtype(at::kByte)
               .device(at::kCPU)
               .pinned_memory(true));
-      if (!pinned_stage.is_pinned()) {
+      if (!pinned.is_pinned()) {
         throw std::runtime_error(
             "CUDA expert staging allocation is not pinned");
       }
     }
-    std::memcpy(pinned_stage.data_ptr<std::uint8_t>(), source, source_bytes);
+    std::memcpy(pinned.data_ptr<std::uint8_t>(), source, source_bytes);
     const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
     auto ready = std::make_shared<CudaReadyEvent>();
     at::Tensor uploaded = at::empty(
         {kCudaExpertSpan},
         at::TensorOptions().dtype(at::kByte).device(device));
     try {
-      uploaded.copy_(pinned_stage, true);
+      uploaded.copy_(pinned, true);
       ready->record(stream);
     } catch (...) {
       // `copy_` may have submitted DMA before reporting a later failure. The
@@ -734,7 +800,7 @@ struct CudaMoeExpertCache::Impl {
       static_cast<void>(cudaStreamSynchronize(stream.stream()));
       throw;
     }
-    stage_ready = ready;
+    stage_ready[slot] = ready;
     return Resident{std::move(uploaded), std::move(ready)};
   }
 
@@ -744,25 +810,16 @@ struct CudaMoeExpertCache::Impl {
                     const std::size_t source_bytes) {
     establish_budget();
     const std::size_t slot = layer_slot(layer_index);
-    auto& entries = layers[slot];
-    const auto found = std::find_if(
-        entries.begin(), entries.end(), [expert](const Entry& entry) {
-          return entry.expert == expert;
-        });
-    if (found != entries.end()) {
-      Resident value = found->resident;
-      Entry promoted = std::move(*found);
-      entries.erase(found);
-      entries.push_back(std::move(promoted));
-      return value;
+    if (Resident* found = hit(layer_index, expert); found != nullptr) {
+      return *found;
     }
     Resident uploaded = upload(source, source_bytes);
-    const std::size_t layer_quota = quota(slot);
-    if (layer_quota != 0) {
-      if (entries.size() >= layer_quota) {
-        entries.erase(entries.begin());
+    if (capacity != 0) {
+      while (resident_entries >= capacity) {
+        evict_global_lru();
       }
-      entries.push_back(Entry{expert, uploaded});
+      layers[slot].push_back(Entry{expert, uploaded, ++use_clock});
+      ++resident_entries;
     }
     return uploaded;
   }
@@ -813,8 +870,13 @@ struct CudaMoeExpertCache::Impl {
   std::size_t capacity = 0;
   CudaMoeCachePolicy policy;
   std::string reason = "CUDA MXFP4 capability has not been checked";
-  at::Tensor pinned_stage;
-  std::shared_ptr<CudaReadyEvent> stage_ready;
+  static constexpr std::size_t kStageSlots = 2;
+  std::array<at::Tensor, kStageSlots> pinned_stage;
+  std::array<std::shared_ptr<CudaReadyEvent>, kStageSlots> stage_ready;
+  std::size_t stage_cursor = 0;
+  std::uint64_t use_clock = 0;
+  std::size_t resident_entries = 0;
+  std::uint32_t rebuilds_remaining = 2;
   std::array<std::vector<Entry>, kCudaLayerStrata> layers;
   std::unordered_map<std::uint64_t, Plan> plans;
 };

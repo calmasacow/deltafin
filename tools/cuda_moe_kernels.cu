@@ -1,11 +1,20 @@
-// Deltafin CUDA MXFP4 kernels.
+// Deltafin device MXFP4 kernels for CUDA and ROCm/HIP.
 //
-// This translation unit is deliberately stateless.  It never calls cudaMalloc,
-// owns no device buffers, and does not retain a pointer after an API call.  The
-// The native provider owns every allocation and passes LibTorch's current CUDA
-// stream explicitly. That makes device, stream, allocator, and lifetime
+// This translation unit is deliberately stateless.  It never allocates device
+// memory, owns no device buffers, and does not retain a pointer after an API
+// call.  The native provider owns every allocation and passes LibTorch's
+// current stream explicitly. That makes device, stream, allocator, and lifetime
 // ownership visible at the native boundary instead of hiding them in process
 // globals.
+//
+// Every reduction here is a shared-memory tree over a fixed 128-thread block.
+// Nothing in this file reads a warp or wavefront lane, so the FP32 addition
+// order is identical on a 32-lane warp and a 64-lane CDNA wavefront and the
+// kernels port to HIP without a reduction change.  What is not identical
+// across vendors is the SiTU activation: tanhf and expf resolve to CUDA
+// libdevice or to AMD's OCML, which agree to well within the routed-expert
+// tolerance but not to the last bit.  Cross-vendor bit equality was never the
+// contract; the token oracle is.
 //
 // Expert layout version 1 is the 17,547,264-byte on-disk span:
 //   w1 packed, w1 scale, w2 packed, w2 scale, w3 packed, w3 scale.
@@ -13,8 +22,7 @@
 // Build integration lives in native/deltafin-native-build. Keep every exported
 // function returning a checked status except the side-effect-free handshake.
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "gpu_runtime_compat.h"
 
 #include <cmath>
 #include <cstdint>
@@ -49,15 +57,15 @@ void set_error(const char* operation, const char* detail) {
         g_last_error,
         sizeof(g_last_error),
         "%s: %s",
-        operation ? operation : "CUDA operation",
+        operation ? operation : "device operation",
         detail ? detail : "unknown error");
 }
 
-int cuda_status(const char* operation, cudaError_t status) {
-    if (status == cudaSuccess) {
+int device_status(const char* operation, k3_gpu::Error status) {
+    if (status == k3_gpu::kSuccess) {
         return kOk;
     }
-    set_error(operation, cudaGetErrorString(status));
+    set_error(operation, k3_gpu::error_string(status));
     return kCudaError;
 }
 
@@ -218,7 +226,7 @@ int launch_gemv(
     int rows,
     int cols,
     int batches,
-    cudaStream_t stream) {
+    k3_gpu::Stream stream) {
     const int valid =
         validate_gemv(packed, scales, x, output, rows, cols, batches);
     if (valid != kOk) {
@@ -228,7 +236,7 @@ int launch_gemv(
         static_cast<int64_t>(rows) * static_cast<int64_t>(batches));
     mxfp4_gemv_kernel<<<blocks, kThreads, 0, stream>>>(
         packed, scales, x, output, rows, cols, batches);
-    return cuda_status("mxfp4 GEMV launch", cudaPeekAtLastError());
+    return device_status("mxfp4 GEMV launch", k3_gpu::peek_error());
 }
 
 }  // namespace
@@ -262,45 +270,51 @@ extern "C" const char* k3_cuda_last_error(void) {
 
 extern "C" int k3_cuda_moe_available(int device) {
     int count = 0;
-    cudaError_t status = cudaGetDeviceCount(&count);
-    if (status != cudaSuccess) {
-        return cuda_status("cudaGetDeviceCount", status);
+    k3_gpu::Error status = k3_gpu::get_device_count(&count);
+    if (status != k3_gpu::kSuccess) {
+        return device_status("device count query", status);
     }
     if (device < 0 || device >= count) {
-        set_error("CUDA availability", "device index is outside the visible range");
+        set_error(
+            "device availability", "device index is outside the visible range");
         return kUnsupported;
     }
     int compute_mode = -1;
-    status = cudaDeviceGetAttribute(
-        &compute_mode, cudaDevAttrComputeMode, device);
-    if (status != cudaSuccess) {
-        return cuda_status("cudaDeviceGetAttribute(compute mode)", status);
+    status = k3_gpu::compute_mode(&compute_mode, device);
+    if (status != k3_gpu::kSuccess) {
+        return device_status("device attribute (compute mode)", status);
     }
-    if (compute_mode == cudaComputeModeProhibited) {
-        set_error("CUDA availability", "device compute mode is prohibited");
+    if (compute_mode == k3_gpu::kComputeModeProhibited) {
+        set_error("device availability", "device compute mode is prohibited");
         return kUnsupported;
     }
     int major = 0;
     int minor = 0;
-    status = cudaDeviceGetAttribute(
-        &major, cudaDevAttrComputeCapabilityMajor, device);
-    if (status != cudaSuccess) {
-        return cuda_status(
-            "cudaDeviceGetAttribute(compute capability major)", status);
+    status = k3_gpu::architecture_major(&major, device);
+    if (status != k3_gpu::kSuccess) {
+        return device_status("device attribute (architecture major)", status);
     }
-    status = cudaDeviceGetAttribute(
-        &minor, cudaDevAttrComputeCapabilityMinor, device);
-    if (status != cudaSuccess) {
-        return cuda_status(
-            "cudaDeviceGetAttribute(compute capability minor)", status);
+    status = k3_gpu::architecture_minor(&minor, device);
+    if (status != k3_gpu::kSuccess) {
+        return device_status("device attribute (architecture minor)", status);
+    }
+    // The expert reduction is a shared-memory tree, so this kernel has no wave
+    // width to qualify. The value is still reported so a run on AMD records
+    // which wavefront the code object actually used.
+    int wave = 0;
+    status = k3_gpu::wave_width(&wave, device);
+    if (status != k3_gpu::kSuccess) {
+        return device_status("device attribute (wave width)", status);
     }
     std::snprintf(
         g_last_error,
         sizeof(g_last_error),
-        "available: device %d compute capability %d.%d",
+        "available: %s device %d architecture %d.%d, %d-lane wave",
+        k3_gpu::kRuntimeName,
         device,
         major,
-        minor);
+        minor,
+        wave);
     return 1;
 }
 
@@ -321,7 +335,7 @@ extern "C" int k3_cuda_mxfp4_gemv(
         rows,
         cols,
         batches,
-        reinterpret_cast<cudaStream_t>(stream_pointer));
+        reinterpret_cast<k3_gpu::Stream>(stream_pointer));
 }
 
 extern "C" int k3_cuda_moe_launch(
@@ -333,12 +347,13 @@ extern "C" int k3_cuda_moe_launch(
     float* expert_output,
     void* stream_pointer) {
     if (!expert_span || !x || !gate || !up || !expert_output) {
-        return reject("CUDA MoE", "null input, scratch, or output pointer");
+        return reject("device MoE", "null input, scratch, or output pointer");
     }
     if (batches <= 0) {
-        return reject("CUDA MoE", "batch count must be positive");
+        return reject("device MoE", "batch count must be positive");
     }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_pointer);
+    k3_gpu::Stream stream =
+        reinterpret_cast<k3_gpu::Stream>(stream_pointer);
 
     const uint8_t* w1_packed = expert_span;
     const uint8_t* w1_scale = expert_span + kPackedBytes;
@@ -380,12 +395,12 @@ extern "C" int k3_cuda_moe_launch(
     const int64_t activation_blocks =
         (activation_count + kThreads - 1) / kThreads;
     if (activation_blocks > std::numeric_limits<int>::max()) {
-        return reject("CUDA MoE", "activation launch grid is too large");
+        return reject("device MoE", "activation launch grid is too large");
     }
     situ_kernel<<<
         static_cast<int>(activation_blocks), kThreads, 0, stream>>>(
         gate, up, activation_count);
-    status = cuda_status("SiTU launch", cudaPeekAtLastError());
+    status = device_status("SiTU launch", k3_gpu::peek_error());
     if (status != kOk) {
         return status;
     }
@@ -424,11 +439,11 @@ extern "C" int k3_cuda_int8_dequant(
         static_cast<int>(blocks),
         256,
         0,
-        reinterpret_cast<cudaStream_t>(stream_pointer)>>>(
+        reinterpret_cast<k3_gpu::Stream>(stream_pointer)>>>(
         quantized,
         reinterpret_cast<const __half*>(scales_fp16),
         output,
         count,
         cols);
-    return cuda_status("int8 dequant launch", cudaPeekAtLastError());
+    return device_status("int8 dequant launch", k3_gpu::peek_error());
 }

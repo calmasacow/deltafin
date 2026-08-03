@@ -365,6 +365,69 @@ impl MetalExpertCacheStatsReportV1 {
     }
 }
 
+const CUDA_CACHE_CAPACITY_EXACT: u32 = 1;
+const CUDA_CACHE_RESERVE_BYTES: u32 = 1;
+
+/// Provider-side bound: one cache entry per routed expert edge across the 92
+/// MoE layers (`92 * DELTAFIN_PROVIDER_ROUTE_TOP_K_V1`). The runtime rejects
+/// larger requests, so the engine clamps before configuring.
+pub const CUDA_EXPERT_CACHE_MAX_EXPERTS: u32 = 92 * 16;
+
+/// Explicit, session-frozen CUDA expert-cache budget. Configuration must
+/// happen before the first expert plan or availability probe; the provider
+/// still clamps the requested capacity against live free VRAM minus
+/// `reserve_bytes` when the budget is first exercised.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CudaExpertCachePolicy {
+    pub capacity_experts: u32,
+    pub reserve_bytes: u64,
+}
+
+#[repr(C)]
+struct CudaCacheConfigureRequestV1 {
+    struct_size: u32,
+    abi_version: u32,
+    session: u64,
+    capacity_mode: u32,
+    reserve_mode: u32,
+    capacity_experts: u64,
+    reserve_value: u64,
+    flags: u32,
+    reserved0: u32,
+    reserved: [u64; 2],
+}
+
+#[repr(C)]
+struct CudaCacheConfigureReportV1 {
+    struct_size: u32,
+    abi_version: u32,
+    session: u64,
+    capacity_mode: u32,
+    reserve_mode: u32,
+    capacity_experts: u64,
+    reserve_value: u64,
+    configured: u32,
+    flags: u32,
+    reserved: [u64; 2],
+}
+
+impl CudaCacheConfigureReportV1 {
+    fn request() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            abi_version: 0,
+            session: 0,
+            capacity_mode: 0,
+            reserve_mode: 0,
+            capacity_experts: 0,
+            reserve_value: 0,
+            configured: 0,
+            flags: 0,
+            reserved: [0; 2],
+        }
+    }
+}
+
 #[repr(C)]
 struct TensorUploadF32V1 {
     struct_size: u32,
@@ -1782,6 +1845,11 @@ const _: [(); 192] = [(); std::mem::offset_of!(
     expert_major_bytes
 )];
 const _: [(); 24] = [(); std::mem::offset_of!(TargetSequenceFinishExpertsReportV1, layer_index)];
+const _: [(); 64] = [(); size_of::<CudaCacheConfigureRequestV1>()];
+const _: [(); 24] = [(); std::mem::offset_of!(CudaCacheConfigureRequestV1, capacity_experts)];
+const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureRequestV1, flags)];
+const _: [(); 64] = [(); size_of::<CudaCacheConfigureReportV1>()];
+const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureReportV1, configured)];
 
 unsafe extern "C" {
     #[cfg(all(test, target_os = "macos"))]
@@ -1837,6 +1905,12 @@ unsafe extern "C" {
     fn deltafin_provider_metal_expert_cache_stats_v1(
         request: *const ResourceRequestV1,
         report: *mut MetalExpertCacheStatsReportV1,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn deltafin_provider_cuda_cache_configure_v1(
+        request: *const CudaCacheConfigureRequestV1,
+        report: *mut CudaCacheConfigureReportV1,
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
@@ -2980,6 +3054,63 @@ impl SessionInner {
             bindless: report.bindless != 0,
         })
     }
+
+    fn configure_cuda_expert_cache(&self, policy: CudaExpertCachePolicy) -> Result<()> {
+        if !matches!(self.device, Device::Cuda(_)) {
+            return Err(DeltafinError::new(
+                "CUDA expert-cache configuration requires a CUDA provider session",
+            ));
+        }
+        if policy.capacity_experts > CUDA_EXPERT_CACHE_MAX_EXPERTS {
+            return Err(DeltafinError::new(format!(
+                "CUDA expert-cache capacity {} exceeds the provider bound {}",
+                policy.capacity_experts, CUDA_EXPERT_CACHE_MAX_EXPERTS,
+            )));
+        }
+        let request = CudaCacheConfigureRequestV1 {
+            struct_size: size_of::<CudaCacheConfigureRequestV1>() as u32,
+            abi_version: ABI_VERSION,
+            session: self.handle,
+            capacity_mode: CUDA_CACHE_CAPACITY_EXACT,
+            reserve_mode: CUDA_CACHE_RESERVE_BYTES,
+            capacity_experts: u64::from(policy.capacity_experts),
+            reserve_value: policy.reserve_bytes,
+            flags: 0,
+            reserved0: 0,
+            reserved: [0; 2],
+        };
+        let mut report = CudaCacheConfigureReportV1::request();
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: the request is immutable and report/error remain writable
+        // for this synchronous, session-retained ABI call.
+        let status = unsafe {
+            deltafin_provider_cuda_cache_configure_v1(
+                &request,
+                &mut report,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error("native CUDA expert-cache configure", &error));
+        }
+        if report.struct_size as usize != size_of::<CudaCacheConfigureReportV1>()
+            || report.abi_version != ABI_VERSION
+            || report.session != self.handle
+            || report.capacity_mode != CUDA_CACHE_CAPACITY_EXACT
+            || report.reserve_mode != CUDA_CACHE_RESERVE_BYTES
+            || report.capacity_experts != u64::from(policy.capacity_experts)
+            || report.reserve_value != policy.reserve_bytes
+            || report.configured != 1
+            || report.flags != 0
+            || report.reserved != [0; 2]
+        {
+            return Err(DeltafinError::new(
+                "native provider returned an invalid CUDA expert-cache configuration report",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SessionInner {
@@ -3087,6 +3218,14 @@ impl NativeProviderSession {
     #[cfg(test)]
     pub(crate) fn metal_expert_cache_stats(&self) -> Result<MetalExpertCacheStats> {
         self.inner.metal_expert_cache_stats()
+    }
+
+    /// Freeze the session's CUDA expert-cache budget before any expert plan
+    /// or availability probe runs. The engine derives this policy from the
+    /// same memory snapshot that sizes spine residency, so the two VRAM
+    /// consumers can never double-book the device.
+    pub fn configure_cuda_expert_cache(&self, policy: CudaExpertCachePolicy) -> Result<()> {
+        self.inner.configure_cuda_expert_cache(policy)
     }
 
     /// Create a real-target provider context. The complete K3 execution tape

@@ -55,10 +55,11 @@ use crate::program::{
     TargetProgram, WeightDType, WeightStorage,
 };
 use crate::provider::{
-    NativeProvider, NativeProviderInventory, NativeProviderMemorySnapshot, NativeProviderSession,
-    ProviderTensor, TARGET_PILOT_RESERVE_BYTES, TargetExpertBackend, TargetGlobalGroup,
-    TargetSequence, TargetSequenceCommit, TargetSequenceLayerPrepare, TargetSequenceMailbox,
-    TargetSequenceMode, TargetSequenceStats, TargetStateBoundary, TargetStateBranch,
+    CUDA_EXPERT_CACHE_MAX_EXPERTS, CudaExpertCachePolicy, NativeProvider, NativeProviderInventory,
+    NativeProviderMemorySnapshot, NativeProviderSession, ProviderTensor,
+    TARGET_PILOT_RESERVE_BYTES, TargetExpertBackend, TargetGlobalGroup, TargetSequence,
+    TargetSequenceCommit, TargetSequenceLayerPrepare, TargetSequenceMailbox, TargetSequenceMode,
+    TargetSequenceStats, TargetStateBoundary, TargetStateBranch,
 };
 use crate::quality::ResidentWeightAuthority;
 use crate::qwen_checkpoint::{QwenCheckpoint, QwenVariant};
@@ -1312,6 +1313,7 @@ impl NativeTargetEngine {
             expert_backend,
             &provider,
             metal_source_selector.as_deref(),
+            expert_stream_cache_policy(config.expert_stream_nocache, cfg!(target_os = "macos")),
         )?;
         let expert_reader_workers = configured_expert_reader_workers(config.expert_read_threads);
         let metal_expert_retire_hook: Option<BufferRetireHook> =
@@ -1429,6 +1431,28 @@ impl NativeTargetEngine {
         let host_memory = probe_host_memory();
         let provider_memory_snapshot = provider.memory_snapshot(false)?;
         let provider_memory = provider_memory(provider_memory_snapshot);
+        // The CUDA expert cache is budgeted from the same snapshot that
+        // residency consumes, then charged as a fixed provider cost so the
+        // resident spine prefix and the cache can never double-book VRAM.
+        // Streaming-critical experts outrank resident spine layers.
+        let cuda_expert_cache = plan_cuda_expert_cache_budget(
+            device,
+            provider_memory_snapshot,
+            fixed.provider_bytes,
+            provider_layer_bytes.iter().copied().max().unwrap_or(0),
+        );
+        let fixed = match &cuda_expert_cache {
+            Some(budget) => FixedCosts {
+                host_bytes: fixed.host_bytes,
+                provider_bytes: fixed
+                    .provider_bytes
+                    .checked_add(budget.charged_provider_bytes)
+                    .ok_or_else(|| {
+                        DeltafinError::new("CUDA expert-cache reserve overflows fixed provider costs")
+                    })?,
+            },
+            None => fixed,
+        };
         let qwen_context_capacity = qwen_context_capacity(context_growth)?;
         let discovered_qwen = discover_qwen_plan(
             config.qwen,
@@ -1496,6 +1520,22 @@ impl NativeTargetEngine {
                 DeltafinError::new("resident layer prefix does not fit the spine ABI")
             })?,
         )?;
+
+        // Freeze the session's expert-cache budget before anything can run a
+        // target sequence or availability probe (both freeze the policy). An
+        // explicit zero is still configured: it makes capacity-starved
+        // sessions deterministically stream instead of letting the provider
+        // re-budget against VRAM that residency has already promised away.
+        if let Some(budget) = &cuda_expert_cache {
+            provider.configure_cuda_expert_cache(budget.policy)?;
+            eprintln!(
+                "[native] CUDA expert cache: {} experts ({:.2} GiB), device reserve {:.2} GiB, resident spine prefix {} layers",
+                budget.policy.capacity_experts,
+                budget.charged_provider_bytes as f64 / (1_u64 << 30) as f64,
+                budget.policy.reserve_bytes as f64 / (1_u64 << 30) as f64,
+                residency.resident_layers,
+            );
+        }
 
         // Admit PILOT only after its complete provider-memory reserve has
         // participated in residency selection, and before the first global or
@@ -4554,6 +4594,11 @@ struct TargetLayerPhaseProfile {
     expert_kernel_ns: u64,
     source_fence_ns: u64,
     layer_total_ns: u64,
+    /// Routed experts already resident in the provider's CUDA cache when the
+    /// tile was planned. Zero on the CPU/Metal paths, which have no plan.
+    expert_plan_hits: u64,
+    /// Routed experts the plan required this pass to read and upload.
+    expert_plan_misses: u64,
 }
 
 impl TargetLayerPhaseProfile {
@@ -4581,6 +4626,10 @@ impl TargetLayerPhaseProfile {
         self.expert_kernel_ns = self.expert_kernel_ns.saturating_add(other.expert_kernel_ns);
         self.source_fence_ns = self.source_fence_ns.saturating_add(other.source_fence_ns);
         self.layer_total_ns = self.layer_total_ns.saturating_add(other.layer_total_ns);
+        self.expert_plan_hits = self.expert_plan_hits.saturating_add(other.expert_plan_hits);
+        self.expert_plan_misses = self
+            .expert_plan_misses
+            .saturating_add(other.expert_plan_misses);
     }
 
     fn attributed_ns(&self) -> u64 {
@@ -4612,6 +4661,8 @@ impl TargetLayerPhaseProfile {
             "expert_kernel_ns": self.expert_kernel_ns,
             "source_fence_ns": self.source_fence_ns,
             "other_control_ns": self.other_control_ns(),
+            "expert_plan_hits": self.expert_plan_hits,
+            "expert_plan_misses": self.expert_plan_misses,
         })
     }
 }
@@ -4683,6 +4734,8 @@ impl TargetExecutionProfile {
                 "layer_other_control_ns": totals.other_control_ns(),
                 "tail_head_sync_ns": self.tail_head_sync_ns,
                 "sequence_control_ns": sequence_control_ns,
+                "expert_plan_hits": totals.expert_plan_hits,
+                "expert_plan_misses": totals.expert_plan_misses,
             },
             "layers": self.layers.iter().enumerate()
                 .filter(|(_, profile)| profile.passes != 0)
@@ -4814,12 +4867,30 @@ fn admit_scale4_storage(
     }
 }
 
+/// Page-cache policy for streaming expert reads.
+///
+/// The 64 GiB reference host must keep purging: one pass streams far more
+/// expert bytes than host RAM, and its F_NOCACHE pool design depends on the
+/// page cache staying out of the way. Hosts with different RAM/VRAM shapes
+/// (typically discrete-GPU workstations) instead leave eviction to the
+/// kernel's LRU, so repeatedly routed experts are re-read from RAM rather
+/// than disk — the behavior the mature Python pipeline relied on.
+fn expert_stream_cache_policy(explicit_nocache: Option<bool>, is_macos: bool) -> CachePolicy {
+    let nocache = explicit_nocache.unwrap_or(is_macos);
+    if nocache {
+        CachePolicy::Streaming
+    } else {
+        CachePolicy::Resident
+    }
+}
+
 fn open_expert_corpus(
     request: ExpertScale4Request,
     model_root: &Path,
     backend: ResolvedExpertBackend,
     provider: &NativeProviderSession,
     metal_source_selector: Option<&str>,
+    stream_cache_policy: CachePolicy,
 ) -> Result<RawExpertCorpus> {
     let metal_qualified = if request != ExpertScale4Request::Off
         && backend == ResolvedExpertBackend::Metal
@@ -4833,7 +4904,11 @@ fn open_expert_corpus(
         false
     };
     if admit_scale4_storage(request, backend, metal_qualified)? {
-        match RawExpertCorpus::open_auto(model_root, ExpertStorageLayout::Scale4V2) {
+        match RawExpertCorpus::open_auto(
+            model_root,
+            ExpertStorageLayout::Scale4V2,
+            stream_cache_policy,
+        ) {
             Ok(corpus) => return Ok(corpus),
             Err(error) if request == ExpertScale4Request::Auto => {
                 eprintln!(
@@ -4847,7 +4922,7 @@ fn open_expert_corpus(
             }
         }
     }
-    RawExpertCorpus::open_auto(model_root, ExpertStorageLayout::RawV1)
+    RawExpertCorpus::open_auto(model_root, ExpertStorageLayout::RawV1, stream_cache_policy)
 }
 
 fn target_global_group(group: u16) -> Result<TargetGlobalGroup> {
@@ -5610,6 +5685,13 @@ fn finish_expert_mailbox(
             add_profile_elapsed(profile.as_deref_mut(), planning_started, |profile| {
                 &mut profile.authoritative_expert_read_prefetch_ns
             });
+            if let Some(profile) = profile.as_deref_mut() {
+                let misses = plan.missing_experts().len() as u64;
+                profile.expert_plan_misses = profile.expert_plan_misses.saturating_add(misses);
+                profile.expert_plan_hits = profile.expert_plan_hits.saturating_add(
+                    (tile.expert_ids().len() as u64).saturating_sub(misses),
+                );
+            }
             let read_started = profile.as_ref().map(|_| Instant::now());
             let misses = if plan.missing_experts().is_empty() {
                 None
@@ -6108,6 +6190,12 @@ fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
             ns_seconds(counters.target_profile.tail_head_sync_ns),
             ns_seconds(totals.other_control_ns()),
         );
+        if totals.expert_plan_hits != 0 || totals.expert_plan_misses != 0 {
+            eprintln!(
+                "[phases] expert plans: {} cache hits, {} misses read+uploaded",
+                totals.expert_plan_hits, totals.expert_plan_misses,
+            );
+        }
     }
 }
 
@@ -6516,6 +6604,76 @@ fn buffer_high_water(lengths: impl IntoIterator<Item = BufferLengths>) -> Result
         .ok_or_else(|| DeltafinError::new("spine component high-water mark overflows u64"))
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CudaExpertCacheBudget {
+    policy: CudaExpertCachePolicy,
+    /// Bytes charged into residency's fixed provider costs so the resident
+    /// spine prefix can only claim VRAM the expert cache will not use.
+    charged_provider_bytes: u64,
+}
+
+/// Split discrete VRAM between the CUDA expert cache and every other
+/// provider consumer before residency selection runs.
+///
+/// Expert misses sit on the routing-dependent critical path: they cannot be
+/// read before the router runs, so every miss pays a demand disk read plus a
+/// PCIe upload inside the layer. Spine streaming reads prefetch one layer
+/// ahead and overlap compute. The cache therefore takes VRAM priority, and
+/// resident spine layers receive only what remains — the same split the
+/// measured Python v4 pipeline used. The envelope mirrors the residency
+/// policy exactly (device reserve, then discrete utilization), so the two
+/// budgets combined can never exceed what residency alone was allowed.
+fn plan_cuda_expert_cache_budget(
+    device: Device,
+    snapshot: NativeProviderMemorySnapshot,
+    fixed_provider_bytes: u64,
+    peak_transient_layer_bytes: u64,
+) -> Option<CudaExpertCacheBudget> {
+    if !matches!(device, Device::Cuda(_)) {
+        return None;
+    }
+    let policy = ResidencyPolicy::default();
+    let zero = CudaExpertCacheBudget {
+        policy: CudaExpertCachePolicy {
+            capacity_experts: 0,
+            reserve_bytes: 0,
+        },
+        charged_provider_bytes: 0,
+    };
+    let (Some(total), Some(available)) = (snapshot.total_bytes, snapshot.available_bytes) else {
+        // Without trustworthy discrete accounting residency also selects
+        // nothing; an explicit zero keeps the provider from budgeting later
+        // against unattributed free VRAM and colliding with other consumers.
+        return Some(zero);
+    };
+    let reserve = policy
+        .device_reserve_floor_bytes
+        .max(total.saturating_mul(u64::from(policy.device_reserve_permille)) / 1_000)
+        .min(total);
+    let raw = total
+        .saturating_sub(reserve)
+        .min(available.min(total).saturating_sub(reserve));
+    let Some(envelope) = raw
+        .checked_mul(u64::from(policy.discrete_utilization_permille))
+        .map(|bytes| bytes / 1_000)
+    else {
+        return Some(zero);
+    };
+    let usable = envelope
+        .saturating_sub(fixed_provider_bytes)
+        .saturating_sub(peak_transient_layer_bytes);
+    let span = crate::experts::K3_EXPERT_SOURCE_BYTES as u64;
+    let capacity = u32::try_from((usable / span).min(u64::from(CUDA_EXPERT_CACHE_MAX_EXPERTS)))
+        .expect("bounded CUDA expert-cache capacity fits u32");
+    Some(CudaExpertCacheBudget {
+        policy: CudaExpertCachePolicy {
+            capacity_experts: capacity,
+            reserve_bytes: reserve,
+        },
+        charged_provider_bytes: u64::from(capacity) * span,
+    })
+}
+
 fn provider_memory(snapshot: NativeProviderMemorySnapshot) -> ProviderMemory {
     match snapshot.device {
         Device::Cpu => ProviderMemory::Host,
@@ -6784,6 +6942,8 @@ mod tests {
             expert_kernel_ns: 200,
             source_fence_ns: 10,
             layer_total_ns: 800,
+            expert_plan_hits: 12,
+            expert_plan_misses: 4,
         };
         // The 700ns active-read interval overlaps preceding work. Only the
         // 100ns caller wait contributes to the additive layer attribution.
@@ -6802,6 +6962,92 @@ mod tests {
         assert_eq!(json["totals"]["sequence_control_ns"], 200);
         assert_eq!(json["layers"].as_array().unwrap().len(), 1);
         assert_eq!(json["layers"][0]["passes"], 2);
+        assert_eq!(json["totals"]["expert_plan_hits"], 24);
+        assert_eq!(json["totals"]["expert_plan_misses"], 8);
+        // Plan counters are informational and must never enter the additive
+        // time attribution.
+        assert_eq!(json["layers"][0]["expert_plan_hits"], 24);
+    }
+
+    #[test]
+    fn cuda_expert_cache_budget_shares_one_envelope_with_residency() {
+        let snapshot = |total: Option<u64>, available: Option<u64>| NativeProviderMemorySnapshot {
+            device: Device::Cuda(0),
+            active_bytes: None,
+            reserved_bytes: None,
+            recommended_bytes: None,
+            total_bytes: total,
+            available_bytes: available,
+            cache_trimmed: false,
+        };
+        let gib = 1_u64 << 30;
+        let span = crate::experts::K3_EXPERT_SOURCE_BYTES as u64;
+
+        // Non-CUDA devices have no CUDA cache to budget.
+        assert_eq!(
+            plan_cuda_expert_cache_budget(Device::Cpu, snapshot(Some(32 * gib), Some(30 * gib)), 0, 0),
+            None,
+        );
+
+        // Unknown discrete accounting fails closed to an explicit zero, the
+        // same outcome residency reaches for an unknown discrete envelope.
+        let unknown =
+            plan_cuda_expert_cache_budget(Device::Cuda(0), snapshot(None, Some(30 * gib)), 0, 0)
+                .unwrap();
+        assert_eq!(unknown.policy.capacity_experts, 0);
+        assert_eq!(unknown.charged_provider_bytes, 0);
+
+        // A 32 GiB card with 30 GiB free: reserve is max(2 GiB, 3.2 GiB),
+        // envelope is 85% of (30 - 3.2) GiB, and the remainder after fixed
+        // and transient charges converts to whole expert spans.
+        let total = 32 * gib;
+        let available = 30 * gib;
+        let fixed = 2 * gib;
+        let transient = gib;
+        let budget = plan_cuda_expert_cache_budget(
+            Device::Cuda(0),
+            snapshot(Some(total), Some(available)),
+            fixed,
+            transient,
+        )
+        .unwrap();
+        let reserve = (total / 10).max(2 * gib);
+        let envelope = (available - reserve) * 850 / 1_000;
+        let expected = ((envelope - fixed - transient) / span)
+            .min(u64::from(CUDA_EXPERT_CACHE_MAX_EXPERTS)) as u32;
+        assert_eq!(budget.policy.capacity_experts, expected);
+        assert!(budget.policy.capacity_experts > 0);
+        assert_eq!(budget.policy.reserve_bytes, reserve);
+        assert_eq!(
+            budget.charged_provider_bytes,
+            u64::from(expected) * span,
+        );
+        // The charge plus fixed costs stays inside the shared envelope, so
+        // residency cannot select spine layers the cache will also claim.
+        assert!(budget.charged_provider_bytes + fixed + transient <= envelope);
+
+        // Plentiful VRAM clamps at the provider ABI bound instead of growing
+        // past one entry per routed edge.
+        let large = plan_cuda_expert_cache_budget(
+            Device::Cuda(0),
+            snapshot(Some(96 * gib), Some(90 * gib)),
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(large.policy.capacity_experts, CUDA_EXPERT_CACHE_MAX_EXPERTS);
+
+        // A starved card configures an explicit zero instead of leaving the
+        // provider free to budget on its own.
+        let starved = plan_cuda_expert_cache_budget(
+            Device::Cuda(0),
+            snapshot(Some(4 * gib), Some(3 * gib)),
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(starved.policy.capacity_experts, 0);
+        assert_eq!(starved.charged_provider_bytes, 0);
     }
 
     #[test]

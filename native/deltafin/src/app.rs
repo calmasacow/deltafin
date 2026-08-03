@@ -1053,15 +1053,21 @@ fn report_native_runtime(executable: &Path) -> Result<()> {
         println!("LibTorch CUDA runtime ABI: {cuda_major}.x");
     }
     if option_env!("DELTAFIN_LIBTORCH_HIP").is_some() {
-        println!(
-            "LibTorch GPU runtime: ROCm/HIP (reported as CUDA devices; MXFP4 experts use the exact CPU path)"
-        );
+        let experts = if option_env!("DELTAFIN_GPU_KERNEL_RUNTIME") == Some("HIP") {
+            "HIP MXFP4 expert kernels are linked but have no token-oracle evidence on AMD hardware"
+        } else {
+            "MXFP4 experts use the exact CPU path"
+        };
+        println!("LibTorch GPU runtime: ROCm/HIP (reported as CUDA devices; {experts})");
     }
-    if let (Some(toolkit), Some(architectures)) = (
+    if let (Some(runtime), Some(toolkit), Some(architectures)) = (
+        option_env!("DELTAFIN_GPU_KERNEL_RUNTIME"),
         option_env!("DELTAFIN_CUDA_TOOLKIT"),
-        option_env!("DELTAFIN_CUDA_ARCHITECTURES"),
+        option_env!("DELTAFIN_GPU_KERNEL_ARCHITECTURES"),
     ) {
-        println!("CUDA expert build: toolkit {toolkit}, architectures {architectures}");
+        println!(
+            "device expert build: {runtime} toolkit {toolkit}, architectures {architectures}"
+        );
     }
     if inventory.providers.cuda_devices != 0 && !inventory.cuda_moe_compiled {
         println!(
