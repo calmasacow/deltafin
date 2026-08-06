@@ -20,10 +20,11 @@ The quality rule is simple: **K3 itself decides every token**, and nobody else. 
 
 ### Latest Benchmarks on an M1 Max laptop
 
-* 0.2847 token/s (3.512 s/token) — 7.0% higher throughput than last update
+* 0.2901 token/s (3.447 s/token) — 1.9% higher throughput than last update
 
 #### Historical M1 benchmarks:
 
+* 0.2847 token/s (August 2, 2026) — 7.0% higher throughput
 * 0.2660 token/s (July 30, 2026) — 102.9% higher throughput
 * 0.1311 token/s (July 28, 2026) — 829.8% higher throughput
 * 0.0141 token/s (July 27, 2026)

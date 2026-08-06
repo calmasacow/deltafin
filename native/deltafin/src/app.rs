@@ -94,6 +94,14 @@ fn run() -> Result<()> {
                 // default without a separate conversion step. The converter
                 // is resumable and recognizes an already-complete output.
                 let root = fetch_model_root(model_root.as_deref())?;
+                // Belt-and-suspenders on top of the per-subdirectory markers
+                // setup already places under k3-experts/k3-resident-*: one
+                // marker at the model root covers the whole install tree,
+                // including anything future code adds here without its own
+                // call. A marker is a best-effort precaution, not a proof
+                // that indexing was ever the cause of any specific slowdown;
+                // it costs nothing and is safe to place regardless.
+                crate::weight_fetch::ensure_spotlight_marker_here(&root)?;
                 println!();
                 println!(
                     "preparing the default row-int8 resident spine (original BF16 remains on disk; --spine bf16 selects it)"
@@ -108,6 +116,17 @@ fn run() -> Result<()> {
                 })?;
                 println!();
                 report_native_runtime(executable)?;
+                if cfg!(target_os = "macos") {
+                    println!();
+                    println!("macOS tip: this model store is large, so setup just excluded it");
+                    println!("from Spotlight search indexing automatically (a hidden marker file).");
+                    println!("For extra assurance, you can also exclude it yourself:");
+                    println!("  1. Open System Settings");
+                    println!("  2. Go to Spotlight > Search Privacy");
+                    println!("  3. Add this folder: {}", root.display());
+                    println!("This is optional, but a large folder that Spotlight tries to index");
+                    println!("can compete with Deltafin for disk and memory while it runs.");
+                }
             }
             Ok(())
         }
@@ -233,6 +252,15 @@ fn run() -> Result<()> {
                 status.verify_snapshots.max_positions,
             );
             eprintln!("[native] {}", status.readiness);
+            if status.expert_heat_recording || status.expert_pin_candidates != 0 {
+                eprintln!(
+                    "[native] expert heat: weight={:.0} passes recording={}; pin tier: candidates={} charged={:.2} GiB",
+                    status.expert_heat_weight,
+                    status.expert_heat_recording,
+                    status.expert_pin_candidates,
+                    status.expert_pin_charged_bytes as f64 / (1_u64 << 30) as f64,
+                );
+            }
             let result = {
                 // Arm only around interactive CLI inference. Bootstrap keeps
                 // the operating system's default SIGINT behavior, and the
@@ -279,6 +307,17 @@ fn run() -> Result<()> {
                         );
                     }
                 }
+            }
+            let pin_status = engine.status();
+            if pin_status.expert_pin_candidates != 0 {
+                eprintln!(
+                    "[expert-pin] candidates={} resident={} ({:.2} GiB) hits={} served-from-ram={:.2} GiB",
+                    pin_status.expert_pin_candidates,
+                    pin_status.expert_pin_resident_experts,
+                    pin_status.expert_pin_resident_bytes as f64 / (1_u64 << 30) as f64,
+                    pin_status.expert_pin_hits,
+                    pin_status.expert_pin_served_bytes as f64 / (1_u64 << 30) as f64,
+                );
             }
             let qwen = engine.status().qwen_telemetry;
             if qwen.proposals != 0

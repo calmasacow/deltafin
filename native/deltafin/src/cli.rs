@@ -28,6 +28,7 @@ Run options:\n\
   --chat                 Apply the K3 chat template\n\
   --reasoning-effort L   Chat thinking depth: low, high, or max (K3_REASONING_EFFORT fallback; template default max)\n\
   --stats                Show live cumulative performance statistics\n\
+  --layer-profile        Also print a per-layer, per-chunk phase breakdown (verbose: ~93 lines/token; independent of --stats)\n\
   --events-jsonl PATH    Write the benchmark event stream\n\
   --router-trace PATH    Append native expert-route JSONL (relative to model root)\n\
   --router-trace-mode M  off, buffered, or sync (path alone implies buffered)\n\
@@ -335,6 +336,10 @@ pub struct RunArgs {
     pub chat: bool,
     pub reasoning_effort: Option<String>,
     pub stats: bool,
+    /// Per-layer, per-chunk phase breakdown (93 lines/token). Independent of
+    /// `stats`: the cheap cumulative summary line needs neither this nor
+    /// per-layer profile collection at all.
+    pub layer_profile: bool,
     pub events_jsonl: Option<PathBuf>,
     pub router_trace: Option<PathBuf>,
     pub router_trace_mode: Option<String>,
@@ -353,6 +358,7 @@ impl Default for RunArgs {
             chat: false,
             reasoning_effort: None,
             stats: false,
+            layer_profile: false,
             events_jsonl: None,
             router_trace: None,
             router_trace_mode: None,
@@ -548,6 +554,7 @@ where
                 run.reasoning_effort = Some(take_value(&values, &mut index, option)?);
             }
             "--stats" => run.stats = true,
+            "--layer-profile" => run.layer_profile = true,
             "--prompt" => run.prompt = take_value(&values, &mut index, option)?,
             "--max-new" => {
                 let raw = take_value(&values, &mut index, option)?;
@@ -1455,6 +1462,25 @@ mod tests {
         assert_eq!(run.max_new, Some(17));
         assert!(run.chat);
         assert!(run.stats);
+        assert!(!run.layer_profile);
+    }
+
+    #[test]
+    fn layer_profile_is_independent_of_stats() {
+        let Command::Run(neither) = parse(["deltafin"]).unwrap() else {
+            panic!("expected run command")
+        };
+        assert!(!neither.stats && !neither.layer_profile);
+
+        let Command::Run(profile_only) = parse(["deltafin", "--layer-profile"]).unwrap() else {
+            panic!("expected run command")
+        };
+        assert!(!profile_only.stats && profile_only.layer_profile);
+
+        let Command::Run(both) = parse(["deltafin", "--stats", "--layer-profile"]).unwrap() else {
+            panic!("expected run command")
+        };
+        assert!(both.stats && both.layer_profile);
     }
 
     #[test]

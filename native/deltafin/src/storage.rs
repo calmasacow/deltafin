@@ -28,12 +28,12 @@ use crate::error::{DeltafinError, Result};
 use crate::packfile::DigestState;
 
 #[cfg(target_os = "macos")]
-const BUFFER_ALIGNMENT: usize = 16 * 1024;
+pub(crate) const BUFFER_ALIGNMENT: usize = 16 * 1024;
 #[cfg(not(target_os = "macos"))]
 // Linux/aarch64 deployments can use 64 KiB base pages. A conservative 64 KiB
 // alignment also remains valid on 4 KiB x86-64 hosts and avoids rebuilding
 // the arena when direct/pinned provider uploads are enabled later.
-const BUFFER_ALIGNMENT: usize = 64 * 1024;
+pub(crate) const BUFFER_ALIGNMENT: usize = 64 * 1024;
 const MAX_PLAN_JOBS: usize = 1_000_000;
 const DEFAULT_ARENA_SLOTS: usize = 2;
 const WORK_QUANTUM: usize = 4;

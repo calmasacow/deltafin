@@ -85,6 +85,33 @@ fn parse_spine_resident_gb(raw: &str) -> Result<u64> {
     Ok(bytes as u64)
 }
 
+fn parse_expert_pin_gb(raw: &str) -> Result<u64> {
+    let gigabytes = if raw.trim().is_empty() {
+        0.0
+    } else {
+        raw.trim().parse::<f64>().map_err(|_| {
+            DeltafinError::new("K3_EXPERT_PIN_GB must be a finite non-negative number")
+        })?
+    };
+    let bytes = gigabytes * 1_000_000_000.0;
+    if !gigabytes.is_finite() || gigabytes < 0.0 || bytes > u64::MAX as f64 {
+        return Err(DeltafinError::new(
+            "K3_EXPERT_PIN_GB must be a finite non-negative number",
+        ));
+    }
+    Ok(bytes as u64)
+}
+
+fn parse_expert_heat(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "no" | "disabled" => Ok(false),
+        _ => Err(DeltafinError::new(
+            "K3_EXPERT_HEAT must be 0/1, false/true, or off/on",
+        )),
+    }
+}
+
 fn parse_pilot_gate_threshold(raw: &str) -> Result<f64> {
     let threshold = raw.trim().parse::<f64>().map_err(|_| {
         DeltafinError::new("K3_PILOT_GATE_THRESHOLD must be a finite number in [0,1)")
@@ -210,10 +237,10 @@ pub enum PilotGateRequest {
 
 impl PilotGateRequest {
     pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("on").trim().to_ascii_lowercase().as_str() {
-            "off" | "0" => Ok(Self::Off),
+        match value.unwrap_or("off").trim().to_ascii_lowercase().as_str() {
+            "" | "off" | "0" => Ok(Self::Off),
             "measure" => Ok(Self::Measure),
-            "" | "on" | "1" => Ok(Self::On),
+            "on" | "1" => Ok(Self::On),
             _ => Err(DeltafinError::new(
                 "K3_PILOT_GATE must be on, measure, or off",
             )),
@@ -292,6 +319,10 @@ pub struct RuntimeConfig {
     pub max_new: Option<u64>,
     pub chat: bool,
     pub stats: bool,
+    /// Verbose per-layer, per-chunk phase breakdown. Independent of `stats`:
+    /// the cheap cumulative summary line needs neither this nor per-layer
+    /// profile collection.
+    pub layer_profile: bool,
     pub events_jsonl: Option<PathBuf>,
     pub router_trace_mode: RouterTraceMode,
     pub router_trace_path: Option<PathBuf>,
@@ -318,6 +349,13 @@ pub struct RuntimeConfig {
     pub expert_read_threads: Option<usize>,
     pub expert_backend: ExpertBackendRequest,
     pub expert_scale4: ExpertScale4Request,
+    /// Byte budget for the permanent learned-expert RAM tier. Zero keeps the
+    /// tier off; a budget only marks histogram candidates, which are still
+    /// promoted lazily on their first authoritative read.
+    pub expert_pin_bytes: u64,
+    /// Whether ordinary runs accumulate the persistent expert-heat histogram.
+    /// Recording is advisory and default-on; it never affects routing.
+    pub expert_heat: bool,
     /// Adaptive admission for PILOT speculative expert reads. Threshold and
     /// warmup are resolved even when the gate is off so a bad value never
     /// silently rides along with a disabled feature.
@@ -376,6 +414,16 @@ impl RuntimeConfig {
             .as_deref()
             .map(parse_expert_read_threads)
             .transpose()?;
+        let expert_pin_bytes = environment("K3_EXPERT_PIN_GB")
+            .as_deref()
+            .map(parse_expert_pin_gb)
+            .transpose()?
+            .unwrap_or(0);
+        let expert_heat = environment("K3_EXPERT_HEAT")
+            .as_deref()
+            .map(parse_expert_heat)
+            .transpose()?
+            .unwrap_or(true);
         let backend_value = arguments.expert_backend.or_else(|| environment("K3_MOE"));
         let router_trace_path = arguments
             .router_trace
@@ -453,6 +501,7 @@ impl RuntimeConfig {
             max_new: arguments.max_new,
             chat: arguments.chat,
             stats: arguments.stats,
+            layer_profile: arguments.layer_profile,
             events_jsonl: arguments.events_jsonl,
             router_trace_mode,
             router_trace_path,
@@ -468,6 +517,8 @@ impl RuntimeConfig {
             expert_read_threads,
             expert_backend: ExpertBackendRequest::parse(backend_value.as_deref())?,
             expert_scale4,
+            expert_pin_bytes,
+            expert_heat,
             pilot_gate,
             pilot_gate_threshold,
             pilot_gate_warmup,
@@ -491,6 +542,7 @@ impl RuntimeConfig {
                 max_new: None,
                 chat: false,
                 stats: false,
+                layer_profile: false,
                 events_jsonl: None,
                 router_trace: arguments.router_trace.clone(),
                 router_trace_mode: arguments.router_trace_mode.clone(),
@@ -519,11 +571,12 @@ impl std::fmt::Display for RuntimeConfig {
             "surface={:?} device={:?} spine={:?} spine_read_threads={} spine_fd_cache={} \
              spine_stream_nocache={} expert_stream_nocache={} spine_resident_bytes={} \
              provider_resident_layers={} \
-             expert_read_threads={} expert_backend={:?} expert_scale4={:?} pilot_gate={:?} \
+             expert_read_threads={} expert_backend={:?} expert_scale4={:?} \
+             expert_pin_bytes={} expert_heat={} pilot_gate={:?} \
              pilot_gate_threshold={} pilot_gate_warmup={} quality={:?} \
              dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
              reasoning_effort={} router_trace_mode={:?} router_trace_path={} chat={} \
-             stats={} max_new={}",
+             stats={} layer_profile={} max_new={}",
             self.surface,
             self.device,
             self.spine,
@@ -536,6 +589,8 @@ impl std::fmt::Display for RuntimeConfig {
             describe_usize(self.expert_read_threads),
             self.expert_backend,
             self.expert_scale4,
+            self.expert_pin_bytes,
+            self.expert_heat,
             self.pilot_gate,
             self.pilot_gate_threshold,
             self.pilot_gate_warmup,
@@ -549,6 +604,7 @@ impl std::fmt::Display for RuntimeConfig {
             describe_path(&self.router_trace_path),
             self.chat,
             self.stats,
+            self.layer_profile,
             describe_u64(self.max_new),
         )
     }
@@ -596,6 +652,7 @@ mod tests {
             max_new: Some(4),
             chat: true,
             stats: false,
+            layer_profile: false,
             events_jsonl: None,
             router_trace: None,
             router_trace_mode: None,
@@ -636,6 +693,48 @@ mod tests {
     }
 
     #[test]
+    fn expert_pin_and_heat_knobs_parse_strictly_and_default_safely() {
+        let defaults = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
+        assert_eq!(defaults.expert_pin_bytes, 0);
+        assert!(defaults.expert_heat);
+
+        let enabled = RuntimeConfig::resolve(arguments(), |name| match name {
+            "K3_EXPERT_PIN_GB" => Some("2.5".into()),
+            "K3_EXPERT_HEAT" => Some("off".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(enabled.expert_pin_bytes, 2_500_000_000);
+        assert!(!enabled.expert_heat);
+
+        let zero = RuntimeConfig::resolve(arguments(), |name| {
+            (name == "K3_EXPERT_PIN_GB").then(|| "0".into())
+        })
+        .unwrap();
+        assert_eq!(zero.expert_pin_bytes, 0);
+
+        // A bad value fails closed even though it would disable the feature.
+        for bad in ["-1", "nan", "gigabytes", "inf"] {
+            assert!(
+                RuntimeConfig::resolve(arguments(), |name| {
+                    (name == "K3_EXPERT_PIN_GB").then(|| bad.into())
+                })
+                .is_err(),
+                "K3_EXPERT_PIN_GB={bad} should be rejected"
+            );
+        }
+        for bad in ["auto", "2", "maybe", ""] {
+            assert!(
+                RuntimeConfig::resolve(arguments(), |name| {
+                    (name == "K3_EXPERT_HEAT").then(|| bad.into())
+                })
+                .is_err(),
+                "K3_EXPERT_HEAT={bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn resolved_configuration_display_names_every_knob() {
         let config = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
         let line = config.to_string();
@@ -651,6 +750,8 @@ mod tests {
             "expert_read_threads=",
             "expert_backend=",
             "expert_scale4=",
+            "expert_pin_bytes=",
+            "expert_heat=",
             "pilot_gate=",
             "pilot_gate_threshold=",
             "pilot_gate_warmup=",
@@ -664,6 +765,7 @@ mod tests {
             "router_trace_path=",
             "chat=",
             "stats=",
+            "layer_profile=",
             "max_new=",
         ] {
             assert!(
@@ -944,14 +1046,14 @@ mod tests {
     #[test]
     fn pilot_gate_environment_is_bounded_and_fail_closed() {
         let default = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
-        assert_eq!(default.pilot_gate, PilotGateRequest::On);
+        assert_eq!(default.pilot_gate, PilotGateRequest::Off);
         assert_eq!(default.pilot_gate_threshold, 0.10);
         assert_eq!(default.pilot_gate_warmup, 16);
 
         for (raw, expected) in [
             ("on", PilotGateRequest::On),
             ("1", PilotGateRequest::On),
-            ("", PilotGateRequest::On),
+            ("", PilotGateRequest::Off),
             ("measure", PilotGateRequest::Measure),
             ("off", PilotGateRequest::Off),
             ("0", PilotGateRequest::Off),

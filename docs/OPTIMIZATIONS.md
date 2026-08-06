@@ -70,6 +70,50 @@ resident weights and is labeled quantized and non-weight-exact. It remains a
 useful research/performance configuration, but it is not presented as the
 original BF16 target. Lossless scale4 expert storage does preserve values.
 
+## 2026-08-03
+
+*Persistent cross-run expert heat and the opt-in learned RAM pin tier.*
+
+### Learned expert residency from a persistent route histogram
+
+**Status: histogram on by default and advisory; the RAM tier is explicit
+(`K3_EXPERT_PIN_GB`) and off pending an interleaved measurement.**
+
+K3 routes 16 of 896 experts per routed layer, and one decode token touches
+roughly 25.8 GB of expert spans — far beyond any per-token cache. The existing
+router-trace/warm flow can already learn placement, but only through an
+explicit trace-then-fetch step, and only onto disk. Deltafin now accumulates
+that signal automatically: every committed pass folds its authoritative routes
+into a small decayed histogram at `k3-meta/expert_heat.v1.bin` (~330 KB),
+merged across runs and processes under a sidecar lock with atomic replacement.
+
+When a byte budget is set, bootstrap freezes a candidate roster from the
+histogram and charges the roster's exact ceiling as a fixed host cost before
+resident-spine selection. Promotion is sticky, never speculative: a candidate
+enters the permanent RAM tier only when an authoritative route has already
+read and authenticated its bytes, and later routes to it are served from that
+tier as page-aligned scattered spans through the same provider boundary the
+PILOT prefetch path proved. Ordinary demand I/O covers everything else; CUDA
+keeps its provider-owned device cache.
+
+This is learned storage placement without learned inference. The histogram
+observes the mailbox after the router publishes; the tier changes only where
+already-selected expert bytes are copied from. Route IDs, fp32 weights and
+reduction order are untouched, and the second-route integration test asserts
+tier-served spans are byte-identical to the tier-free read. A missing, stale,
+corrupt or locked histogram degrades to "nothing learned yet" — recording is
+infallible on the hot path and flushes are best-effort by contract.
+
+Counting is presence-per-mailbox rather than per row, with an 8,192-pass
+half-life, a 256-pass confidence ramp and a 2× uniform-frequency floor. Those
+guards exist because our own holdout study measured naive frequency pinning at
+**41.1%** held-out hit rate versus **51.9%** in-sample at a 40 GB tier, with
+the gap widening as the tier grows: the tail of a frequency ranking is exactly
+the part that does not generalize. Realistic budgets on the 64 GiB reference
+host are smaller than that study's tier, so the honest expectation is a lower
+hit rate over the best-generalizing head, and no throughput number is claimed
+here until the interleaved A/B run reports one.
+
 ## 2026-08-02
 
 *The compiled Rust runtime: one executable owning the engine, model contract,
@@ -692,7 +736,8 @@ The public implementation is the native workspace:
   `spine_int8.rs`, `expert_scale4/`;
 - DSpark and Qwen: `dspark_*.rs`, `qwen_*.rs` plus matching provider sources;
 - server/KV publication/memo: `openai/`, provider target-state branch ABI;
-- trace and warming: `router_trace.rs`, `cache_warm.rs`;
+- trace, warming and learned residency: `router_trace.rs`, `cache_warm.rs`,
+  `expert_heat.rs`;
 - tensor provider and PILOT/CUDA cache: `native/provider_gate/`;
 - specialized C/Metal/CUDA arithmetic: the compiled sources under `tools/`
   listed in [the compiled-runtime document](COMPILED-RUNTIME.md).

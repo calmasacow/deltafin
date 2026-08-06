@@ -46,6 +46,8 @@ pub mod embedding;
 #[cfg(feature = "runtime")]
 mod engine;
 #[cfg(feature = "runtime")]
+mod expert_heat;
+#[cfg(feature = "runtime")]
 pub mod expert_scale4;
 #[cfg(feature = "runtime")]
 pub mod experts;

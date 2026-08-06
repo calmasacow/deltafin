@@ -18,6 +18,10 @@
 /models/
 /weights/
 /checkpoints/
+# setup places this at the model root on macOS (see ensure_spotlight_marker_here
+# in weight_fetch.rs) the same way it already does inside each weight
+# subdirectory above; it is a zero-byte, host-local marker, not source.
+/.metadata_never_index
 
 # belt and braces: no weight/tensor blobs in any form, anywhere
 *.safetensors
@@ -111,6 +115,7 @@ dist/
 # --- private planning / experiment ledgers ------------------
 /BRAINSTORM-SPEED.md
 /PLAN.md
+/SPEED-ROADMAP.md
 /experiments/
 /native/experiments/
 

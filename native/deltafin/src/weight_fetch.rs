@@ -1763,6 +1763,15 @@ fn ensure_spotlight_marker(directory: &Path, platform: HostPlatform) -> Result<(
     }
 }
 
+/// Same marker, for callers outside this module that have no reason to know
+/// about [`HostPlatform`]: gate on the actual current host automatically.
+/// `directory` need not be a weight subdirectory — placing this at the top of
+/// `model_root` excludes the whole install tree in one call, including
+/// anything a caller adds later that this module was never told about.
+pub(crate) fn ensure_spotlight_marker_here(directory: &Path) -> Result<()> {
+    ensure_spotlight_marker(directory, HostPlatform::current())
+}
+
 fn unique_part(directory: &Path, label: &str) -> Result<PathBuf> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     for _ in 0..128 {
@@ -2026,6 +2035,29 @@ mod tests {
         assert!(ensure_spotlight_marker(&directory, HostPlatform::MacOs).is_err());
         // Non-macOS is a genuine no-op and does not inspect or follow a marker.
         ensure_spotlight_marker(&directory, HostPlatform::Other).unwrap();
+    }
+
+    /// Unlike the test above, which only ever passes an explicit
+    /// `HostPlatform`, this exercises the actual `HostPlatform::current()`
+    /// resolution the install-time caller depends on -- so it asserts
+    /// whichever behavior is correct for the host actually running the test,
+    /// not a fixed expectation.
+    #[test]
+    fn ensure_spotlight_marker_here_matches_the_current_host() {
+        let root = TestRoot::new();
+        let directory = root.0.join("model-root");
+        fs::create_dir(&directory).unwrap();
+        let marker = directory.join(SPOTLIGHT_MARKER);
+
+        ensure_spotlight_marker_here(&directory).unwrap();
+        if cfg!(target_os = "macos") {
+            let metadata = fs::symlink_metadata(&marker).unwrap();
+            assert!(metadata.is_file());
+            assert!(!metadata.file_type().is_symlink());
+        } else {
+            assert!(!marker.exists());
+        }
+        ensure_spotlight_marker_here(&directory).unwrap();
     }
 
     #[test]

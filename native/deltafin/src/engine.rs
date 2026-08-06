@@ -45,6 +45,9 @@ use crate::openai::{
     TokenUsage,
 };
 use crate::output::IncrementalUtf8Decoder;
+use crate::expert_heat::{
+    EXPERT_HEAT_HOST_RESERVE_BYTES, ExpertHeat, ExpertPinTier, PageAlignedSpan,
+};
 use crate::pilot_gate::{ExpertPrefetchPlan, PilotGate, PilotGateReport};
 use crate::platform::{
     Device, DeviceRequest, DeviceSelection, DeviceSelectionPolicy, ProviderInventory,
@@ -820,6 +823,14 @@ pub struct NativeEngineStatus<'a> {
     pub expert_reader_workers: usize,
     pub expert_prefetch_reader_workers: usize,
     pub router_trace_enabled: bool,
+    pub expert_heat_recording: bool,
+    pub expert_heat_weight: f64,
+    pub expert_pin_candidates: usize,
+    pub expert_pin_charged_bytes: u64,
+    pub expert_pin_resident_experts: u64,
+    pub expert_pin_resident_bytes: u64,
+    pub expert_pin_hits: u64,
+    pub expert_pin_served_bytes: u64,
     pub expert_cpu_threads: usize,
     pub speculative_max_drafts: usize,
     pub qwen_state: QwenRuntimeState,
@@ -1066,6 +1077,8 @@ pub struct NativeTargetEngine {
     expert_reader: Reader,
     expert_prefetch_reader: Option<Reader>,
     pilot_gate: Option<PilotGate>,
+    expert_heat: ExpertHeat,
+    expert_pin_tier: Option<ExpertPinTier>,
     router_trace: RouterTrace,
     global_plans: Box<[GlobalSpinePlan]>,
     spine: CompiledSpine,
@@ -1092,6 +1105,10 @@ pub struct NativeTargetEngine {
 
 impl Drop for NativeTargetEngine {
     fn drop(&mut self) {
+        // Persist any expert-heat deltas the periodic cadence has not merged
+        // yet. Best-effort by contract: teardown proceeds identically when
+        // the file or its lock is unavailable.
+        self.expert_heat.flush_best_effort();
         // Drop bodies run before fields. This explicit ordering lets the
         // pipeline synchronously abort a borrowed CPU/CUDA/Metal source while
         // the provider session and its completion primitives are still live.
@@ -1315,6 +1332,25 @@ impl NativeTargetEngine {
             metal_source_selector.as_deref(),
             expert_stream_cache_policy(config.expert_stream_nocache, cfg!(target_os = "macos")),
         )?;
+        // Cross-run learned expert residency. The heat histogram observes the
+        // authoritative routes of every backend; an explicit byte budget
+        // freezes a candidate roster whose spans promote lazily on their
+        // first authoritative read. CUDA keeps its provider-owned device
+        // cache, so the host tier is limited to the scattered-span backends.
+        let expert_heat = ExpertHeat::open(&model_root, config.expert_heat);
+        let expert_pin_tier = (config.expert_pin_bytes > 0
+            && matches!(
+                expert_backend,
+                ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
+            ))
+        .then(|| {
+            ExpertPinTier::plan(
+                expert_heat.snapshot(),
+                experts.layout().expert_span_bytes(),
+                config.expert_pin_bytes,
+            )
+        })
+        .flatten();
         let expert_reader_workers = configured_expert_reader_workers(config.expert_read_threads);
         let metal_expert_retire_hook: Option<BufferRetireHook> =
             (expert_backend == ResolvedExpertBackend::Metal).then(|| {
@@ -1408,6 +1444,26 @@ impl NativeTargetEngine {
         } else {
             0
         };
+        // The pin tier fills lazily, but its exact ceiling is reserved up
+        // front so residency selection can never double-book those bytes
+        // against the resident spine prefix. A cold histogram charges only
+        // the recorder arrays.
+        let fixed_host_addition = fixed_host_addition
+            .checked_add(
+                expert_pin_tier
+                    .as_ref()
+                    .map_or(0, ExpertPinTier::charged_host_bytes),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(if expert_heat.recording() {
+                    EXPERT_HEAT_HOST_RESERVE_BYTES
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| {
+                DeltafinError::new("expert-pin host reserve overflows fixed host costs")
+            })?;
         let fixed = fixed_costs(
             &program,
             &global_plans,
@@ -1601,6 +1657,8 @@ impl NativeTargetEngine {
             expert_reader,
             expert_prefetch_reader,
             pilot_gate,
+            expert_heat,
+            expert_pin_tier,
             router_trace,
             global_plans,
             spine,
@@ -1659,6 +1717,28 @@ impl NativeTargetEngine {
                 .as_ref()
                 .map_or(0, Reader::workers),
             router_trace_enabled: self.router_trace.enabled(),
+            expert_heat_recording: self.expert_heat.recording(),
+            expert_heat_weight: self.expert_heat.live_weight(),
+            expert_pin_candidates: self
+                .expert_pin_tier
+                .as_ref()
+                .map_or(0, ExpertPinTier::candidate_count),
+            expert_pin_charged_bytes: self
+                .expert_pin_tier
+                .as_ref()
+                .map_or(0, ExpertPinTier::charged_host_bytes),
+            expert_pin_resident_experts: self
+                .expert_pin_tier
+                .as_ref()
+                .map_or(0, ExpertPinTier::resident_experts),
+            expert_pin_resident_bytes: self
+                .expert_pin_tier
+                .as_ref()
+                .map_or(0, ExpertPinTier::resident_bytes),
+            expert_pin_hits: self.expert_pin_tier.as_ref().map_or(0, ExpertPinTier::hits),
+            expert_pin_served_bytes: self.expert_pin_tier.as_ref().map_or(0, |tier| {
+                tier.hits().saturating_mul(tier.span_bytes() as u64)
+            }),
             expert_cpu_threads: self.expert_cpu_threads,
             speculative_max_drafts: self.speculative_max_drafts,
             qwen_state: self.qwen.state,
@@ -1708,6 +1788,16 @@ impl NativeTargetEngine {
         {
             return Err(DeltafinError::new(
                 "native scale4-v2 expert corpus lacks its qualified Metal backend",
+            ));
+        }
+        if self.expert_pin_tier.is_some()
+            && !matches!(
+                self.expert_backend,
+                ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
+            )
+        {
+            return Err(DeltafinError::new(
+                "the learned expert pin tier is limited to the scattered-span backends",
             ));
         }
         let prefetch_expected = self.experts.lazy_missing_files() == 0
@@ -2004,6 +2094,7 @@ impl NativeTargetEngine {
         &mut self,
         token_ids: &[u32],
         collect_stats: bool,
+        verbose_layer_profile: bool,
         collect_profile: bool,
         capture_dspark: bool,
     ) -> Result<CompletedTargetChunk> {
@@ -2011,17 +2102,20 @@ impl NativeTargetEngine {
             token_ids,
             TargetSequenceMode::Prefill,
             collect_stats,
+            verbose_layer_profile,
             collect_profile,
             capture_dspark,
         )?;
         self.commit_target_chunk(prepared, token_ids.len())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_target_chunk(
         &mut self,
         token_ids: &[u32],
         mode: TargetSequenceMode,
         collect_stats: bool,
+        verbose_layer_profile: bool,
         collect_profile: bool,
         capture_dspark: bool,
     ) -> Result<PreparedTargetChunk> {
@@ -2029,16 +2123,19 @@ impl NativeTargetEngine {
             token_ids,
             mode,
             collect_stats,
+            verbose_layer_profile,
             collect_profile,
             capture_dspark,
             false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_full_commit_verify_chunk(
         &mut self,
         token_ids: &[u32],
         collect_stats: bool,
+        verbose_layer_profile: bool,
         collect_profile: bool,
         capture_dspark: bool,
     ) -> Result<PreparedTargetChunk> {
@@ -2046,6 +2143,7 @@ impl NativeTargetEngine {
             token_ids,
             TargetSequenceMode::Verify,
             collect_stats,
+            verbose_layer_profile,
             collect_profile,
             capture_dspark,
             true,
@@ -2058,6 +2156,7 @@ impl NativeTargetEngine {
         token_ids: &[u32],
         mode: TargetSequenceMode,
         collect_stats: bool,
+        verbose_layer_profile: bool,
         collect_profile: bool,
         capture_dspark: bool,
         full_commit_only: bool,
@@ -2122,6 +2221,8 @@ impl NativeTargetEngine {
             &self.expert_reader,
             self.expert_prefetch_reader.as_ref(),
             self.pilot_gate.as_mut(),
+            &self.expert_heat,
+            self.expert_pin_tier.as_ref(),
             &mut self.router_trace,
             target_expert_backend(self.expert_backend),
             self.expert_cpu_threads,
@@ -2129,12 +2230,19 @@ impl NativeTargetEngine {
             self.metal_expert_wrapper_retention,
             complete_expert_union,
             collect_stats,
+            verbose_layer_profile,
             collect_profile,
         );
         let (predictions, stats, profile) = match result {
             Ok(result) => result,
             Err(error) => return Err(cancel_after_error(sequence, error)),
         };
+        // One completed 93-layer pass of authoritative routes is the heat
+        // histogram's weight unit; the periodic merge stays off the per-layer
+        // path and out of the sequence transaction entirely.
+        if self.expert_heat.note_pass_committed() {
+            self.expert_heat.flush_best_effort();
+        }
         let expected_predictions = match mode {
             TargetSequenceMode::Prefill => 1,
             TargetSequenceMode::Verify => token_ids.len(),
@@ -2787,6 +2895,7 @@ impl NativeTargetEngine {
         prompt: &[u32],
         maximum_new: Option<u64>,
         stats: bool,
+        verbose_layer_profile: bool,
         allow_dspark: bool,
         reusable_target: bool,
         interrupt: &I,
@@ -2805,10 +2914,11 @@ impl NativeTargetEngine {
         let mut reuse_transaction: Option<(PublishedTargetBoundary, TargetStateBranch)> = None;
         let mut result = (|| -> Result<NativeGeneration> {
             let started = Instant::now();
-            // Structured evidence and explicit --stats diagnostics both opt
-            // into phase timing. Ordinary CLI/server generation does neither,
+            // Structured evidence, explicit --stats diagnostics, and the
+            // separate --layer-profile opt-in all need per-layer phase data
+            // collected; ordinary CLI/server generation needs none of them,
             // so its target loop remains free of profiling clock reads.
-            let collect_profile = stats || events.is_some();
+            let collect_profile = stats || verbose_layer_profile || events.is_some();
             if self.output_decoder.pending_bytes() != 0 {
                 return Err(DeltafinError::new(
                     "native output decoder retained bytes before a request",
@@ -2914,6 +3024,7 @@ impl NativeTargetEngine {
                 let completed = self.execute_target_chunk(
                     &prompt[range.clone()],
                     stats,
+                    verbose_layer_profile,
                     collect_profile,
                     capture_dspark,
                 )?;
@@ -3122,6 +3233,7 @@ impl NativeTargetEngine {
                             self.prepare_full_commit_verify_chunk(
                                 &inputs,
                                 stats,
+                                verbose_layer_profile,
                                 collect_profile,
                                 capture_dspark,
                             )?
@@ -3130,6 +3242,7 @@ impl NativeTargetEngine {
                                 &inputs,
                                 TargetSequenceMode::Verify,
                                 stats,
+                                verbose_layer_profile,
                                 collect_profile,
                                 capture_dspark,
                             )?
@@ -3176,6 +3289,7 @@ impl NativeTargetEngine {
                                 let rerun = self.prepare_full_commit_verify_chunk(
                                     rerun_inputs,
                                     stats,
+                                    verbose_layer_profile,
                                     collect_profile,
                                     capture_dspark,
                                 )?;
@@ -3276,6 +3390,7 @@ impl NativeTargetEngine {
                         let completed = self.execute_target_chunk(
                             &[pending_token],
                             stats,
+                            verbose_layer_profile,
                             collect_profile,
                             capture_dspark,
                         )?;
@@ -3579,6 +3694,7 @@ impl NativeTargetEngine {
             &prompt,
             config.max_new,
             config.stats,
+            config.layer_profile,
             config.chat || config.dspark == DSparkRequest::On,
             false,
             interrupt,
@@ -3761,6 +3877,7 @@ impl AuthoritativeTarget for NativeTargetEngine {
             &encoded.prompt,
             Some(encoded.maximum_new),
             false,
+            false,
             allow_dspark,
             encoded.chat_request,
             &ClientPresenceInterrupt(client),
@@ -3813,6 +3930,7 @@ impl AuthoritativeTarget for NativeTargetEngine {
         let generated = self.generate_tokens_to_with_interrupt(
             &encoded.prompt,
             Some(encoded.maximum_new),
+            false,
             false,
             allow_dspark,
             encoded.chat_request,
@@ -5065,6 +5183,8 @@ fn execute_target_sequence(
     expert_reader: &Reader,
     expert_prefetch_reader: Option<&Reader>,
     mut pilot_gate: Option<&mut PilotGate>,
+    expert_heat: &ExpertHeat,
+    expert_pin_tier: Option<&ExpertPinTier>,
     router_trace: &mut RouterTrace,
     expert_backend: TargetExpertBackend,
     cpu_threads: usize,
@@ -5072,6 +5192,7 @@ fn execute_target_sequence(
     metal_expert_wrapper_retention: bool,
     complete_expert_union: CompleteExpertUnion,
     collect_stats: bool,
+    verbose_layer_profile: bool,
     collect_profile: bool,
 ) -> Result<(
     Box<[u32]>,
@@ -5159,6 +5280,8 @@ fn execute_target_sequence(
                         expert_prefetch_reader,
                         &mut pending_expert_prefetch,
                         pilot_gate.as_deref_mut(),
+                        expert_heat,
+                        expert_pin_tier,
                         expert_backend,
                         cpu_threads,
                         metal_source_selector,
@@ -5231,7 +5354,11 @@ fn execute_target_sequence(
         if let Some(started) = layer_started {
             layer_profile.layer_total_ns = elapsed_ns(started);
             profile.as_mut().expect("profile exists").layers[index].absorb(&layer_profile);
-            if collect_stats {
+            // Deliberately independent of collect_stats: the cheap cumulative
+            // summary line (print_run_stats) needs neither this nor per-layer
+            // profile collection at all. This print is the verbose ~93
+            // lines/token detail, opt-in via --layer-profile alone.
+            if verbose_layer_profile {
                 print_target_layer_profile(&layer_profile, index, layers.len());
             }
         }
@@ -5363,6 +5490,7 @@ enum ExpertTileLease {
     Contiguous(ExpertUnionReadBatch),
     Scattered {
         layout: ExpertStorageLayout,
+        pinned: Vec<(u16, Arc<PageAlignedSpan>)>,
         hits: Vec<ExpertUnionReadBatch>,
         demand: Option<ExpertUnionReadBatch>,
     },
@@ -5395,28 +5523,28 @@ impl ExpertTileLease {
             ),
             Self::Scattered {
                 layout,
+                pinned,
                 hits,
                 demand,
             } => {
-                let span_bytes = layout.expert_span_bytes();
-                let mut spans = Vec::with_capacity(tile.expert_ids().len());
-                for &expert in tile.expert_ids() {
-                    if let Some(hit) = hits.iter().find(|batch| batch.expert_ids() == [expert]) {
-                        spans.push(hit.buffers().other());
-                        continue;
-                    }
-                    let batch = demand.as_ref().ok_or_else(|| {
-                        DeltafinError::new(
-                            "expert-prefetch merge lost an authoritative demand miss",
-                        )
-                    })?;
-                    spans.push(canonical_expert_span(
-                        batch.expert_ids(),
-                        batch.buffers().other(),
-                        span_bytes,
-                        expert,
-                    )?);
+                let mut hit_spans = Vec::with_capacity(hits.len());
+                for batch in &hits {
+                    let &[expert] = batch.expert_ids() else {
+                        return Err(DeltafinError::new(
+                            "expert-prefetch hit batch is not a single-expert span",
+                        ));
+                    };
+                    hit_spans.push((expert, batch.buffers().other()));
                 }
+                let spans = assemble_expert_spans(
+                    tile.expert_ids(),
+                    &pinned,
+                    &hit_spans,
+                    demand
+                        .as_ref()
+                        .map(|batch| (batch.expert_ids(), batch.buffers().other())),
+                    layout.expert_span_bytes(),
+                )?;
                 sequence.finish_expert_span_tile(
                     mailbox,
                     tile.first_row,
@@ -5432,6 +5560,46 @@ impl ExpertTileLease {
             }
         }
     }
+}
+
+/// Resolve one span per canonical tile expert from, in order of preference,
+/// the permanent pin tier, single-expert prefetch-hit spans, and the
+/// expert-major demand slab. Pure assembly: every byte source was already
+/// authenticated by the read that produced it, and the caller's canonical ID
+/// order is preserved exactly.
+fn assemble_expert_spans<'a>(
+    tile_expert_ids: &[u16],
+    pinned: &'a [(u16, Arc<PageAlignedSpan>)],
+    hits: &'a [(u16, &'a [u8])],
+    demand: Option<(&'a [u16], &'a [u8])>,
+    span_bytes: usize,
+) -> Result<Vec<&'a [u8]>> {
+    let mut spans = Vec::with_capacity(tile_expert_ids.len());
+    for &expert in tile_expert_ids {
+        if let Some((_, span)) = pinned.iter().find(|(pinned_id, _)| *pinned_id == expert) {
+            if span.len() != span_bytes {
+                return Err(DeltafinError::new(
+                    "pinned expert span disagrees with the corpus span length",
+                ));
+            }
+            spans.push(&span[..]);
+            continue;
+        }
+        if let Some(&(_, span)) = hits.iter().find(|(hit_id, _)| *hit_id == expert) {
+            spans.push(span);
+            continue;
+        }
+        let (demand_ids, demand_bytes) = demand.ok_or_else(|| {
+            DeltafinError::new("expert tile merge lost an authoritative demand miss")
+        })?;
+        spans.push(canonical_expert_span(
+            demand_ids,
+            demand_bytes,
+            span_bytes,
+            expert,
+        )?);
+    }
+    Ok(spans)
 }
 
 fn canonical_expert_span<'a>(
@@ -5467,29 +5635,80 @@ fn canonical_expert_span<'a>(
         .ok_or_else(|| DeltafinError::new("expert-prefetch demand span exceeds its checked slab"))
 }
 
+/// Feed one just-authenticated batch to the tier's sticky promotion. A no-op
+/// without a tier; the tier itself narrows to unresolved candidates, so this
+/// trails every successful authoritative read at negligible cost.
+fn promote_from_batch(
+    expert_pin_tier: Option<&ExpertPinTier>,
+    layer: u32,
+    batch: &ExpertUnionReadBatch,
+) {
+    if let Some(tier) = expert_pin_tier {
+        tier.maybe_promote(layer, batch.expert_ids(), batch.buffers().other());
+    }
+}
+
 fn read_expert_tile_with_prefetch(
     experts: &RawExpertCorpus,
     expert_reader: &Reader,
+    expert_pin_tier: Option<&ExpertPinTier>,
     layer: u32,
     canonical_expert_ids: &[u16],
     prefetch: Option<ExpertPrefetchSet>,
 ) -> Result<ExpertTileLease> {
+    // Partition against the permanent tier before any submission: a resident
+    // span was authenticated when it was promoted and needs no file I/O this
+    // pass. `streamed` keeps canonical ascending order for the demand union.
+    let mut pinned: Vec<(u16, Arc<PageAlignedSpan>)> = Vec::new();
+    let streamed: Vec<u16> = match expert_pin_tier {
+        Some(tier) => canonical_expert_ids
+            .iter()
+            .copied()
+            .filter(|&expert| match tier.lookup(layer, expert) {
+                Some(span) => {
+                    pinned.push((expert, span));
+                    false
+                }
+                None => true,
+            })
+            .collect(),
+        None => canonical_expert_ids.to_vec(),
+    };
+    let read_streamed_demand =
+        |lease_pinned: Vec<(u16, Arc<PageAlignedSpan>)>| -> Result<ExpertTileLease> {
+            if lease_pinned.is_empty() {
+                let batch = experts.read_union(expert_reader, layer, canonical_expert_ids)?;
+                promote_from_batch(expert_pin_tier, layer, &batch);
+                return Ok(ExpertTileLease::Contiguous(batch));
+            }
+            let demand = if streamed.is_empty() {
+                None
+            } else {
+                let batch = experts.read_union(expert_reader, layer, &streamed)?;
+                promote_from_batch(expert_pin_tier, layer, &batch);
+                Some(batch)
+            };
+            Ok(ExpertTileLease::Scattered {
+                layout: experts.layout(),
+                pinned: lease_pinned,
+                hits: Vec::new(),
+                demand,
+            })
+        };
     let Some(prefetch) = prefetch else {
-        return experts
-            .read_union(expert_reader, layer, canonical_expert_ids)
-            .map(ExpertTileLease::Contiguous);
+        return read_streamed_demand(pinned);
     };
     if prefetch.target_layer != layer {
         prefetch.cancel_and_drain();
-        return experts
-            .read_union(expert_reader, layer, canonical_expert_ids)
-            .map(ExpertTileLease::Contiguous);
+        return read_streamed_demand(pinned);
     }
 
+    // A speculative ticket for a tier-resident expert is a loser: cancelling
+    // it can still reclaim a read the filesystem has not started.
     let mut hit_tickets = Vec::with_capacity(prefetch.tickets.len());
     let mut loser_tickets = Vec::with_capacity(prefetch.tickets.len());
     for (expert, ticket) in prefetch.tickets {
-        if canonical_expert_ids.binary_search(&expert).is_ok() {
+        if streamed.binary_search(&expert).is_ok() {
             hit_tickets.push((expert, ticket));
         } else {
             loser_tickets.push((expert, ticket));
@@ -5509,7 +5728,7 @@ fn read_expert_tile_with_prefetch(
         loser_tickets,
         |(_, ticket)| ticket.cancel_unclaimed(),
         || {
-            provisional_misses = canonical_expert_ids
+            provisional_misses = streamed
                 .iter()
                 .copied()
                 .filter(|expert| {
@@ -5558,9 +5777,12 @@ fn read_expert_tile_with_prefetch(
         if let Some(ticket) = demand_ticket {
             let _ = ticket.wait();
         }
-        return experts
-            .read_union(expert_reader, layer, canonical_expert_ids)
-            .map(ExpertTileLease::Contiguous);
+        // The retry reads the complete canonical union — including any
+        // tier-resident experts — so this fallback stays byte-identical to
+        // the established path.
+        let batch = experts.read_union(expert_reader, layer, canonical_expert_ids)?;
+        promote_from_batch(expert_pin_tier, layer, &batch);
+        return Ok(ExpertTileLease::Contiguous(batch));
     }
 
     hits.sort_unstable_by_key(|batch| batch.expert_ids()[0]);
@@ -5579,13 +5801,20 @@ fn read_expert_tile_with_prefetch(
         }
         None => None,
     };
-    if hits.is_empty() {
+    for batch in &hits {
+        promote_from_batch(expert_pin_tier, layer, batch);
+    }
+    if let Some(batch) = &demand {
+        promote_from_batch(expert_pin_tier, layer, batch);
+    }
+    if hits.is_empty() && pinned.is_empty() {
         return demand.map(ExpertTileLease::Contiguous).ok_or_else(|| {
-            DeltafinError::new("expert-prefetch merge produced neither hits nor demand bytes")
+            DeltafinError::new("expert tile merge produced neither resident nor demand bytes")
         });
     }
     Ok(ExpertTileLease::Scattered {
         layout: experts.layout(),
+        pinned,
         hits,
         demand,
     })
@@ -5600,6 +5829,8 @@ fn finish_expert_mailbox(
     expert_prefetch_reader: Option<&Reader>,
     pending_expert_prefetch: &mut Option<ExpertPrefetchSet>,
     mut pilot_gate: Option<&mut PilotGate>,
+    expert_heat: &ExpertHeat,
+    expert_pin_tier: Option<&ExpertPinTier>,
     backend: TargetExpertBackend,
     cpu_threads: usize,
     metal_source_selector: Option<&str>,
@@ -5618,6 +5849,15 @@ fn finish_expert_mailbox(
                 .map(|route| route.ordered_experts()),
         );
     }
+    // The same free signal feeds the cross-run heat histogram: presence per
+    // mailbox, all backends, infallible, and strictly after the authoritative
+    // routes were published.
+    expert_heat.observe_layer_routes(
+        mailbox.layer_index(),
+        (0..mailbox.position_count())
+            .filter_map(|row| mailbox.route(row))
+            .map(|route| route.ordered_experts()),
+    );
     let mut first_row = 0_usize;
     // The established Python/Metal verifier fetches one sorted unique expert
     // union for all candidate rows. Reproduce that topology only for exact
@@ -5672,6 +5912,11 @@ fn finish_expert_mailbox(
             if expert_prefetch_reader.is_some() || pending_expert_prefetch.is_some() {
                 return Err(DeltafinError::new(
                     "CUDA expert planning cannot share the scattered host-prefetch path",
+                ));
+            }
+            if expert_pin_tier.is_some() {
+                return Err(DeltafinError::new(
+                    "CUDA expert planning cannot share the pinned host-span tier",
                 ));
             }
             let planning_started = profile.as_ref().map(|_| Instant::now());
@@ -5740,6 +5985,7 @@ fn finish_expert_mailbox(
         let lease = read_expert_tile_with_prefetch(
             experts,
             expert_reader,
+            expert_pin_tier,
             mailbox.layer_index(),
             tile.expert_ids(),
             due_prefetch,
@@ -9332,5 +9578,169 @@ mod tests {
         assert!(qwen_residency_admitted(&selection(
             ResidencyStop::AllLayersFit
         )));
+    }
+
+    fn pin_snapshot_hot_at(
+        slots: &[(u32, u16)],
+        heat: f32,
+        total_weight: f64,
+    ) -> crate::expert_heat::ExpertHeatSnapshot {
+        let mut heats = vec![0.0_f32; crate::experts::K3_EXPERT_RAW_FILES].into_boxed_slice();
+        for &(layer, expert) in slots {
+            heats[(layer - 1) as usize * crate::routing::K3_EXPERTS + expert as usize] = heat;
+        }
+        crate::expert_heat::ExpertHeatSnapshot {
+            heats,
+            total_weight,
+        }
+    }
+
+    #[test]
+    fn assemble_expert_spans_prefers_pinned_then_hits_then_demand() {
+        let span_bytes = 8_usize;
+        let pinned_bytes = vec![0xAA_u8; span_bytes];
+        let pinned = vec![(7_u16, PageAlignedSpan::copy_from(&pinned_bytes).unwrap())];
+        let hit_bytes = vec![0xBB_u8; span_bytes];
+        let hits = vec![(11_u16, &hit_bytes[..])];
+        let demand_ids = [3_u16, 20_u16];
+        let demand_bytes: Vec<u8> = [0x33_u8; 8].into_iter().chain([0x44_u8; 8]).collect();
+        let spans = assemble_expert_spans(
+            &[3, 7, 11, 20],
+            &pinned,
+            &hits,
+            Some((&demand_ids, &demand_bytes)),
+            span_bytes,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 4);
+        assert_eq!(spans[0], &[0x33_u8; 8][..]);
+        assert_eq!(spans[1], &pinned_bytes[..]);
+        assert_eq!(spans[2], &hit_bytes[..]);
+        assert_eq!(spans[3], &[0x44_u8; 8][..]);
+
+        // All-pinned tiles need no demand slab at all.
+        let alone = assemble_expert_spans(&[7], &pinned, &[], None, span_bytes).unwrap();
+        assert_eq!(alone, vec![&pinned_bytes[..]]);
+
+        // A tile expert with no source is an authoritative failure.
+        assert!(assemble_expert_spans(&[7, 9], &pinned, &[], None, span_bytes).is_err());
+        // A pinned span whose length disagrees with the corpus is refused.
+        assert!(assemble_expert_spans(&[7], &pinned, &[], None, span_bytes + 1).is_err());
+    }
+
+    #[test]
+    fn pin_tier_serves_second_route_from_ram_with_identical_bytes() {
+        use crate::experts::{K3_EXPERT_SOURCE_BYTES, RawExpertCorpus};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "deltafin-engine-pin-{}-{nonce}",
+            std::process::id()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let cache = root.join("k3-experts");
+        std::fs::create_dir_all(&cache).unwrap();
+        for (expert, fill) in [(3_u16, 0xA3_u8), (7, 0xA7), (11, 0xAB)] {
+            std::fs::write(
+                cache.join(format!("L1-E{expert}.bin")),
+                vec![fill; K3_EXPERT_SOURCE_BYTES],
+            )
+            .unwrap();
+        }
+        let corpus = RawExpertCorpus::open_raw_v1(&root).unwrap();
+        let reader = Reader::with_arena_capacity(2, 2).unwrap();
+        let span_bytes = corpus.layout().expert_span_bytes();
+        let tier = ExpertPinTier::plan(
+            &pin_snapshot_hot_at(&[(1, 3), (1, 7)], 300.0, 512.0),
+            span_bytes,
+            2 * span_bytes as u64,
+        )
+        .unwrap();
+
+        // The invariant baseline: the exact bytes a tier-free read produces.
+        let baseline = corpus.read_union(&reader, 1, &[3, 7, 11]).unwrap();
+        let expected = baseline.buffers().other().to_vec();
+        drop(baseline);
+
+        // First route: everything streams, candidates promote stickily.
+        let first =
+            read_expert_tile_with_prefetch(&corpus, &reader, Some(&tier), 1, &[3, 7, 11], None)
+                .unwrap();
+        assert!(matches!(first, ExpertTileLease::Contiguous(_)));
+        drop(first);
+        assert_eq!(tier.resident_experts(), 2);
+        assert_eq!(tier.resident_bytes(), 2 * span_bytes as u64);
+
+        // Second route: both candidates come from RAM; only expert 11 reads.
+        let second =
+            read_expert_tile_with_prefetch(&corpus, &reader, Some(&tier), 1, &[3, 7, 11], None)
+                .unwrap();
+        let ExpertTileLease::Scattered {
+            layout,
+            pinned,
+            hits,
+            demand,
+        } = second
+        else {
+            panic!("tier-resident tile did not use the scattered lease");
+        };
+        assert_eq!(layout, corpus.layout());
+        assert_eq!(
+            pinned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert!(hits.is_empty());
+        let demand = demand.expect("expert 11 is not a candidate and must stream");
+        assert_eq!(demand.expert_ids(), [11]);
+
+        // Byte-identical to the tier-free union, span by span.
+        let hit_spans: Vec<(u16, &[u8])> = Vec::new();
+        let spans = assemble_expert_spans(
+            &[3, 7, 11],
+            &pinned,
+            &hit_spans,
+            Some((demand.expert_ids(), demand.buffers().other())),
+            span_bytes,
+        )
+        .unwrap();
+        for (index, span) in spans.iter().enumerate() {
+            assert_eq!(
+                *span,
+                &expected[index * span_bytes..(index + 1) * span_bytes],
+                "span {index} diverged from the tier-free read"
+            );
+        }
+        assert_eq!(tier.hits(), 2);
+
+        // An all-pinned tile performs no file I/O and still assembles.
+        drop(demand);
+        let third = read_expert_tile_with_prefetch(&corpus, &reader, Some(&tier), 1, &[3, 7], None)
+            .unwrap();
+        let ExpertTileLease::Scattered {
+            pinned: third_pinned,
+            hits: third_hits,
+            demand: third_demand,
+            ..
+        } = third
+        else {
+            panic!("all-pinned tile did not use the scattered lease");
+        };
+        assert_eq!(third_pinned.len(), 2);
+        assert!(third_hits.is_empty());
+        assert!(third_demand.is_none());
+        let spans =
+            assemble_expert_spans(&[3, 7], &third_pinned, &hit_spans, None, span_bytes).unwrap();
+        assert_eq!(spans[0], &expected[..span_bytes]);
+        assert_eq!(spans[1], &expected[span_bytes..2 * span_bytes]);
+        assert_eq!(tier.hits(), 4);
     }
 }

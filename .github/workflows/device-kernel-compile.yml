@@ -1,22 +1,25 @@
 name: Device kernel compile
 
-# Manual only, deliberately.
-#
 # These legs compile the two device kernel translation units with the real
-# vendor toolchains. Neither has ever run: the HIP path has never been through
-# HIPCC at all, and the flag spellings, header layout and offload targets below
-# are unverified. Wiring that to `push` would make the default branch red for a
-# reason nobody can fix without first running it, and a permanently red build
-# stops being read.
+# vendor toolchains. No job needs a GPU: HIPCC and NVCC cross-compile to gfx
+# and sm targets on an ordinary runner, so this establishes that the sources
+# compile — not that they produce correct tokens. That still requires
+# physical hardware and the token oracle.
 #
-# Neither job needs a GPU. HIPCC and NVCC cross-compile to gfx and sm targets on
-# an ordinary runner, so this establishes that the sources compile — not that
-# they produce correct tokens. That still requires physical hardware and the
-# token oracle.
+# cuda (CUDA 12.6) and cuda13 (CUDA 13.0, added for gh#20 -- a contributor's
+# RTX 5090/Blackwell build report) each passed a manual run and now also run
+# on push/pull_request.
 #
-# Promote to `push` once both legs pass.
+# hip stays workflow_dispatch-only: rocm/dev-ubuntu-24.04:6.3-complete is too
+# large to pull on a standard runner's disk ("no space left on device" while
+# registering hipblaslt's Tensile kernel library, confirmed on a real run) --
+# an infrastructure problem, not a compile failure, unrelated to the CUDA
+# legs above. Revisit (a smaller ROCm image, or freeing runner disk space
+# first) before promoting it too.
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
     inputs:
       rocm_image:
@@ -24,9 +27,13 @@ on:
         required: false
         default: rocm/dev-ubuntu-24.04:6.3-complete
       cuda_image:
-        description: CUDA development image providing nvcc
+        description: CUDA 12.6 development image providing nvcc
         required: false
         default: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      cuda13_image:
+        description: CUDA 13.0 development image providing nvcc (Blackwell/sm_100+sm_120)
+        required: false
+        default: nvidia/cuda:13.0.3-devel-ubuntu24.04
 
 permissions:
   contents: read
@@ -38,8 +45,9 @@ concurrency:
 jobs:
   hip:
     name: HIPCC device compile
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    container: ${{ inputs.rocm_image }}
+    container: ${{ inputs.rocm_image || 'rocm/dev-ubuntu-24.04:6.3-complete' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +92,7 @@ jobs:
   cuda:
     name: NVCC device compile
     runs-on: ubuntu-24.04
-    container: ${{ inputs.cuda_image }}
+    container: ${{ inputs.cuda_image || 'nvidia/cuda:12.6.3-devel-ubuntu24.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +118,39 @@ jobs:
               --fmad=true \
               --generate-code=arch=compute_80,code=[compute_80,sm_80] \
               --generate-code=arch=compute_90,code=[compute_90,sm_90] \
+              -Itools \
+              -c "$source" -o "/tmp/$(basename "$source").o"
+          done
+
+  cuda13:
+    name: NVCC device compile (CUDA 13.0 / Blackwell)
+    runs-on: ubuntu-24.04
+    container: ${{ inputs.cuda13_image || 'nvidia/cuda:13.0.3-devel-ubuntu24.04' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the selected toolchain
+        run: nvcc --version
+
+      # cuda_architectures() in native/deltafin-native-build/src/lib.rs only
+      # emits sm_100/sm_120 (Blackwell datacenter/consumer, including the
+      # RTX 5090 a contributor reported build trouble on in gh#20) when paired
+      # with CUDA 13.0 -- the 12.6 leg above never asks nvcc for these targets,
+      # so it cannot prove Blackwell sources compile at all.
+      - name: Compile both device kernels for the pinned CUDA 13.0 architectures
+        run: |
+          set -eux
+          for source in tools/cuda_moe_kernels.cu \
+                        native/provider_gate/provider_spine_bf16_cuda.cu; do
+            nvcc \
+              -std=c++17 -O3 -DNDEBUG -Xcompiler=-fPIC \
+              --ftz=false \
+              --prec-div=true \
+              --prec-sqrt=true \
+              --fmad=true \
+              --generate-code=arch=compute_100,code=[compute_100,sm_100] \
+              --generate-code=arch=compute_120,code=[compute_120,sm_120] \
               -Itools \
               -c "$source" -o "/tmp/$(basename "$source").o"
           done
